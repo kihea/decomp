@@ -23,6 +23,8 @@ pub struct Case {
     pub input: Vec<u8>,
     /// The blobs the job may read.
     pub blobs: Blobs,
+    /// The records of the shard the job was handed, if it was handed one.
+    pub shard: Option<Vec<u8>>,
     pub compute_cap: u64,
     pub reports: Vec<(PublicKey, JobResult)>,
     /// Each node's checkpoints, in the order of `reports`.
@@ -50,6 +52,7 @@ pub fn referee(sandbox: &Sandbox, case: &Case) -> Verdict {
         compute_cap: case.compute_cap,
         seed: *case.job_id.as_bytes(),
         blobs: &case.blobs,
+        state: case.shard.as_deref(),
     };
     let mut standing: Vec<usize> = (0..case.reports.len()).collect();
     let mut units = 0;
@@ -82,6 +85,7 @@ pub fn referee(sandbox: &Sandbox, case: &Case) -> Verdict {
             Ok(produced) => Outcome::Completed {
                 output: ContentHash::of(&produced.output),
                 blobs: produced.blobs.iter().map(|b| ContentHash::of(b)).collect(),
+                state: produced.state.as_ref().map(|left| ContentHash::of(left)),
             },
             Err(failure) => Outcome::Failed { failure: *failure },
         };

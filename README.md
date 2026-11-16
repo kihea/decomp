@@ -143,12 +143,26 @@ are part of its result, so nodes are held to them like the output.
   the submitter is within what the app allows one account in a day.
 - Publishing again replaces the manifest.
 
+**App state** (also build step 7).
+
+- An app's state is cut into shards, each a set of records under a name the app
+  chooses. A job can be handed one shard if it runs one of the app's own
+  modules, whoever submits it.
+- The job reads the records as they were when it was handed out, with `kv.get`
+  and `kv.scan`, and changes them with `kv.put`. What it leaves behind comes back
+  in its result and is checked like its output: nodes that ran the job must
+  agree on it, and a referee settles it if they do not.
+- Jobs on the same shard run one at a time, each starting from what the last
+  one left, so no change is lost. Jobs on different shards run side by side.
+- A job that fails changes nothing.
+- Anyone can ask what a shard holds now and read its records.
+
 ## Layout
 
 | Path | What it is |
 | --- | --- |
 | `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage and relay rules, and every message shape. No I/O. |
-| `crates/decomp-schema` | How a job's input and output types are described and checked. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
+| `crates/decomp-schema` | How a job's input and output types are described and checked, and the byte form of a set of records. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
 | `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, and what it stores (logs, blobs). |
 | `crates/decomp-node` | The node agent, as a library and as the `decomp-node` command: joins an account, works as a node, holds and relays data, submits jobs, stores files, and sends files to other devices. |
@@ -223,6 +237,13 @@ cargo run -p decomp-node -- submit path/to/module.wasm --input path/to/input --c
 
 A job may be given files to read as blobs with `--read path/to/file`, once for
 each file. The module asks for one by the hash of its contents.
+
+A job may be handed a shard of an app's state with `--state <app ID>/<shard>`,
+if its module is one of that app's. The records a shard holds:
+
+```bash
+cargo run -p decomp-node -- state <app ID>/<shard>
+```
 
 The same job on this device alone, without the network:
 
@@ -329,6 +350,17 @@ fund them, or replay them at startup. A developer with two apps uses two
 accounts. As with other changes to an account, a device the account has approved
 may sign for it.
 
+**A shard is one blob, and jobs on it take turns.** Results are checked by
+comparing them, so what a job reads must be fixed and what it changes must be
+part of its result. A shard is therefore a set of records with exactly one byte
+form, named by its hash like any blob. The coordinator keeps only which hash is
+current for each shard. A job is told the hash when it is handed out, every node
+on it reads those same records, and the records it leaves are a new blob whose
+hash is in its result. Running a shard's jobs one at a time means none has to be
+redone because another got in first. The price is that a job reads and writes
+its whole shard, so shards are small, 8 MiB at most, and an app with more state
+uses more shards.
+
 **Data services are node work.** Storing, serving, and relaying data are done by
 nodes and paid for in credits. DeComp does not lean on an outside peer-to-peer
 network for them.
@@ -407,7 +439,11 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | The same blob cannot be stored twice | A second request for a root already stored is refused, even from another account. | When two accounts need the same data |
 | Stored blobs are readable by anyone with the root | There is no private mode yet. | Build step 9 |
 | Logs can fall out of step on a crash | A storage or relay change and the credits that go with it are written to two files, one after the other. | Settlement, build step 13 |
-| An app's manifest lists no permissions or schemas | Each module already describes its own types, and there is nothing to permit until jobs can reach state and stored blobs. | With the host functions that need permission |
+| An app's manifest lists no permissions or schemas | The one permission so far follows from the list of modules: only the app's own modules may be handed its state. Each module describes its own types. | With the first permission that cannot be read off the modules |
 | What an app has set aside for an account today is kept in memory | A restart forgets it, so a daily cap can be passed once for each restart. It counts the highest possible fee of each job, not what the job cost. | Settlement, build step 13 |
 | A daily cap limits an account, not a person | Accounts are free to make, so someone can get around an app's cap with new ones. What the app's account holds is the real limit. | Sign-in, build step 14 |
-| Three host functions are missing | State (`kv`), follow-up jobs, and sealing data to a key. | State and follow-up jobs next in build step 7; sealing with private mode, build step 9 |
+| Two host functions are missing | Follow-up jobs, and sealing data to a key. | Follow-up jobs next in build step 7; sealing with private mode, build step 9 |
+| A job reads and writes its whole shard | Every job on a shard fetches all its records and stores all of them again, which is why a shard is capped at 8 MiB. | A hash tree over the records, if apps need larger shards |
+| Every past version of a shard is kept | Each is a blob on the coordinator, and nothing removes old ones. | With job blobs moving to node storage |
+| Records have no declared types and cannot be removed | The SDK reads and writes them as JSON of whatever type the module asks for, and the spec lists no call to delete one. | With the first app that needs either |
+| A job run on this device alone is handed no state | `run` has no way to name a shard. | When someone needs to try a stateful module off the network |

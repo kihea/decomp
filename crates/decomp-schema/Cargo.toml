@@ -2,7 +2,7 @@
 name = "decomp-schema"
 version = "0.1.0"
 edition.workspace = true
-description = "How the types of a job's inputs and outputs are described and checked."
+description = "How the types of a job's inputs and outputs are described and checked, and the byte form of a set of records."
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

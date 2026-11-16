@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use decomp_core::{Assignment, JobResult, Outcome};
 use decomp_sandbox::{Blobs, Job, Sandbox};
+use decomp_schema::records::{self, Records};
 
 use crate::client::{Client, ClientError};
 
@@ -28,12 +29,20 @@ pub fn work(
     for hash in &manifest.reads {
         blobs.insert(*hash, client.get_blob(*hash)?);
     }
+    // A job handed a shard reads it as it was when the job was handed out. A
+    // shard nothing has been written to is empty.
+    let shard = match (&manifest.state, assignment.shard) {
+        (None, _) => None,
+        (Some(_), Some(contents)) => Some(client.get_blob(contents)?),
+        (Some(_), None) => Some(records::encode(&Records::new())),
+    };
     let finding = sandbox.find(&Job {
         module: &module,
         input: &input,
         compute_cap: manifest.compute_cap,
         seed: *assignment.seed.as_bytes(),
         blobs: &blobs,
+        state: shard.as_deref(),
     });
 
     let result = JobResult {
@@ -47,6 +56,10 @@ pub fn work(
                     .into_iter()
                     .map(|blob| client.put_blob(blob))
                     .collect::<Result<_, _>>()?,
+                state: produced
+                    .state
+                    .map(|left| client.put_blob(left))
+                    .transpose()?,
             },
             Err(failure) => Outcome::Failed { failure },
         },

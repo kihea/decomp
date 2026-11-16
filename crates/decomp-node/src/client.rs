@@ -3,10 +3,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decomp_core::{
-    AccountOp, AccountStatus, AppManifest, Blob, BlobData, BlobRef, Call, Challenge, CheckedIn,
-    ContentHash, Credits, Envelope, Incoming, IncomingChannels, JobId, JobResult, JobStatus,
-    Located, MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey, Refusal, Request, Route,
-    SigningKey, Standing, Submitted,
+    AccountId, AccountOp, AccountStatus, AppManifest, Blob, BlobData, BlobRef, Call, Challenge,
+    CheckedIn, ContentHash, Credits, Envelope, Incoming, IncomingChannels, JobId, JobResult,
+    JobStatus, Located, MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey, Refusal, Request, Route,
+    ShardNow, SigningKey, Standing, Submitted,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -108,6 +108,13 @@ impl Client {
             return Err(ClientError::CorruptBlob);
         }
         Ok(bytes)
+    }
+
+    /// The hash of the contents a shard of an app's state has now, or `None` if
+    /// the shard is empty.
+    pub fn state(&self, app: AccountId, shard: String) -> Result<Option<ContentHash>, ClientError> {
+        let now: ShardNow = self.call(Call::GetState { app, shard })?;
+        Ok(now.contents)
     }
 
     pub fn submit_job(&self, manifest: Manifest) -> Result<JobId, ClientError> {

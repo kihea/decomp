@@ -16,13 +16,14 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
     AccountId, AccountStatus, AppManifest, ContentHash, Credits, JobStatus, Manifest, Outcome,
-    PublicKey, Split, Sponsorship, merkle,
+    PublicKey, ShardRef, Split, Sponsorship, merkle,
 };
 use decomp_node::client::{Client, unix_now};
 use decomp_node::relay;
 
 use crate::agent::Reachable;
 use decomp_sandbox::{Blobs, Job, Sandbox};
+use decomp_schema::records;
 
 const NO_KEY: &str = "this device has no key yet; run `decomp-node link` first";
 
@@ -140,6 +141,16 @@ enum Command {
         /// it this account pays.
         #[arg(long)]
         sponsor: Option<AccountId>,
+        /// A shard of an app's state to hand the job, as the app's ID, a slash,
+        /// and the shard's name. The module must be one of that app's.
+        #[arg(long, value_parser = parse_shard)]
+        state: Option<ShardRef>,
+    },
+    /// Show the records in a shard of an app's state.
+    State {
+        /// The app's ID, a slash, and the shard's name.
+        #[arg(value_parser = parse_shard)]
+        shard: ShardRef,
     },
     /// Run a job module on this device only, without the network.
     Run {
@@ -208,15 +219,18 @@ fn main() -> ExitCode {
             redundancy,
             split_bytes,
             sponsor,
+            state,
         } => connect().and_then(|client| {
             let limits = Limits {
                 deadline_secs,
                 redundancy,
                 split_bytes,
                 sponsor,
+                state,
             };
             submit(&client, job, limits)
         }),
+        Command::State { shard } => connect().and_then(|client| show_state(&client, shard)),
         Command::Run { job } => run_locally(job),
     };
     outcome.unwrap_or_else(|error| {
@@ -318,6 +332,37 @@ struct Limits {
     redundancy: Option<u32>,
     split_bytes: Option<u64>,
     sponsor: Option<AccountId>,
+    state: Option<ShardRef>,
+}
+
+/// Reads a shard as it is written on the command line: the app's ID, a slash,
+/// and the shard's name.
+fn parse_shard(text: &str) -> Result<ShardRef, String> {
+    let (app, shard) = text
+        .split_once('/')
+        .ok_or("write a shard as the app's ID, a slash, and the shard's name")?;
+    Ok(ShardRef {
+        app: app
+            .parse()
+            .map_err(|_| "the part before the slash is not an app ID")?,
+        shard: shard.to_string(),
+    })
+}
+
+/// Prints a shard's records, one to a line.
+fn show_state(client: &Client, shard: ShardRef) -> Result<ExitCode, Box<dyn Error>> {
+    let Some(contents) = client.state(shard.app, shard.shard)? else {
+        println!("the shard is empty");
+        return Ok(ExitCode::SUCCESS);
+    };
+    let records = records::decode(&client.get_blob(contents)?)
+        .ok_or("the shard's contents are not a set of records")?;
+    println!("contents {contents}");
+    for (key, value) in &records {
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        println!("{} = {}", text(key), text(value));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box<dyn Error>> {
@@ -326,6 +371,7 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
         redundancy,
         split_bytes,
         sponsor,
+        state,
     } = limits;
     let JobFiles {
         module,
@@ -347,6 +393,7 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
             .into_values()
             .map(|blob| client.put_blob(blob))
             .collect::<Result<_, _>>()?,
+        state,
     };
     // Set aside the most the job can cost; what is not spent comes back.
     for _ in 0..pieces {
@@ -379,9 +426,16 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
     }
     println!("fee     {} credits", receipt.fee.total);
     match receipt.outcome {
-        Outcome::Completed { output, blobs } => {
+        Outcome::Completed {
+            output,
+            blobs,
+            state,
+        } => {
             for blob in blobs {
                 println!("stored  {blob}");
+            }
+            if let Some(contents) = state {
+                println!("state   {contents}");
             }
             let bytes = client.get_blob(output)?;
             report_output(&bytes, job.output.as_deref())?;
@@ -502,6 +556,8 @@ fn run_locally(job: JobArgs) -> Result<ExitCode, Box<dyn Error>> {
         compute_cap: job.compute_cap,
         seed: [0; 32],
         blobs: &blobs,
+        // Nor is there any state to hand it.
+        state: None,
     })?;
 
     println!("module  {}", ContentHash::of(&module));

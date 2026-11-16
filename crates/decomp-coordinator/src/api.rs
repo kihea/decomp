@@ -16,8 +16,8 @@ use axum::{Json, Router};
 use decomp_core::{
     Account, AccountStatus, Accounts, Blob, BlobData, BlobRef, Call, ContentHash, Envelope,
     EnvelopeError, IncomingChannels, JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS,
-    MAX_MESSAGE_BYTES, OpError, Outcome, PublicKey, Refusal, RelayError, Request, SponsorError,
-    StorageError, Submitted,
+    MAX_MESSAGE_BYTES, OpError, Outcome, PublicKey, Refusal, RelayError, Request, ShardNow,
+    ShardRef, SponsorError, StorageError, Submitted,
 };
 use decomp_sandbox::Sandbox;
 use serde_json::json;
@@ -139,6 +139,10 @@ fn answer(
         Call::GetJob { job_id } => {
             Json(coordinator.job_status(job_id, account.id, now)?).into_response()
         }
+        Call::GetState { app, shard } => Json(ShardNow {
+            contents: coordinator.shard_now(&ShardRef { app, shard }),
+        })
+        .into_response(),
         Call::Stake { amount } => {
             coordinator.record(LedgerEntry::Stake {
                 account: account.id,
@@ -199,8 +203,13 @@ fn answer(
             Json(json!({})).into_response()
         }
         Call::SubmitResult { result } => {
-            if let Outcome::Completed { output, blobs } = &result.outcome {
-                for hash in blobs.iter().chain([output]) {
+            if let Outcome::Completed {
+                output,
+                blobs,
+                state,
+            } = &result.outcome
+            {
+                for hash in blobs.iter().chain([output]).chain(state) {
                     require_blob(coordinator, hash)?;
                 }
             }
@@ -373,6 +382,12 @@ impl From<SubmitError> for ApiError {
             }
             SubmitError::TooManyReads => {
                 Self::new(StatusCode::BAD_REQUEST, "too_many_reads", message)
+            }
+            SubmitError::StateNotAllowed => {
+                Self::new(StatusCode::FORBIDDEN, "state_not_allowed", message)
+            }
+            SubmitError::BadShardName | SubmitError::SplitWithState => {
+                Self::new(StatusCode::BAD_REQUEST, "bad_state", message)
             }
             SubmitError::Sponsor(inner) => {
                 let (status, code) = match inner {

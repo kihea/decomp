@@ -6,6 +6,7 @@ description = "Runs DeComp job modules: deterministic, metered WebAssembly."
 
 [dependencies]
 decomp-core = { version = "0.1.0", path = "../decomp-core" }
+decomp-schema = { version = "0.1.0", path = "../decomp-schema" }
 sha2 = "0.11.1"
 thiserror = "2.0.21"
 wasm-encoder = { version = "0.258.3", features = ["wasmparser"] }

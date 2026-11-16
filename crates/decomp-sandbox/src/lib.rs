@@ -31,13 +31,19 @@
 //! | `rand.seeded` | `(dest, len)` | Fills `len` bytes at `dest` from a stream fixed by the job's seed, so every node draws the same bytes |
 //! | `blob.get` | `(hash) -> len` | Looks up the blob whose SHA-256 hash is the 32 bytes at `hash` among those the job was given to read, and returns its length as a 64-bit integer, or -1 if it is not one of them. `result.read` then copies it |
 //! | `blob.put` | `(src, len, dest)` | Stores the `len` bytes at `src` as a blob and writes its hash to the 32 bytes at `dest`. The blob is kept only if the job completes |
-//! | `result.read` | `(dest)` | Copies the blob the last `blob.get` found into memory at `dest` |
+//! | `kv.get` | `(key, len) -> len` | Looks up the record whose key is the `len` bytes at `key`, in the shard of state the job was handed, and returns its value's length as a 64-bit integer, or -1 if there is no such record. `result.read` then copies the value |
+//! | `kv.put` | `(key, key_len, value, value_len)` | Sets the record with that key to that value. The change is kept only if the job completes |
+//! | `kv.scan` | `(prefix, len) -> len` | Gathers the records whose keys start with the `len` bytes at `prefix`, in the byte form `decomp_schema::records` defines, and returns its length as a 64-bit integer. `result.read` then copies it |
+//! | `result.read` | `(dest)` | Copies what the last `blob.get`, `kv.get`, or `kv.scan` found into memory at `dest` |
+//!
+//! The three `kv` functions end a job that was handed no shard.
 
 mod meter;
 
 use std::collections::HashMap;
 
 use decomp_core::{ContentHash, PublicKey, Signature};
+use decomp_schema::records::{self, Records, record_bytes};
 use sha2::{Digest, Sha256};
 use wasmtime::{
     Caller, Config, Engine, Extern, ExternType, Linker, Module, Store, StoreLimits,
@@ -74,6 +80,14 @@ const SIGNATURE_CHECK_INSTRUCTIONS: u64 = 500_000;
 /// a bound a job could fill its host's memory for the price of one unit.
 pub const MAX_PRODUCED_BYTES: usize = SLOT_MEMORY_BYTES;
 
+/// The longest key a record of state may have.
+pub const MAX_KEY_BYTES: usize = 1024;
+
+/// The most one shard of state may hold, in its byte form. A job reads its whole
+/// shard and writes it whole, so shards are kept small; an app with more state
+/// than this cuts it into more shards.
+pub const MAX_SHARD_BYTES: usize = 8 * 1024 * 1024;
+
 /// The most a module may be charged for describing its signature.
 const SIGNATURE_COMPUTE_CAP: u64 = 1;
 
@@ -97,6 +111,9 @@ pub struct Job<'a> {
     pub seed: [u8; 32],
     /// The blobs the job may read with `blob.get`: those its manifest names.
     pub blobs: &'a Blobs,
+    /// The records of the shard of state the job is handed, in their byte form.
+    /// `None` if it is handed no shard.
+    pub state: Option<&'a [u8]>,
 }
 
 /// Blobs by the hash of their contents.
@@ -108,6 +125,9 @@ pub struct Produced {
     pub output: Vec<u8>,
     /// The blobs the job stored, in the order it stored them.
     pub blobs: Vec<Vec<u8>>,
+    /// The records the job left its shard with, in their byte form, if it
+    /// changed them.
+    pub state: Option<Vec<u8>>,
 }
 
 /// What running a job produced and what it cost.
@@ -150,6 +170,8 @@ pub enum RunError {
     InvalidModule(String),
     #[error("the input is larger than a slot's memory")]
     InputTooLarge,
+    #[error("the state the job was handed is not a shard's records")]
+    InvalidState,
 }
 
 /// Why a host function stopped the job.
@@ -164,8 +186,14 @@ enum Halt {
     CheckpointReached,
     #[error("the job handed back more than a slot's memory holds")]
     TooMuchProduced,
-    #[error("the module asked for a blob it had not just looked up")]
+    #[error("the module asked to read a result when it had not just looked one up")]
     NothingToRead,
+    #[error("the job was handed no state")]
+    NoState,
+    #[error("a record's key is longer than {MAX_KEY_BYTES} bytes")]
+    KeyTooLong,
+    #[error("the job left its shard holding more than a shard may")]
+    TooMuchState,
 }
 
 /// Per-job state the host functions work on.
@@ -176,8 +204,12 @@ struct State {
     blobs: Blobs,
     /// The blobs the job has stored.
     stored: Vec<Vec<u8>>,
-    /// The blob the last `blob.get` found, until the module reads it.
-    found: Option<ContentHash>,
+    /// The records of the job's shard, as the job has left them so far, and how
+    /// many bytes their byte form takes. `None` if it was handed no shard.
+    records: Option<Records>,
+    records_bytes: usize,
+    /// What the module last looked up, until it reads it.
+    found: Option<Found>,
     limits: StoreLimits,
     /// The most instructions the job may execute.
     cap: u64,
@@ -191,6 +223,14 @@ struct State {
     seed: [u8; 32],
     /// How many blocks of the job's random stream have been drawn.
     random_blocks_drawn: u64,
+}
+
+/// What `result.read` copies next.
+enum Found {
+    /// One of the blobs the job may read.
+    Blob(ContentHash),
+    /// A record's value, or the byte form of several records.
+    Bytes(Vec<u8>),
 }
 
 /// A configured engine. Create one and reuse it for every job.
@@ -232,6 +272,9 @@ impl Sandbox {
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "blob.get", blob_get))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "blob.put", blob_put))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "result.read", result_read))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "kv.get", kv_get))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "kv.put", kv_put))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "kv.scan", kv_scan))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, METER_IMPORT, meter))
             .expect("host function names are unique");
         Self { engine, linker }
@@ -280,6 +323,7 @@ impl Sandbox {
             compute_cap: SIGNATURE_COMPUTE_CAP,
             seed: [0; 32],
             blobs: &Blobs::new(),
+            state: None,
         };
         match self.execute(&job, SIGNATURE_EXPORT, None) {
             Ok(run) => Ok(run.result.ok().map(|produced| produced.output)),
@@ -305,6 +349,11 @@ impl Sandbox {
         if job.input.len() > SLOT_MEMORY_BYTES {
             return Err(RunError::InputTooLarge);
         }
+        let handed = job.state.filter(|bytes| bytes.len() <= MAX_SHARD_BYTES);
+        let records = handed.map(records::decode);
+        if records.is_none() != job.state.is_none() || records == Some(None) {
+            return Err(RunError::InvalidState);
+        }
         let metered =
             add_metering(job.module).map_err(|e| RunError::InvalidModule(e.to_string()))?;
         let invalid = |error: wasmtime::Error| RunError::InvalidModule(error.to_string());
@@ -318,6 +367,8 @@ impl Sandbox {
             output: Vec::new(),
             blobs: job.blobs.clone(),
             stored: Vec::new(),
+            records: records.flatten(),
+            records_bytes: job.state.map_or(0, <[u8]>::len),
             found: None,
             limits: StoreLimitsBuilder::new()
                 .memory_size(SLOT_MEMORY_BYTES)
@@ -355,6 +406,10 @@ impl Sandbox {
                 Ok(()) => Ok(Produced {
                     output: state.output,
                     blobs: state.stored,
+                    state: state
+                        .records
+                        .map(|records| records::encode(&records))
+                        .filter(|left| Some(left.as_slice()) != job.state),
                 }),
                 Err(error) => Err(failure_of(&error)),
             },
@@ -500,17 +555,79 @@ fn blob_get(mut caller: Caller<'_, State>, hash: u32) -> wasmtime::Result<i64> {
     let (memory, state) = memory_and_state(&mut caller);
     let hash = ContentHash::from_bytes(range(memory, hash, 32)?.try_into().expect("32 bytes"));
     let len = state.blobs.get(&hash).map(Vec::len);
-    state.found = len.map(|_| hash);
+    state.found = len.map(|_| Found::Blob(hash));
     Ok(len.map_or(-1, |len| len as i64))
 }
 
 fn result_read(mut caller: Caller<'_, State>, dest: u32) -> wasmtime::Result<()> {
     let (memory, state) = memory_and_state(&mut caller);
     let found = state.found.take().ok_or(Halt::NothingToRead)?;
-    let len = state.blobs[&found].len();
+    let bytes = match &found {
+        Found::Blob(hash) => &state.blobs[hash],
+        Found::Bytes(bytes) => bytes,
+    };
+    let len = bytes.len();
+    range_mut(memory, dest, len)?.copy_from_slice(bytes);
     charge_for_bytes(state, len)?;
-    range_mut(memory, dest, len)?.copy_from_slice(&state.blobs[&found]);
     Ok(())
+}
+
+/// The bytes a module names as a record's key or as the start of several.
+fn key(memory: &[u8], start: u32, len: u32) -> Result<&[u8], Halt> {
+    if len as usize > MAX_KEY_BYTES {
+        return Err(Halt::KeyTooLong);
+    }
+    range(memory, start, len as usize)
+}
+
+fn kv_get(mut caller: Caller<'_, State>, at: u32, len: u32) -> wasmtime::Result<i64> {
+    let (memory, state) = memory_and_state(&mut caller);
+    let records = state.records.as_ref().ok_or(Halt::NoState)?;
+    let value = records.get(key(memory, at, len)?).cloned();
+    charge_for_bytes(state, value.as_ref().map_or(0, Vec::len))?;
+    let found = value.as_ref().map_or(-1, |value| value.len() as i64);
+    state.found = value.map(Found::Bytes);
+    Ok(found)
+}
+
+fn kv_put(
+    mut caller: Caller<'_, State>,
+    at: u32,
+    len: u32,
+    value: u32,
+    value_len: u32,
+) -> wasmtime::Result<()> {
+    let (memory, state) = memory_and_state(&mut caller);
+    charge_for_bytes(state, len as usize + value_len as usize)?;
+    let key = key(memory, at, len)?.to_vec();
+    let value = range(memory, value, value_len as usize)?.to_vec();
+    let records = state.records.as_mut().ok_or(Halt::NoState)?;
+
+    let added = record_bytes(&key, &value);
+    let removed = records.get(&key).map_or(0, |old| record_bytes(&key, old));
+    let left = state.records_bytes + added - removed;
+    if left > MAX_SHARD_BYTES {
+        return Err(Halt::TooMuchState.into());
+    }
+    state.records_bytes = left;
+    records.insert(key, value);
+    Ok(())
+}
+
+fn kv_scan(mut caller: Caller<'_, State>, at: u32, len: u32) -> wasmtime::Result<i64> {
+    let (memory, state) = memory_and_state(&mut caller);
+    let records = state.records.as_ref().ok_or(Halt::NoState)?;
+    let prefix = key(memory, at, len)?;
+    let matching: Records = records
+        .range(prefix.to_vec()..)
+        .take_while(|(key, _)| key.starts_with(prefix))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let found = records::encode(&matching);
+    charge_for_bytes(state, found.len())?;
+    let len = found.len() as i64;
+    state.found = Some(Found::Bytes(found));
+    Ok(len)
 }
 
 fn blob_put(mut caller: Caller<'_, State>, src: u32, len: u32, dest: u32) -> wasmtime::Result<()> {

@@ -595,6 +595,7 @@ dependencies = [
  "clap",
  "decomp-core",
  "decomp-sandbox",
+ "decomp-schema",
  "serde",
  "serde_json",
  "thiserror",
@@ -607,6 +608,7 @@ name = "decomp-sandbox"
 version = "0.1.0"
 dependencies = [
  "decomp-core",
+ "decomp-schema",
  "sha2 0.11.1",
  "thiserror",
  "wasm-encoder",

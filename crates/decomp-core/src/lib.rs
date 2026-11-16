@@ -16,6 +16,7 @@ mod relay;
 mod request;
 mod scores;
 mod splits;
+mod state;
 mod storage;
 
 pub use account::{Account, AccountOp, Accounts, Device, OpError};
@@ -41,10 +42,11 @@ pub use relay::{
 };
 pub use request::{
     AccountStatus, Blob, BlobData, BlobRef, Call, CheckedIn, IncomingChannels, MAX_CLOCK_SKEW_SECS,
-    MAX_MESSAGE_BYTES, Placement, Refusal, Request, Submitted,
+    MAX_MESSAGE_BYTES, Placement, Refusal, Request, ShardNow, Submitted,
 };
 pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
 pub use splits::{Merge, Splits};
+pub use state::{MAX_SHARD_NAME_BYTES, ShardRef, StateEntry, States};
 pub use storage::{
     Challenge, Located, Storage, StorageEntry, StorageError, StoreOrder, Storing, storage_fee,
 };

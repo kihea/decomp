@@ -3,14 +3,14 @@
 //! and section 4).
 //!
 //! Like `Accounts`, this does no I/O. The caller passes in the time, the source of
-//! randomness, and each node's standing, so the same calls always produce the
-//! same decisions. What the caller must act on comes back through three lists it
+//! randomness, each node's standing, and the contents of each shard of state, so
+//! the same calls always produce the same decisions. What the caller must act on comes back through three lists it
 //! takes after each call: jobs that closed, score events, and disputes to referee.
 //!
 //! Nothing here is durable: assignments and results are needed only until a job
 //! closes (spec section 6). What lasts is the receipt, which the caller stores.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rand::{Rng, RngExt};
 
@@ -21,6 +21,7 @@ use crate::job::{
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey};
 use crate::ledger::{Credits, FeeSplit, fee};
 use crate::scores::{Conduct, FIRST_STAKED_TIER, ScoreEvent, Standing};
+use crate::state::ShardRef;
 
 /// A node counts as online for this long after it last checked in.
 pub const ONLINE_WINDOW_SECS: u64 = 10;
@@ -92,6 +93,8 @@ pub enum Closure {
 pub struct Dispute {
     pub job_id: JobId,
     pub manifest: Manifest,
+    /// The contents of the shard the job was handed, if any.
+    pub shard: Option<ContentHash>,
     pub reports: Vec<(PublicKey, JobResult)>,
 }
 
@@ -110,6 +113,8 @@ enum Kind {
 struct Known {
     manifest: Manifest,
     seed: JobId,
+    /// The contents of the shard the job was handed, if any.
+    shard: Option<ContentHash>,
     units: u64,
     outcome: Outcome,
     checkpoints: ContentHash,
@@ -118,6 +123,9 @@ struct Known {
 struct Job {
     kind: Kind,
     manifest: Manifest,
+    /// The contents its shard had when the job was handed out, which is what
+    /// every node on it reads. `None` before then, and for an empty shard.
+    shard: Option<ContentHash>,
     workers: Vec<Worker>,
     results: Vec<Report>,
     status: JobStatus,
@@ -208,6 +216,10 @@ impl Jobs {
     /// Records that `node` is online and returns the job it should be running.
     /// Nodes do not choose work: each check-in also hands waiting jobs to idle
     /// nodes drawn at random, and a node learns of its job here.
+    ///
+    /// `contents` gives the contents a shard of state has now. The caller must
+    /// have applied what every verified job left behind before calling this, so
+    /// that a job handed out here starts from where the last one ended.
     pub fn check_in(
         &mut self,
         node: PublicKey,
@@ -215,6 +227,7 @@ impl Jobs {
         now: u64,
         rng: &mut impl Rng,
         standing: &dyn Fn(&PublicKey, &AccountId) -> Standing,
+        contents: &dyn Fn(&ShardRef) -> Option<ContentHash>,
     ) -> Option<Assignment> {
         self.sweep(now);
         let entry = self.nodes.entry(node).or_insert(Node {
@@ -224,7 +237,7 @@ impl Jobs {
             known_answer_due: false,
         });
         entry.last_seen = now;
-        self.assign(now, rng, standing);
+        self.assign(now, rng, standing, contents);
         if self.nodes[&node].job.is_none() && self.nodes[&node].known_answer_due {
             self.issue_known_answer(node, account, now, rng, &standing(&node, &account));
         }
@@ -239,6 +252,7 @@ impl Jobs {
             job_id,
             manifest: job.manifest.clone(),
             seed,
+            shard: job.shard,
         })
     }
 
@@ -322,6 +336,7 @@ impl Jobs {
             self.disputes.push(Dispute {
                 job_id,
                 manifest: job.manifest.clone(),
+                shard: job.shard,
                 reports: job
                     .results
                     .iter()
@@ -440,6 +455,8 @@ impl Jobs {
             units: result.units,
             fee: FeeSplit::of(result.units, node_accounts.len() as u32),
             outcome: result.outcome.clone(),
+            state: job.manifest.state.clone(),
+            handed: job.shard,
             results: job
                 .results
                 .iter()
@@ -456,6 +473,7 @@ impl Jobs {
             self.known.push_back(Known {
                 manifest: job.manifest.clone(),
                 seed: job_id,
+                shard: job.shard,
                 units: result.units,
                 outcome: result.outcome,
                 checkpoints: result.checkpoints,
@@ -476,11 +494,15 @@ impl Jobs {
     /// to their scores, one per account. A job is handed out whole or not at all,
     /// so that every node on it is drawn from everyone eligible and not from
     /// whoever checked in first.
+    ///
+    /// Jobs on the same shard of state run one at a time: a job waits while
+    /// another that was handed its shard is still open.
     fn assign(
         &mut self,
         now: u64,
         rng: &mut impl Rng,
         standing: &dyn Fn(&PublicKey, &AccountId) -> Standing,
+        contents: &dyn Fn(&ShardRef) -> Option<ContentHash>,
     ) {
         let Self {
             jobs,
@@ -498,8 +520,25 @@ impl Jobs {
             })
             .collect();
 
+        // A job reissued as a known answer reads old contents and changes
+        // nothing, so it does not hold its shard.
+        let mut held: HashSet<ShardRef> = jobs
+            .values()
+            .filter(|job| matches!(job.kind, Kind::Submitted { .. }))
+            .filter(|job| !job.workers.is_empty() && job.closed_at.is_none())
+            .filter_map(|job| job.manifest.state.clone())
+            .collect();
+
         waiting.retain(|id| {
             let job = jobs.get_mut(id).expect("waiting jobs exist");
+            if job
+                .manifest
+                .state
+                .as_ref()
+                .is_some_and(|shard| held.contains(shard))
+            {
+                return true;
+            }
             let Some(first) = draw(&idle, &job.manifest, &[], rng) else {
                 return true;
             };
@@ -539,6 +578,10 @@ impl Jobs {
             for index in taken {
                 idle.remove(index);
             }
+            if let Some(shard) = &job.manifest.state {
+                job.shard = contents(shard);
+                held.insert(shard.clone());
+            }
             job.status = JobStatus::Running;
             false
         });
@@ -569,6 +612,7 @@ impl Jobs {
         let job_id = JobId::of(&node, &label);
         let mut manifest = expected.manifest.clone();
         manifest.deadline = now + KNOWN_ANSWER_DEADLINE_SECS;
+        let shard = expected.shard;
 
         let mut job = Job::new(
             Kind::KnownAnswer {
@@ -576,6 +620,7 @@ impl Jobs {
             },
             manifest,
         );
+        job.shard = shard;
         job.workers.push(Worker {
             node,
             account,
@@ -638,6 +683,7 @@ impl Job {
         Self {
             kind,
             manifest,
+            shard: None,
             workers: Vec::new(),
             results: Vec::new(),
             status: JobStatus::Waiting,

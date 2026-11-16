@@ -120,6 +120,7 @@ impl Splits {
                 Outcome::Completed {
                     output,
                     blobs: Vec::new(),
+                    state: None,
                 },
             ));
             job.status = JobStatus::Verified { receipt };
@@ -155,6 +156,8 @@ impl SplitJob {
             units: verified().map(|(units, _)| units).sum(),
             fee: verified().map(|(_, fee)| fee).sum(),
             outcome,
+            state: None,
+            handed: None,
             results: Vec::new(),
             pieces: self.pieces.iter().map(|(id, _)| *id).collect(),
         }

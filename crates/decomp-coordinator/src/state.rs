@@ -9,6 +9,7 @@
 //! | Receipts | `receipts.jsonl` | Yes |
 //! | Which nodes hold which blobs | `storage.jsonl`, replayed at startup | Yes |
 //! | Relay channels | `relays.jsonl`, replayed at startup | Yes |
+//! | What each shard of app state holds now | `state.jsonl`, replayed at startup | Yes |
 //! | Open jobs, online nodes, and unanswered challenges | Memory | No, by design (spec section 6) |
 //!
 //! The log files are the "local signed log" that stands in for the ledger during
@@ -22,12 +23,14 @@ use std::path::Path;
 use decomp_core::{
     Account, AccountId, AccountStatus, Accounts, Assignment, Challenge, CheckedIn, Closure,
     Conduct, ContentHash, Credits, Envelope, Hosts, Incoming, JobError, JobId, JobStatus, Jobs,
-    Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, MAX_READS, Manifest, Merge, OpError,
-    Opening, PROBATION_FORFEIT_PERCENT, Penalty, Placement, PublicKey, RelayEntry, RelayError,
-    Relays, Route, ScoreEvent, Scores, Splits, SponsorError, Sponsored, Standing, Storage,
-    StorageEntry, StorageError, Storing, channel_id, fee,
+    Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, MAX_READS, MAX_SHARD_NAME_BYTES,
+    Manifest, Merge, OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT, Penalty, Placement,
+    PublicKey, RelayEntry, RelayError, Relays, Route, ScoreEvent, Scores, ShardRef, Splits,
+    SponsorError, Sponsored, Standing, StateEntry, States, Storage, StorageEntry, StorageError,
+    Storing, channel_id, fee,
 };
 use decomp_sandbox::Sandbox;
+use decomp_schema::records::{self, Records};
 use decomp_schema::{Mismatch, Signature};
 use serde::de::DeserializeOwned;
 
@@ -78,6 +81,12 @@ pub enum SubmitError {
     TypedJobSplitByBytes,
     #[error(transparent)]
     Sponsor(#[from] SponsorError),
+    #[error("a job may be handed an app's state only if it runs one of that app's modules")]
+    StateNotAllowed,
+    #[error("a shard's name is between 1 and {MAX_SHARD_NAME_BYTES} bytes")]
+    BadShardName,
+    #[error("a job that is handed state cannot be split")]
+    SplitWithState,
 }
 
 pub struct Coordinator {
@@ -102,6 +111,8 @@ pub struct Coordinator {
     storage_log: Log,
     relays: Relays,
     relays_log: Log,
+    states: States,
+    states_log: Log,
     /// How long a stored blob goes between challenges, in seconds.
     challenge_interval: u64,
 }
@@ -138,6 +149,12 @@ impl Coordinator {
             Ok(())
         })?;
 
+        let mut states = States::default();
+        let states_log = replay(&data_dir.join("state.jsonl"), |entry: StateEntry| {
+            states.apply(&entry);
+            Ok(())
+        })?;
+
         // Open jobs do not survive a restart, so hand back what was set aside for
         // any job that was still open when the coordinator last stopped.
         for job_id in ledger.escrowed_jobs() {
@@ -166,6 +183,8 @@ impl Coordinator {
             storage_log,
             relays,
             relays_log,
+            states,
+            states_log,
             challenge_interval,
         })
     }
@@ -222,12 +241,16 @@ impl Coordinator {
             jobs,
             scores,
             ledger,
+            states,
             ..
         } = self;
         let standing = |node: &PublicKey, account: &AccountId| {
             scores.standing(node, ledger.balance(account).staked)
         };
-        jobs.check_in(node, account, now, &mut rand::rng(), &standing)
+        // `settle` runs after every request, so the contents read here already
+        // include what every verified job left behind.
+        let contents = |shard: &ShardRef| states.contents(shard);
+        jobs.check_in(node, account, now, &mut rand::rng(), &standing, &contents)
     }
 
     /// Accepts a job: checks it, sets its highest possible fee aside, and queues
@@ -252,6 +275,21 @@ impl Coordinator {
         {
             if !self.blobs.contains(hash) {
                 return Err(SubmitError::UnknownBlob(*hash));
+            }
+        }
+        if let Some(shard) = &manifest.state {
+            let app = self
+                .accounts
+                .get(&shard.app)
+                .and_then(|owner| owner.app.as_ref());
+            if !app.is_some_and(|app| app.modules.contains(&manifest.module)) {
+                return Err(SubmitError::StateNotAllowed);
+            }
+            if !shard.is_well_named() {
+                return Err(SubmitError::BadShardName);
+            }
+            if manifest.split.is_some() {
+                return Err(SubmitError::SplitWithState);
             }
         }
         self.check_types(&manifest, sandbox)?;
@@ -432,6 +470,11 @@ impl Coordinator {
         self.storage.locate(root)
     }
 
+    /// The hash of the contents a shard of state has now, or `None` if it is empty.
+    pub fn shard_now(&self, shard: &ShardRef) -> Option<ContentHash> {
+        self.states.contents(shard)
+    }
+
     /// Opens a channel from the device `from` to the device `to`: chooses the
     /// node that relays it and sets the fee for `bytes` bytes aside. `payload` is
     /// the signed request, which gives the channel its name.
@@ -560,6 +603,23 @@ impl Coordinator {
                     node_accounts,
                     checker,
                 } => {
+                    // What the job left its shard with is what the next job on
+                    // that shard is handed.
+                    if let (
+                        Some(shard),
+                        Outcome::Completed {
+                            state: Some(contents),
+                            ..
+                        },
+                    ) = (&receipt.state, &receipt.outcome)
+                    {
+                        let entry = StateEntry {
+                            shard: shard.clone(),
+                            contents: *contents,
+                        };
+                        self.states.apply(&entry);
+                        self.states_log.append(&entry);
+                    }
                     self.receipts.append(&receipt);
                     let amount = receipt.fee.per_node;
                     let settle = LedgerEntry::Settle {
@@ -604,6 +664,14 @@ impl Coordinator {
                     .iter()
                     .map(|hash| (*hash, blob(hash)))
                     .collect(),
+                shard: dispute
+                    .manifest
+                    .state
+                    .as_ref()
+                    .map(|_| match dispute.shard {
+                        Some(contents) => blob(&contents),
+                        None => records::encode(&Records::new()),
+                    }),
                 compute_cap: dispute.manifest.compute_cap,
                 checkpoint_lists: dispute
                     .reports

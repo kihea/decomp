@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::account::Account;
 use crate::envelope::Envelope;
 use crate::job::{Assignment, JobResult, Manifest};
-use crate::keys::{ContentHash, JobId, PublicKey};
+use crate::keys::{AccountId, ContentHash, JobId, PublicKey};
 use crate::ledger::{Balance, Credits};
 use crate::relay::{Incoming, RelayOrder};
 use crate::storage::{Challenge, StoreOrder};
@@ -44,6 +44,9 @@ pub enum Call {
     SubmitJob { manifest: Manifest },
     /// Answer: `JobStatus`.
     GetJob { job_id: JobId },
+    /// The contents a shard of an app's state has now, to be fetched as a blob
+    /// and read as records (see `state`). Answer: `ShardNow`.
+    GetState { app: AccountId, shard: String },
     /// Puts earned credits up as stake behind the account's nodes.
     /// Answer: `AccountStatus`.
     Stake { amount: Credits },
@@ -109,6 +112,12 @@ pub struct BlobRef {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlobData {
     pub data: Blob,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShardNow {
+    /// The hash of the shard's contents, or nothing if the shard is empty.
+    pub contents: Option<ContentHash>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::Envelope;
 use crate::keys::{AccountId, ContentHash, JobId};
 use crate::ledger::{Credits, FeeSplit, fee};
+use crate::state::ShardRef;
 
 /// How many nodes run a job when the first node drawn for it is still on
 /// probation and the submitter has not asked for a number.
@@ -54,6 +55,11 @@ pub struct Manifest {
     /// ran it after would honestly disagree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reads: Vec<ContentHash>,
+    /// The shard of an app's state the job is handed, to read and to change (see
+    /// `state`). Only a job that runs one of the app's own modules may be handed
+    /// its state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ShardRef>,
 }
 
 /// The rule for cutting a job into pieces (spec section 2, "Decomposition"). The
@@ -117,6 +123,9 @@ pub enum Outcome {
         /// The blobs the job stored with `blob.put`, in the order it stored them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         blobs: Vec<ContentHash>,
+        /// The contents the job left its shard with, if it changed them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<ContentHash>,
     },
     Failed {
         failure: Failure,
@@ -153,6 +162,10 @@ pub struct Assignment {
     /// under. It differs from `job_id` only when a verified job is being reissued
     /// to check a node, which must reproduce the original run.
     pub seed: JobId,
+    /// The contents of the job's shard as they were when the job was first handed
+    /// out. `None` if the job is handed no shard, or the shard was empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard: Option<ContentHash>,
 }
 
 /// Proof of a finished job (spec section 6, "Receipts"). `results` holds the signed
@@ -166,6 +179,12 @@ pub struct Receipt {
     pub units: u64,
     pub fee: FeeSplit,
     pub outcome: Outcome,
+    /// The shard the job was handed, if any, and the contents it had then
+    /// (`None` for an empty shard). The contents the job left are in `outcome`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ShardRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handed: Option<ContentHash>,
     pub results: Vec<Envelope>,
     /// For a job that was split: its pieces, in order. Each piece has a receipt of
     /// its own holding its nodes' reports; this one totals their units and fees.

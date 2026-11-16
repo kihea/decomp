@@ -9,6 +9,8 @@
 //!
 //! Typed inputs and outputs travel as JSON, so a schema describes JSON values.
 
+pub mod records;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
