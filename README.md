@@ -458,7 +458,6 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | A torn final line in `ops.jsonl` stops the coordinator from starting | Acceptable for a development stand-in; the error names the line. | Build step 13 |
 | Devices never connect directly | Every transfer goes through a relay, even when the receiver could be reached. | Build step 8 |
 | Nothing waits for a device that is away for more than an hour | A channel lasts an hour. The spec has data for an offline device wait in network storage. | Build step 8 |
-| An abandoned channel running out has not been exercised | A channel lasts an hour, so the close and refund of one that was never finished had not been seen when this was written. Channels that end normally were. | A run that lasts an hour |
 | A relay keeps frames in memory | A relay that restarts loses what it had not delivered and the pay it had not claimed. | When relays carry more than tests |
 | A sender can make a relay take in data nobody collects | Up to 8 MiB a channel, for which the relay is not paid. Opening a channel costs the sender nothing if it is not used. | A small charge for opening a channel |
 | Relays and storage nodes are picked at random | Bandwidth is not scored, and a relay that does not deliver loses its pay but not its standing. | With the bandwidth score |
