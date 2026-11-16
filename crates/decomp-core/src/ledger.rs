@@ -216,22 +216,24 @@ pub enum LedgerEntry {
     /// Pays an account from the verification fund, for checking work: a spot
     /// check or a job with a known answer. Pays less if the fund is short.
     PayChecker { account: AccountId, amount: Credits },
-    /// Sets aside the whole fee for storing a blob, out of its owner's balance.
-    StorageEscrow {
-        root: ContentHash,
+    /// Sets aside the whole fee for a data service, out of the balance of the
+    /// account that asked for it. `id` is a stored blob's root or a relay
+    /// channel's name.
+    DataEscrow {
+        id: ContentHash,
         account: AccountId,
         amount: Credits,
     },
-    /// Pays a node for a stretch of holding a blob, out of what was set aside.
-    /// The amount is divided like a job fee: most to the node, the rest to the
-    /// verification fund and the treasury.
-    StoragePay {
-        root: ContentHash,
+    /// Pays a node for part of a data service (a stretch of holding a blob, or
+    /// bytes relayed) out of what was set aside. The amount is divided like a job
+    /// fee: most to the node, the rest to the verification fund and the treasury.
+    DataPay {
+        id: ContentHash,
         account: AccountId,
         amount: Credits,
     },
-    /// Returns what is left of a blob's storage fee to its owner.
-    StorageRefund { root: ContentHash },
+    /// Returns what is left of a data service's fee to the account that paid.
+    DataRefund { id: ContentHash },
     /// Moves earned credits into the account's stake.
     Stake { account: AccountId, amount: Credits },
     /// Moves stake back into earned credits.
@@ -243,7 +245,7 @@ pub enum LedgerEntry {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
-    #[error("the account's balance does not cover the job's highest possible fee")]
+    #[error("the account's balance does not cover the fee that must be set aside")]
     InsufficientCredits,
     #[error("only earned credits can be staked, and the account has too few")]
     InsufficientEarnedCredits,
@@ -269,8 +271,9 @@ struct Escrow {
 pub struct Ledger {
     balances: HashMap<AccountId, Balance>,
     escrows: HashMap<JobId, Escrow>,
-    /// Credits set aside for stored blobs, by the blob's root.
-    storage_escrows: HashMap<ContentHash, Escrow>,
+    /// Credits set aside for data services: by root for a stored blob, by name
+    /// for a relay channel.
+    data_escrows: HashMap<ContentHash, Escrow>,
     verification_fund: Credits,
     treasury: Credits,
 }
@@ -348,12 +351,12 @@ impl Ledger {
                     .ok_or(LedgerError::NothingEscrowed)?;
                 self.balances.entry(account).or_default().put_back(held);
             }
-            LedgerEntry::StorageEscrow {
-                root,
+            LedgerEntry::DataEscrow {
+                id,
                 account,
                 amount,
             } => {
-                if self.storage_escrows.contains_key(root) {
+                if self.data_escrows.contains_key(id) {
                     return Err(LedgerError::AlreadyEscrowed);
                 }
                 let balance = self.account(account)?;
@@ -365,16 +368,16 @@ impl Ledger {
                     account: *account,
                     held,
                 };
-                self.storage_escrows.insert(*root, escrow);
+                self.data_escrows.insert(*id, escrow);
             }
-            LedgerEntry::StoragePay {
-                root,
+            LedgerEntry::DataPay {
+                id,
                 account,
                 amount,
             } => {
                 let escrow = self
-                    .storage_escrows
-                    .get_mut(root)
+                    .data_escrows
+                    .get_mut(id)
                     .ok_or(LedgerError::NothingEscrowed)?;
                 if escrow.held.spendable() < *amount {
                     return Err(LedgerError::FeeExceedsEscrow);
@@ -386,10 +389,10 @@ impl Ledger {
                 self.verification_fund += to_fund;
                 self.treasury += *amount - to_node - to_fund;
             }
-            LedgerEntry::StorageRefund { root } => {
+            LedgerEntry::DataRefund { id } => {
                 let Escrow { account, held } = self
-                    .storage_escrows
-                    .remove(root)
+                    .data_escrows
+                    .remove(id)
                     .ok_or(LedgerError::NothingEscrowed)?;
                 self.balances.entry(account).or_default().put_back(held);
             }

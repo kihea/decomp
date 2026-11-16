@@ -1,9 +1,11 @@
 //! The DeComp node agent: this device's side of the network. It joins an
-//! account, works as a node, and submits jobs for the account.
+//! account, works as a node, submits jobs, stores files, and sends files to
+//! other devices.
 
 mod agent;
 mod device;
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,9 +15,10 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
-    AccountStatus, ContentHash, Credits, JobStatus, Manifest, Outcome, Split, merkle,
+    AccountStatus, ContentHash, Credits, JobStatus, Manifest, Outcome, PublicKey, Split, merkle,
 };
 use decomp_node::client::{Client, unix_now};
+use decomp_node::relay;
 
 use crate::agent::Reachable;
 use decomp_sandbox::{Job, Sandbox};
@@ -66,8 +69,8 @@ enum Command {
     },
     /// Work as a node: run the jobs the coordinator hands out, until stopped.
     Start {
-        /// Also hold data for the network, serving it at this local address,
-        /// such as 0.0.0.0:9000. Other devices must be able to connect to it.
+        /// Also hold and relay data for the network, at this local address, such
+        /// as 0.0.0.0:9000. Other devices must be able to connect to it.
         #[arg(long)]
         listen: Option<String>,
         /// The address other devices use to reach `--listen`, such as
@@ -86,6 +89,19 @@ enum Command {
     Fetch {
         /// The root the file was stored under, as `store` printed it.
         root: ContentHash,
+        /// Where to save the file.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Send a file to another device through a relay node.
+    Send {
+        file: PathBuf,
+        /// The receiving device's code, as `link` or `account` shows it.
+        #[arg(long)]
+        to: PublicKey,
+    },
+    /// Wait for a file sent to this device, and save it.
+    Receive {
         /// Where to save the file.
         #[arg(long)]
         output: PathBuf,
@@ -147,6 +163,8 @@ fn main() -> ExitCode {
         Command::Fetch { root, output } => {
             connect().and_then(|client| fetch(&client, root, &output))
         }
+        Command::Send { file, to } => connect().and_then(|client| send(&client, &file, to)),
+        Command::Receive { output } => connect().and_then(|client| receive(&client, &output)),
         Command::Account => connect().and_then(|client| show_account(&client)),
         Command::Stake { amount } => connect().and_then(|client| {
             show_credits(&client.stake(amount)?);
@@ -320,6 +338,53 @@ fn fetch(client: &Client, root: ContentHash, output: &Path) -> Result<ExitCode, 
         }
     }
     fail("no node that holds the file gave it")
+}
+
+/// Sends a file to another device through a relay node.
+fn send(client: &Client, file: &Path, to: PublicKey) -> Result<ExitCode, Box<dyn Error>> {
+    let bytes = fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let route = relay::send(client, to, &bytes)?;
+    println!("channel {}", route.channel);
+    println!(
+        "sent    {} bytes to the relay at {}",
+        bytes.len(),
+        route.address
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Waits for a channel addressed to this device that has something on it, and
+/// saves what it carries.
+fn receive(client: &Client, output: &Path) -> Result<ExitCode, Box<dyn Error>> {
+    println!("device  {}", client.device_key());
+    println!("waiting for a file sent to this device...");
+    // Channels that went wrong, which are not tried again.
+    let mut broken = HashSet::new();
+    loop {
+        for incoming in client.incoming()? {
+            if broken.contains(&incoming.channel) {
+                continue;
+            }
+            let bytes = match relay::receive(client, &incoming) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!("channel {}: {error}", incoming.channel);
+                    broken.insert(incoming.channel);
+                    continue;
+                }
+            };
+            fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
+            println!("from    {}", incoming.from);
+            println!(
+                "saved   {} bytes, relayed by {}",
+                bytes.len(),
+                incoming.address
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        sleep(relay::TAKE_POLL);
+    }
 }
 
 fn run_locally(job: JobArgs) -> Result<ExitCode, Box<dyn Error>> {

@@ -7,7 +7,9 @@
 //! | Node scores | `scores.jsonl`, replayed at startup | Yes |
 //! | Blobs | `blobs/`, one file per hash | Yes |
 //! | Receipts | `receipts.jsonl` | Yes |
-//! | Open jobs and online nodes | Memory | No, by design (spec section 6) |
+//! | Which nodes hold which blobs | `storage.jsonl`, replayed at startup | Yes |
+//! | Relay channels | `relays.jsonl`, replayed at startup | Yes |
+//! | Open jobs, online nodes, and unanswered challenges | Memory | No, by design (spec section 6) |
 //!
 //! The log files are the "local signed log" that stands in for the ledger during
 //! development (spec section 6).
@@ -19,10 +21,11 @@ use std::path::Path;
 
 use decomp_core::{
     Account, AccountId, AccountStatus, Accounts, Assignment, Challenge, CheckedIn, Closure,
-    Conduct, ContentHash, Credits, Envelope, JobError, JobId, JobStatus, Jobs, Ledger, LedgerEntry,
-    LedgerError, Located, MAX_PIECES, Manifest, Merge, OpError, PROBATION_FORFEIT_PERCENT, Penalty,
-    Placement, PublicKey, ScoreEvent, Scores, Splits, Standing, Storage, StorageEntry,
-    StorageError, fee,
+    Conduct, ContentHash, Credits, Envelope, Hosts, Incoming, JobError, JobId, JobStatus, Jobs,
+    Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, Manifest, Merge, OpError, Opening,
+    PROBATION_FORFEIT_PERCENT, Penalty, Placement, PublicKey, RelayEntry, RelayError, Relays,
+    Route, ScoreEvent, Scores, Splits, Standing, Storage, StorageEntry, StorageError, Storing,
+    channel_id, fee,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::{Mismatch, Signature};
@@ -39,6 +42,17 @@ pub enum StoreError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Ledger(#[from] LedgerError),
+}
+
+/// Why a channel was not opened.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenRelayError {
+    #[error(transparent)]
+    Relay(#[from] RelayError),
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
+    #[error("the receiving key is not a device in any account")]
+    UnknownDevice,
 }
 
 /// Why a job was not accepted.
@@ -76,8 +90,12 @@ pub struct Coordinator {
     /// `None` for a module that does not describe itself.
     signatures: HashMap<ContentHash, Option<Signature>>,
     receipts: Log,
+    /// The nodes other devices can connect to, which hold and relay data.
+    hosts: Hosts,
     storage: Storage,
     storage_log: Log,
+    relays: Relays,
+    relays_log: Log,
     /// How long a stored blob goes between challenges, in seconds.
     challenge_interval: u64,
 }
@@ -108,6 +126,12 @@ impl Coordinator {
             Ok(())
         })?;
 
+        let mut relays = Relays::default();
+        let relays_log = replay(&data_dir.join("relays.jsonl"), |entry: RelayEntry| {
+            relays.apply(&entry);
+            Ok(())
+        })?;
+
         // Open jobs do not survive a restart, so hand back what was set aside for
         // any job that was still open when the coordinator last stopped.
         for job_id in ledger.escrowed_jobs() {
@@ -130,8 +154,11 @@ impl Coordinator {
             splits: Splits::default(),
             signatures: HashMap::new(),
             receipts: Log::open(&data_dir.join("receipts.jsonl"))?,
+            hosts: Hosts::default(),
             storage,
             storage_log,
+            relays,
+            relays_log,
             challenge_interval,
         })
     }
@@ -157,7 +184,8 @@ impl Coordinator {
     }
 
     /// Records that a node is online and returns what it should be doing: the
-    /// job it should be running, blobs to take in, and a storage challenge.
+    /// job it should be running, blobs to take in, a storage challenge, and
+    /// channels to carry.
     pub fn check_in(
         &mut self,
         node: PublicKey,
@@ -165,7 +193,7 @@ impl Coordinator {
         address: Option<String>,
         now: u64,
     ) -> CheckedIn {
-        self.storage.seen(node, account, address, now);
+        self.hosts.seen(node, account, address, now);
         let interval = self.challenge_interval;
         CheckedIn {
             assignment: self.assignment_for(node, account, now),
@@ -173,6 +201,7 @@ impl Coordinator {
             challenge: self
                 .storage
                 .challenge_for(node, now, interval, &mut rand::rng()),
+            relay: self.relays.orders_for(&node, now),
         }
     }
 
@@ -328,9 +357,14 @@ impl Coordinator {
         days: u32,
         now: u64,
     ) -> Result<Placement, StoreError> {
-        let (placed, escrow) =
-            self.storage
-                .place(root, size, owner, days, now, &mut rand::rng())?;
+        let blob = Storing {
+            root,
+            size,
+            owner,
+            days,
+        };
+        let online = self.hosts.online(now);
+        let (placed, escrow) = self.storage.place(blob, online, now, &mut rand::rng())?;
         self.record(escrow)?;
         let StorageEntry::Placed { replicas, .. } = &placed else {
             unreachable!("placing a blob yields a Placed entry");
@@ -374,6 +408,72 @@ impl Coordinator {
         self.storage.locate(root)
     }
 
+    /// Opens a channel from the device `from` to the device `to`: chooses the
+    /// node that relays it and sets the fee for `bytes` bytes aside. `payload` is
+    /// the signed request, which gives the channel its name.
+    pub fn open_relay(
+        &mut self,
+        from: PublicKey,
+        payer: AccountId,
+        payload: &str,
+        to: PublicKey,
+        bytes: u64,
+        now: u64,
+    ) -> Result<Route, OpenRelayError> {
+        let known = self.accounts.account_of(&to);
+        if !known.is_some_and(|account| account.authorizes(&to)) {
+            return Err(OpenRelayError::UnknownDevice);
+        }
+        let channel = channel_id(&from, payload);
+        let opening = Opening {
+            channel,
+            from,
+            payer,
+            to,
+            bytes,
+        };
+        let online = self.hosts.online(now);
+        let (opened, escrow) = self.relays.open(opening, &online, now, &mut rand::rng())?;
+        self.record(escrow)?;
+        let RelayEntry::Opened { relay, .. } = &opened else {
+            unreachable!("opening a channel yields an Opened entry");
+        };
+        let address = relay.address.clone();
+        self.note_relay(opened, None);
+        Ok(Route { channel, address })
+    }
+
+    /// The open channels addressed to a device.
+    pub fn incoming(&self, to: &PublicKey, now: u64) -> Vec<Incoming> {
+        self.relays.incoming(to, now)
+    }
+
+    /// Pays a relay node for the bytes a channel's receiver has signed for.
+    pub fn redeem_relay(
+        &mut self,
+        node: &PublicKey,
+        header: &Envelope,
+        receipt: &Envelope,
+    ) -> Result<(), RelayError> {
+        for (entry, credits) in self.relays.redeem(node, header, receipt)? {
+            self.note_relay(entry, Some(credits));
+        }
+        Ok(())
+    }
+
+    /// Applies and records a change to the channels, and moves any credits that
+    /// go with it.
+    fn note_relay(&mut self, entry: RelayEntry, credits: Option<LedgerEntry>) {
+        self.relays.apply(&entry);
+        self.relays_log.append(&entry);
+        if let Some(credits) = credits {
+            // A relay is never paid for more bytes than the channel may carry, and
+            // the fee for that many was set aside when it opened.
+            self.record(credits)
+                .expect("relay payments fit what was set aside");
+        }
+    }
+
     /// Applies and records a change to what is stored where, moves any credits
     /// that go with it, and scores the node if it was challenged.
     fn note_storage(&mut self, entry: StorageEntry, payment: Option<LedgerEntry>) {
@@ -410,6 +510,9 @@ impl Coordinator {
     pub fn settle(&mut self, now: u64) {
         for (entry, refund) in self.storage.sweep(now) {
             self.note_storage(entry, refund);
+        }
+        for (entry, refund) in self.relays.sweep(now) {
+            self.note_relay(entry, Some(refund));
         }
         for event in self.jobs.take_events() {
             let penalty = self.scores.apply(&event);

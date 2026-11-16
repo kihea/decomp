@@ -6,14 +6,20 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::account::Account;
+use crate::envelope::Envelope;
 use crate::job::{Assignment, JobResult, Manifest};
-use crate::keys::{ContentHash, JobId};
+use crate::keys::{ContentHash, JobId, PublicKey};
 use crate::ledger::{Balance, Credits};
+use crate::relay::{Incoming, RelayOrder};
 use crate::storage::{Challenge, StoreOrder};
 
 /// The largest request or answer either side accepts. A blob travels inside one
 /// as base64, so this allows blobs of up to about 48 MB.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// How far a signed request's `issued_at` may be from the clock of whoever
+/// receives it. This bounds how long a captured request can be replayed.
+pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
 
 /// A signed request. `issued_at` (seconds since 1970) must be close to the
 /// coordinator's clock, which bounds how long a captured request can be replayed.
@@ -73,6 +79,15 @@ pub enum Call {
         chunk: Blob,
         proof: Vec<ContentHash>,
     },
+    /// Opens a channel to the device `to` through a relay node, for up to `bytes`
+    /// bytes, and sets the fee for that much aside (see `relay`). Answer: `Route`.
+    OpenRelay { to: PublicKey, bytes: u64 },
+    /// The open channels addressed to the signing device. Answer: `IncomingChannels`.
+    ListIncoming,
+    /// A relay node claiming its pay: a frame header from a channel's sender, and
+    /// a `Take` in which the receiver signed for that frame. Answer: an empty
+    /// object.
+    RedeemRelay { header: Envelope, receipt: Envelope },
     /// A node reporting what a job produced. Answer: an empty object.
     SubmitResult { result: JobResult },
 }
@@ -111,6 +126,14 @@ pub struct CheckedIn {
     /// A storage challenge to answer.
     #[serde(default)]
     pub challenge: Option<Challenge>,
+    /// The open channels the node is asked to carry.
+    #[serde(default)]
+    pub relay: Vec<RelayOrder>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IncomingChannels {
+    pub channels: Vec<Incoming>,
 }
 
 /// The nodes a blob should be uploaded to.

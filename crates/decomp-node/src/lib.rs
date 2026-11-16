@@ -3,6 +3,9 @@
 //! kept and when to work; this crate talks to the coordinator and runs the jobs.
 
 pub mod client;
+mod peer;
+pub mod relay;
+pub mod server;
 pub mod store;
 mod work;
 

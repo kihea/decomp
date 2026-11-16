@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decomp_core::{
     AccountStatus, Blob, BlobData, BlobRef, Call, Challenge, CheckedIn, ContentHash, Credits,
-    Envelope, JobId, JobResult, JobStatus, Located, MAX_MESSAGE_BYTES, Manifest, Placement,
-    PublicKey, Refusal, Request, SigningKey, Standing, Submitted,
+    Envelope, Incoming, IncomingChannels, JobId, JobResult, JobStatus, Located, MAX_MESSAGE_BYTES,
+    Manifest, Placement, PublicKey, Refusal, Request, Route, SigningKey, Standing, Submitted,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -54,6 +54,12 @@ impl Client {
 
     pub fn device_key(&self) -> PublicKey {
         self.key.public_key()
+    }
+
+    /// This device's key, for signing what goes to other devices and to nodes
+    /// rather than to the coordinator.
+    pub fn key(&self) -> &SigningKey {
+        &self.key
     }
 
     pub fn account(&self) -> Result<AccountStatus, ClientError> {
@@ -136,6 +142,25 @@ impl Client {
             chunk,
             proof,
         })?;
+        Ok(())
+    }
+
+    /// Opens a channel to the device `to` through a relay node, paying for up
+    /// to `bytes` bytes; answers with where to send them.
+    pub fn open_relay(&self, to: PublicKey, bytes: u64) -> Result<Route, ClientError> {
+        self.call(Call::OpenRelay { to, bytes })
+    }
+
+    /// The open channels addressed to this device.
+    pub fn incoming(&self) -> Result<Vec<Incoming>, ClientError> {
+        let incoming: IncomingChannels = self.call(Call::ListIncoming)?;
+        Ok(incoming.channels)
+    }
+
+    /// Claims a relay node's pay with a frame header from a channel's sender and
+    /// the receiver's signed word that it has that frame.
+    pub fn redeem_relay(&self, header: Envelope, receipt: Envelope) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::RedeemRelay { header, receipt })?;
         Ok(())
     }
 

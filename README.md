@@ -112,15 +112,34 @@ declares, made when the job is submitted and before any node runs it.
   node. What arrives is checked against the root, so a node cannot pass off
   other data.
 
+**Relays, done by nodes** (the second data service in build step 7).
+
+- Two devices that cannot connect to each other both connect to a relay: a node
+  that accepts connections. The sender opens a channel to the receiving device,
+  and the coordinator picks the relay and sets aside the fee for the most the
+  channel may carry. The data itself never passes through the coordinator.
+- The sender signs every frame it sends, so the receiver can tell that nothing
+  was changed, dropped, or reordered on the way. Only the receiving device can
+  collect a channel.
+- A relay is paid for what arrived. Each time the receiver asks for more, it
+  signs for what it already has, and the relay shows that signature and the
+  sender's to the coordinator. A relay that takes data and does not deliver it
+  earns nothing, and the sender gets back whatever was not delivered.
+- A relay holds a few megabytes for a receiver that is behind and makes the
+  sender wait beyond that. A channel closes when its last frame is delivered, or
+  after an hour.
+- A node keeps checking in while it runs a job, so taking in blobs, answering
+  storage challenges, and carrying channels do not wait for the job to finish.
+
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage rules, and every message shape. No I/O. |
+| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage and relay rules, and every message shape. No I/O. |
 | `crates/decomp-schema` | How a job's input and output types are described and checked. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
 | `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, and what it stores (logs, blobs). |
-| `crates/decomp-node` | The node agent, as a library and as the `decomp-node` command: joins an account, works as a node, holds data, and submits jobs and files. |
+| `crates/decomp-node` | The node agent, as a library and as the `decomp-node` command: joins an account, works as a node, holds and relays data, submits jobs, stores files, and sends files to other devices. |
 | `client-ts` | The TypeScript client: message shapes, signing, and calls. It has no dependencies. |
 
 ## Run it
@@ -143,8 +162,8 @@ cargo run -p decomp-node -- link
 cargo run -p decomp-node -- start
 ```
 
-A node that also holds data. Other devices must be able to connect to the
-address it listens on; `--public-url` says how, if that differs:
+A node that also holds and relays data. Other devices must be able to connect to
+the address it listens on; `--public-url` says how, if that differs:
 
 ```bash
 cargo run -p decomp-node -- start --listen 0.0.0.0:9000
@@ -159,6 +178,17 @@ cargo run -p decomp-node -- store path/to/file --days 7
 
 ```bash
 cargo run -p decomp-node -- fetch <root> --output path/to/copy
+```
+
+A file sent to another device through a relay node. The receiving device runs
+`receive`, which shows its code and waits; the sender names that code:
+
+```bash
+cargo run -p decomp-node -- receive --output path/to/copy
+```
+
+```bash
+cargo run -p decomp-node -- send path/to/file --to <device code>
 ```
 
 A job sent to the network, from a linked device:
@@ -258,22 +288,37 @@ each platform keeps secrets in its own secure storage.
 nodes and paid for in credits. DeComp does not lean on an outside peer-to-peer
 network for them.
 
-**Only reachable nodes hold data.** A device behind a home router cannot accept
-connections, so it cannot serve a file to anyone. Nodes that can be reached take
-the storage work; every node can still do compute, which needs only outgoing
-connections. The coordinator stays out of the data path: it decides who holds
-what, challenges them, and pays.
+**Only reachable nodes hold or relay data.** A device behind a home router cannot
+accept connections, so it cannot serve a file to anyone or pass one on. Nodes
+that can be reached take the data work; every node can still do compute, which
+needs only outgoing connections. The coordinator stays out of the data path: it
+decides who holds or carries what, checks them, and pays.
+
+**A relay is paid on the receiver's signature.** Paying a relay for whatever the
+sender handed it would pay a relay that threw the data away. So a claim needs two
+signatures: the sender's, on a frame header that counts the bytes sent so far,
+and the receiver's, on a request that says it has that frame. The receiver signs
+as part of asking for more, so no extra message is needed. The most a relay can
+lose to a receiver that takes data and does not sign is one answer's worth, four
+megabytes.
+
+**A node checks in while it works.** A job runs on its own thread and the node
+keeps checking in every two seconds. Storage challenges must be answered within a
+minute and a new channel must be picked up at once, and a job can run far longer
+than either.
 
 **Stored blobs are named by a hash-tree root, not a plain hash.** With a root, one
 chunk can be proven to belong to the blob, so the coordinator can check that a
 node still holds a blob without holding it too. Modules, inputs, and outputs keep
 their plain hashes.
 
-**Storage is priced by size and time.** A node is paid 180 credits to hold a
-gibibyte for a day, before the usual fee split. The spec prices compute and not
-storage; this starting value is what cloud storage costs at the credit value the
-spec's compute price implies. It is `CREDITS_PER_GIB_DAY` in
-`crates/decomp-core/src/storage.rs`, and the owner has not yet confirmed it.
+**Storage is priced by size and time, relaying by the byte.** Before the usual fee
+split, a node is paid 180 credits to hold a gibibyte for a day and 2,500 credits
+to relay a gibibyte. The spec prices compute and not data. These starting values
+are what cloud storage and hosted bandwidth cost at the credit value the spec's
+compute price implies. They are `CREDITS_PER_GIB_DAY` in
+`crates/decomp-core/src/storage.rs` and `CREDITS_PER_GIB_RELAYED` in
+`crates/decomp-core/src/relay.rs`, and the owner has not yet confirmed them.
 
 ## Known gaps
 
@@ -285,7 +330,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | No test vectors shared by Rust and TypeScript | Same reason. Until then, a change to the envelope format must be checked end to end by hand. | First test pass |
 | The account key is the only controller | Passkeys, recovery keys, guardians, and email reset are build step 14. A device that loses its account key cannot be recovered. | Build step 14 |
 | The command-line node keeps its key in a plain file | It has no access to the system keychain. On Unix the file is readable by its owner only. | When the command needs it |
-| A job is not handed to another node if one goes silent | It waits for its deadline and expires; the silent node loses availability. A working node does not check in, so the coordinator cannot yet tell busy from gone. | A heartbeat from working nodes |
+| A job is not handed to another node if one goes silent | It waits for its deadline and expires; the silent node loses availability. A working node now checks in, but the coordinator does not yet use that to tell a node that has gone from one that is busy. | Re-assignment of jobs |
 | Assignment draws on the coordinator's own randomness | The spec calls for a public source so anyone can recheck a draw. | With staked operators, build step 13 |
 | The price of a unit is fixed at one credit | The spec lets the base price float with load and each tier carry a premium that moves with supply and demand. Both need load measurements that a test network cannot give. | When there is real traffic to steer |
 | Disputes re-run a job from its start, and spot checks re-run all of it | The spec re-runs one segment between two checkpoints. That needs a job's state to be restored mid-run, which a compiled engine cannot do; an interpreter with saved state, or a proof system, could. A spot check therefore costs a whole second run. | Zero-knowledge proofs, or an interpreter built for it |
@@ -301,14 +346,21 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | A job that overflows the call stack may not fail the same way everywhere | Stack depth is measured in native stack bytes, which differ by processor type. Two honest nodes on different processors could disagree about such a job. | Before nodes on mixed hardware verify each other (build step 5) |
 | Modules are compiled again on every run | The agent has no cache of compiled modules yet. Compiling is fast next to running a job. | When measurements show it matters |
 | A torn final line in `ops.jsonl` stops the coordinator from starting | Acceptable for a development stand-in; the error names the line. | Build step 13 |
-| Relays are not built | Devices cannot yet pass messages or files to each other through nodes. | Next, on the same footing as storage |
-| The storage price is not confirmed | 180 credits a gibibyte-day is derived from the spec's compute price, not chosen by the owner. | Owner's decision |
+| Relayed data is not encrypted | The spec has everything encrypted to the receiving device's key. Device keys only sign, and a browser's key cannot be turned into one that encrypts, so each device needs a second key. Until then a relay can read what it carries, though it cannot change it. | Build step 8, before Send carries anything real |
+| Devices never connect directly | Every transfer goes through a relay, even when the receiver could be reached. | Build step 8 |
+| Nothing waits for a device that is away for more than an hour | A channel lasts an hour. The spec has data for an offline device wait in network storage. | Build step 8 |
+| An abandoned channel running out has not been exercised | A channel lasts an hour, so the close and refund of one that was never finished had not been seen when this was written. Channels that end normally were. | A run that lasts an hour |
+| A relay keeps frames in memory | A relay that restarts loses what it had not delivered and the pay it had not claimed. | When relays carry more than tests |
+| A sender can make a relay take in data nobody collects | Up to 8 MiB a channel, for which the relay is not paid. Opening a channel costs the sender nothing if it is not used. | A small charge for opening a channel |
+| Relays and storage nodes are picked at random | Bandwidth is not scored, and a relay that does not deliver loses its pay but not its standing. | With the bandwidth score |
+| A receiver polls its relay | It asks twice a second, and each frame is its own request. Good enough for files; too slow for anything live. | Real-time apps |
+| The storage and relay prices are not confirmed | 180 credits a gibibyte-day and 2,500 credits a gibibyte relayed are derived from the spec's compute price, not chosen by the owner. | Owner's decision |
 | A blob's paid time running out has not been exercised | The shortest time that can be paid for is a day, so the end of a deal, the refund of what was not paid out, and nodes deleting the blob were not run. | A run that lasts a day, or tests |
 | A lost copy is not replaced | When a node's copy is counted as lost, no other node is asked to take one. | With re-replication |
 | A node's address is taken on trust | The coordinator does not check that a node can be reached where it says. A node that lies is never sent the blob, so it is never paid, but the blob ends up with fewer copies. | A reachability check at check-in |
-| Job blobs are still held by the coordinator | Modules, inputs, and outputs do not yet go through node storage. | After relays |
+| Job blobs are still held by the coordinator | Modules, inputs, and outputs do not yet go through node storage. | Later in build step 7 |
 | The same blob cannot be stored twice | A second request for a root already stored is refused, even from another account. | When two accounts need the same data |
 | Stored blobs are readable by anyone with the root | There is no private mode yet. | Build step 9 |
-| Logs can fall out of step on a crash | A storage change and the credits that go with it are written to two files, one after the other. | Settlement, build step 13 |
+| Logs can fall out of step on a crash | A storage or relay change and the credits that go with it are written to two files, one after the other. | Settlement, build step 13 |
 | No app manifests or sponsored jobs | An application cannot yet register itself or pay for its users' jobs from a pool of its own. | Build step 7 |
 | Four host functions are missing | State (`kv`), blobs by hash, follow-up jobs, and sealing data to a key. | With storage (state, blobs), sponsorship (follow-up jobs), and private mode (sealing) |

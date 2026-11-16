@@ -15,19 +15,16 @@ use axum::routing::post;
 use axum::{Json, Router};
 use decomp_core::{
     Account, AccountStatus, Accounts, Blob, BlobData, BlobRef, Call, ContentHash, Envelope,
-    EnvelopeError, JobError, LedgerEntry, LedgerError, MAX_MESSAGE_BYTES, OpError, Outcome,
-    PublicKey, Refusal, Request, StorageError, Submitted,
+    EnvelopeError, IncomingChannels, JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS,
+    MAX_MESSAGE_BYTES, OpError, Outcome, PublicKey, Refusal, RelayError, Request, StorageError,
+    Submitted,
 };
 use decomp_sandbox::Sandbox;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 use crate::referee::referee;
-use crate::state::{Coordinator, StoreError, SubmitError};
-
-/// How far a request's `issued_at` may be from the coordinator's clock. This bounds
-/// how long a captured request can be replayed.
-const MAX_CLOCK_SKEW_SECS: u64 = 300;
+use crate::state::{Coordinator, OpenRelayError, StoreError, SubmitError};
 
 struct App {
     coordinator: Mutex<Coordinator>,
@@ -186,6 +183,19 @@ fn answer(
             proof,
         } => {
             coordinator.answer_challenge(signer, challenge, &chunk.0, &proof, now)?;
+            Json(json!({})).into_response()
+        }
+        Call::OpenRelay { to, bytes } => {
+            let payload = &envelope.payload;
+            Json(coordinator.open_relay(signer, account.id, payload, to, bytes, now)?)
+                .into_response()
+        }
+        Call::ListIncoming => Json(IncomingChannels {
+            channels: coordinator.incoming(&signer, now),
+        })
+        .into_response(),
+        Call::RedeemRelay { header, receipt } => {
+            coordinator.redeem_relay(&signer, &header, &receipt)?;
             Json(json!({})).into_response()
         }
         Call::SubmitResult { result } => {
@@ -373,6 +383,35 @@ impl From<StorageError> for ApiError {
             StorageError::NotChallenged => (StatusCode::CONFLICT, "not_challenged"),
         };
         Self::new(status, code, error.to_string())
+    }
+}
+
+impl From<RelayError> for ApiError {
+    fn from(error: RelayError) -> Self {
+        let (status, code) = match error {
+            RelayError::ChannelExists => (StatusCode::CONFLICT, "channel_exists"),
+            RelayError::BadSize => (StatusCode::BAD_REQUEST, "bad_size"),
+            RelayError::NoRelay => (StatusCode::SERVICE_UNAVAILABLE, "no_relay"),
+            RelayError::UnknownChannel => (StatusCode::NOT_FOUND, "unknown_channel"),
+            RelayError::NotTheRelay => (StatusCode::FORBIDDEN, "not_the_relay"),
+            RelayError::NotFromSender => (StatusCode::BAD_REQUEST, "not_from_sender"),
+            RelayError::OverBudget => (StatusCode::BAD_REQUEST, "over_budget"),
+            RelayError::NotCollected => (StatusCode::BAD_REQUEST, "not_collected"),
+        };
+        Self::new(status, code, error.to_string())
+    }
+}
+
+impl From<OpenRelayError> for ApiError {
+    fn from(error: OpenRelayError) -> Self {
+        let message = error.to_string();
+        match error {
+            OpenRelayError::Relay(inner) => inner.into(),
+            OpenRelayError::Ledger(inner) => inner.into(),
+            OpenRelayError::UnknownDevice => {
+                Self::new(StatusCode::NOT_FOUND, "unknown_device", message)
+            }
+        }
     }
 }
 

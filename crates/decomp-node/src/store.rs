@@ -1,8 +1,7 @@
-//! A node's side of storage: the blobs it holds for the network, the small web
-//! server other devices send them to and fetch them from, and the two calls a
-//! device makes to such a server.
+//! Storage, from both ends: the blobs a node holds for the network, and the two
+//! calls a device makes to send a blob to such a node and fetch it back.
 //!
-//! The server takes in only blobs the coordinator has asked this node to hold, and
+//! A node takes in only blobs the coordinator has asked this node to hold, and
 //! only if they hash to the root they are stored under, so nobody can fill a
 //! node's disk with data it was not asked to take. Anyone who knows a blob's root
 //! can fetch it.
@@ -12,17 +11,14 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
 
 use decomp_core::{ContentHash, StoreOrder, merkle};
-use tiny_http::{Method, Request, Response, Server};
+use tiny_http::{Method, Request, Response};
+
+use crate::peer;
 
 /// Where a node's server keeps blobs, in its web addresses.
-const BLOB_PATH: &str = "/v1/stored/";
-
-/// How long a device waits for a node to take or give a blob.
-const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const BLOB_PATH: &str = "/v1/stored/";
 
 /// The blobs this node holds, and those it has been asked to take in.
 pub struct Store {
@@ -92,25 +88,10 @@ impl Store {
     }
 }
 
-/// Starts the web server other devices reach this node's store through. It runs
-/// on its own thread for as long as the program does.
-pub fn serve(store: Arc<Store>, listen: &str) -> io::Result<()> {
-    let server = Server::http(listen).map_err(io::Error::other)?;
-    thread::spawn(move || {
-        for request in server.incoming_requests() {
-            // A device that hangs up mid-answer is its own problem.
-            let _ = answer(&store, request);
-        }
-    });
-    Ok(())
-}
-
-fn answer(store: &Store, mut request: Request) -> io::Result<()> {
-    let root: Option<ContentHash> = request
-        .url()
-        .strip_prefix(BLOB_PATH)
-        .and_then(|root| root.parse().ok());
-    let Some(root) = root else {
+/// Answers a request to this node's server about the blob named in `path`, which
+/// is the rest of the address after `BLOB_PATH`.
+pub(crate) fn answer(store: &Store, path: &str, mut request: Request) -> io::Result<()> {
+    let Ok(root) = path.parse::<ContentHash>() else {
         return request.respond(Response::from_string("no such address").with_status_code(404));
     };
     match request.method() {
@@ -129,7 +110,7 @@ fn answer(store: &Store, mut request: Request) -> io::Result<()> {
 /// Sends a blob to the node at `address`. Fails if the node refuses it, which it
 /// does until it has heard from the coordinator that it should hold the blob.
 pub fn upload(address: &str, root: &ContentHash, bytes: &[u8]) -> Result<(), String> {
-    let response = transfers()
+    let response = peer::agent()
         .put(&format!("{address}{BLOB_PATH}{root}"))
         .send(bytes)
         .map_err(|error| error.to_string())?;
@@ -143,7 +124,7 @@ pub fn upload(address: &str, root: &ContentHash, bytes: &[u8]) -> Result<(), Str
 /// Fetches the blob named `root`, of `size` bytes, from the node at `address`,
 /// and checks that what arrived is that blob.
 pub fn download(address: &str, root: &ContentHash, size: u64) -> Result<Vec<u8>, String> {
-    let response = transfers()
+    let response = peer::agent()
         .get(&format!("{address}{BLOB_PATH}{root}"))
         .call()
         .map_err(|error| error.to_string())?;
@@ -163,13 +144,4 @@ pub fn download(address: &str, root: &ContentHash, size: u64) -> Result<Vec<u8>,
         return Err("the node sent something other than the blob".into());
     }
     Ok(bytes)
-}
-
-fn transfers() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        // Read refusals ourselves: their bodies say why.
-        .http_status_as_error(false)
-        .timeout_global(Some(TRANSFER_TIMEOUT))
-        .build()
-        .new_agent()
 }

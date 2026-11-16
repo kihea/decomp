@@ -8,8 +8,8 @@
 //! data itself. A node is paid for the time up to each challenge it passes.
 //!
 //! What must last (who holds what, and what has been paid) changes only by
-//! applying entries, so a log of entries is a complete copy. Which nodes are
-//! online and which challenges are awaiting answers are not kept.
+//! applying entries, so a log of entries is a complete copy. Which challenges
+//! are awaiting answers is not kept.
 
 use std::collections::HashMap;
 
@@ -17,7 +17,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 
-use crate::jobs::ONLINE_WINDOW_SECS;
+use crate::hosts::Host;
 use crate::keys::{AccountId, ContentHash, PublicKey};
 use crate::ledger::{Credits, LedgerEntry};
 use crate::merkle;
@@ -54,15 +54,6 @@ pub fn storage_fee(size: u64, secs: u64) -> Credits {
     Credits::from_micros((work * micros_per_gib_day).div_ceil(span) as u64)
 }
 
-/// A node holding, or asked to hold, a blob.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Replica {
-    pub node: PublicKey,
-    pub account: AccountId,
-    /// Where other devices reach the node, such as `http://203.0.113.5:9000`.
-    pub address: String,
-}
-
 /// A change to what is stored where.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -72,7 +63,7 @@ pub enum StorageEntry {
         root: ContentHash,
         size: u64,
         owner: AccountId,
-        replicas: Vec<Replica>,
+        replicas: Vec<Host>,
         until: u64,
     },
     /// A node received the blob. It is paid from this moment.
@@ -115,6 +106,15 @@ pub enum StorageError {
     NotChallenged,
 }
 
+/// A blob an account asks to have held.
+pub struct Storing {
+    pub root: ContentHash,
+    pub size: u64,
+    /// The account that pays.
+    pub owner: AccountId,
+    pub days: u32,
+}
+
 /// What a node is asked to hold.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoreOrder {
@@ -145,7 +145,7 @@ struct Deal {
 }
 
 struct Holder {
-    replica: Replica,
+    replica: Host,
     state: Holding,
 }
 
@@ -167,18 +167,10 @@ struct Awaited {
     asked_at: u64,
 }
 
-struct Reachable {
-    account: AccountId,
-    address: String,
-    last_seen: u64,
-}
-
-/// What is stored where, and which nodes can take more.
+/// What is stored where.
 #[derive(Default)]
 pub struct Storage {
     deals: HashMap<ContentHash, Deal>,
-    /// Nodes that say other devices can connect to them.
-    reachable: HashMap<PublicKey, Reachable>,
     /// The one challenge each node may have awaiting an answer.
     awaited: HashMap<PublicKey, Awaited>,
 }
@@ -248,61 +240,34 @@ impl Storage {
         }
     }
 
-    /// Notes that a node checked in, and whether other devices can reach it.
-    pub fn seen(&mut self, node: PublicKey, account: AccountId, address: Option<String>, now: u64) {
-        match address {
-            Some(address) => {
-                self.reachable.insert(
-                    node,
-                    Reachable {
-                        account,
-                        address,
-                        last_seen: now,
-                    },
-                );
-            }
-            None => {
-                self.reachable.remove(&node);
-            }
-        }
-    }
-
-    /// Chooses nodes to hold a blob for `days` days. Returns the entry that
+    /// Chooses which of the `online` hosts hold a blob. Returns the entry that
     /// records the choice and the ledger entry that sets the whole fee aside.
     pub fn place(
         &self,
-        root: ContentHash,
-        size: u64,
-        owner: AccountId,
-        days: u32,
+        blob: Storing,
+        mut online: Vec<Host>,
         now: u64,
         rng: &mut impl Rng,
     ) -> Result<(StorageEntry, LedgerEntry), StorageError> {
+        let Storing {
+            root,
+            size,
+            owner,
+            days,
+        } = blob;
         if self.deals.contains_key(&root) {
             return Err(StorageError::AlreadyStored);
         }
         if days == 0 || days > MAX_DAYS {
             return Err(StorageError::BadDuration);
         }
-        let mut online: Vec<(&PublicKey, &Reachable)> = self
-            .reachable
-            .iter()
-            .filter(|(_, node)| now.saturating_sub(node.last_seen) <= ONLINE_WINDOW_SECS)
-            .collect();
         online.shuffle(rng);
-
-        let mut replicas: Vec<Replica> = Vec::new();
-        for (node, reachable) in online {
+        let mut replicas: Vec<Host> = Vec::new();
+        for host in online {
             if replicas.len() < TARGET_REPLICAS
-                && replicas
-                    .iter()
-                    .all(|chosen| chosen.account != reachable.account)
+                && replicas.iter().all(|chosen| chosen.account != host.account)
             {
-                replicas.push(Replica {
-                    node: *node,
-                    account: reachable.account,
-                    address: reachable.address.clone(),
-                });
+                replicas.push(host);
             }
         }
         if replicas.len() < MIN_REPLICAS {
@@ -321,8 +286,8 @@ impl Storage {
                 replicas,
                 until,
             },
-            LedgerEntry::StorageEscrow {
-                root,
+            LedgerEntry::DataEscrow {
+                id: root,
                 account: owner,
                 amount,
             },
@@ -440,8 +405,8 @@ impl Storage {
             }) => {
                 let held_for = now.min(deal.until).saturating_sub(*paid_through);
                 let amount = storage_fee(deal.size, held_for);
-                (amount > Credits::ZERO).then_some(LedgerEntry::StoragePay {
-                    root,
+                (amount > Credits::ZERO).then_some(LedgerEntry::DataPay {
+                    id: root,
                     account: replica.account,
                     amount,
                 })
@@ -479,7 +444,7 @@ impl Storage {
         });
         for (root, deal) in &self.deals {
             if deal.until <= now {
-                let refund = LedgerEntry::StorageRefund { root: *root };
+                let refund = LedgerEntry::DataRefund { id: *root };
                 entries.push((StorageEntry::Ended { root: *root }, Some(refund)));
             }
         }
