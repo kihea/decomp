@@ -94,15 +94,33 @@ hashing, Ed25519 signature checks, and randomness fixed by the job, so every nod
 draws the same bytes), and a check of a job's input against the types its module
 declares, made when the job is submitted and before any node runs it.
 
+**Storage, done by nodes** (the first of the data services in build step 7).
+
+- A node that other devices can connect to says so when it checks in, and from
+  then on may be asked to hold data. Nodes that cannot be reached do compute only.
+- An account pays to have a blob held for a number of days. The coordinator
+  chooses up to three such nodes, each from a different account, and the device
+  uploads the blob to each of them directly. The coordinator never holds it.
+- A stored blob is named by the root of a hash tree over its chunks. A node takes
+  in only a blob it was asked to hold and that hashes to its root.
+- Every so often each node is challenged to produce one randomly chosen chunk,
+  with the hashes that link it to the root. A node is paid for the time up to
+  each challenge it passes. Failing, or not answering within a minute, costs it
+  that stretch of pay and some availability; three failures in a row and its
+  copy is counted as lost.
+- Anyone who knows a blob's root can ask where it is held and fetch it from a
+  node. What arrives is checked against the root, so a node cannot pass off
+  other data.
+
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), and every message shape. No I/O. |
+| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage rules, and every message shape. No I/O. |
 | `crates/decomp-schema` | How a job's input and output types are described and checked. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
 | `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, and what it stores (logs, blobs). |
-| `crates/decomp-node` | The node agent, as a library and as the `decomp-node` command: joins an account, works as a node, and submits jobs. |
+| `crates/decomp-node` | The node agent, as a library and as the `decomp-node` command: joins an account, works as a node, holds data, and submits jobs and files. |
 | `client-ts` | The TypeScript client: message shapes, signing, and calls. It has no dependencies. |
 
 ## Run it
@@ -125,6 +143,24 @@ cargo run -p decomp-node -- link
 cargo run -p decomp-node -- start
 ```
 
+A node that also holds data. Other devices must be able to connect to the
+address it listens on; `--public-url` says how, if that differs:
+
+```bash
+cargo run -p decomp-node -- start --listen 0.0.0.0:9000
+```
+
+A file stored on the network for a week, and fetched back by the root that
+`store` prints:
+
+```bash
+cargo run -p decomp-node -- store path/to/file --days 7
+```
+
+```bash
+cargo run -p decomp-node -- fetch <root> --output path/to/copy
+```
+
 A job sent to the network, from a linked device:
 
 ```bash
@@ -137,7 +173,9 @@ The same job on this device alone, without the network:
 cargo run -p decomp-node -- run path/to/module.wasm --input path/to/input --compute-cap 4
 ```
 
-Coordinator settings are `DECOMP_ADDR` and `DECOMP_DATA_DIR`. The node agent takes
+Coordinator settings are `DECOMP_ADDR`, `DECOMP_DATA_DIR`, and
+`DECOMP_STORAGE_CHALLENGE_SECS` (how often each node is asked to show that it
+still holds a blob; an hour unless set). The node agent takes
 `--coordinator` and `--dir`, or `DECOMP_COORDINATOR_URL` and `DECOMP_NODE_DIR`.
 
 Checks, run before every commit, from this folder:
@@ -216,9 +254,26 @@ repeats the message shapes and the signing convention in TypeScript, and must
 change together with the Rust. It holds no keys: a caller hands it a `Signer`, so
 each platform keeps secrets in its own secure storage.
 
-**Data services are node work.** Storing, serving, and relaying data are jobs of
-the data class, done by nodes and paid for like any other job. DeComp does not
-lean on an outside peer-to-peer network for them.
+**Data services are node work.** Storing, serving, and relaying data are done by
+nodes and paid for in credits. DeComp does not lean on an outside peer-to-peer
+network for them.
+
+**Only reachable nodes hold data.** A device behind a home router cannot accept
+connections, so it cannot serve a file to anyone. Nodes that can be reached take
+the storage work; every node can still do compute, which needs only outgoing
+connections. The coordinator stays out of the data path: it decides who holds
+what, challenges them, and pays.
+
+**Stored blobs are named by a hash-tree root, not a plain hash.** With a root, one
+chunk can be proven to belong to the blob, so the coordinator can check that a
+node still holds a blob without holding it too. Modules, inputs, and outputs keep
+their plain hashes.
+
+**Storage is priced by size and time.** A node is paid 180 credits to hold a
+gibibyte for a day, before the usual fee split. The spec prices compute and not
+storage; this starting value is what cloud storage costs at the credit value the
+spec's compute price implies. It is `CREDITS_PER_GIB_DAY` in
+`crates/decomp-core/src/storage.rs`, and the owner has not yet confirmed it.
 
 ## Known gaps
 
@@ -246,6 +301,14 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | A job that overflows the call stack may not fail the same way everywhere | Stack depth is measured in native stack bytes, which differ by processor type. Two honest nodes on different processors could disagree about such a job. | Before nodes on mixed hardware verify each other (build step 5) |
 | Modules are compiled again on every run | The agent has no cache of compiled modules yet. Compiling is fast next to running a job. | When measurements show it matters |
 | A torn final line in `ops.jsonl` stops the coordinator from starting | Acceptable for a development stand-in; the error names the line. | Build step 13 |
-| Storage and relays are not built | Blobs are still held by the coordinator. Nodes do not yet store, serve, or relay data, and there are no storage challenges. | Next: the data class of jobs |
+| Relays are not built | Devices cannot yet pass messages or files to each other through nodes. | Next, on the same footing as storage |
+| The storage price is not confirmed | 180 credits a gibibyte-day is derived from the spec's compute price, not chosen by the owner. | Owner's decision |
+| A blob's paid time running out has not been exercised | The shortest time that can be paid for is a day, so the end of a deal, the refund of what was not paid out, and nodes deleting the blob were not run. | A run that lasts a day, or tests |
+| A lost copy is not replaced | When a node's copy is counted as lost, no other node is asked to take one. | With re-replication |
+| A node's address is taken on trust | The coordinator does not check that a node can be reached where it says. A node that lies is never sent the blob, so it is never paid, but the blob ends up with fewer copies. | A reachability check at check-in |
+| Job blobs are still held by the coordinator | Modules, inputs, and outputs do not yet go through node storage. | After relays |
+| The same blob cannot be stored twice | A second request for a root already stored is refused, even from another account. | When two accounts need the same data |
+| Stored blobs are readable by anyone with the root | There is no private mode yet. | Build step 9 |
+| Logs can fall out of step on a crash | A storage change and the credits that go with it are written to two files, one after the other. | Settlement, build step 13 |
 | No app manifests or sponsored jobs | An application cannot yet register itself or pay for its users' jobs from a pool of its own. | Build step 7 |
 | Four host functions are missing | State (`kv`), blobs by hash, follow-up jobs, and sealing data to a key. | With storage (state, blobs), sponsorship (follow-up jobs), and private mode (sealing) |

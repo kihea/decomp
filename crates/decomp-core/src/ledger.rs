@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::keys::{AccountId, JobId};
+use crate::keys::{AccountId, ContentHash, JobId};
 
 /// An amount of credits, held as millionths of a credit so that fee shares are
 /// exact. On the wire it is that whole number.
@@ -42,6 +42,16 @@ impl Credits {
 
     pub const fn whole(credits: u64) -> Self {
         Self(credits * MICROS_PER_CREDIT)
+    }
+
+    /// An amount given in millionths of a credit.
+    pub const fn from_micros(micros: u64) -> Self {
+        Self(micros)
+    }
+
+    /// The amount in millionths of a credit.
+    pub const fn micros(self) -> u64 {
+        self.0
     }
 
     pub fn percent(self, percent: u64) -> Self {
@@ -206,6 +216,22 @@ pub enum LedgerEntry {
     /// Pays an account from the verification fund, for checking work: a spot
     /// check or a job with a known answer. Pays less if the fund is short.
     PayChecker { account: AccountId, amount: Credits },
+    /// Sets aside the whole fee for storing a blob, out of its owner's balance.
+    StorageEscrow {
+        root: ContentHash,
+        account: AccountId,
+        amount: Credits,
+    },
+    /// Pays a node for a stretch of holding a blob, out of what was set aside.
+    /// The amount is divided like a job fee: most to the node, the rest to the
+    /// verification fund and the treasury.
+    StoragePay {
+        root: ContentHash,
+        account: AccountId,
+        amount: Credits,
+    },
+    /// Returns what is left of a blob's storage fee to its owner.
+    StorageRefund { root: ContentHash },
     /// Moves earned credits into the account's stake.
     Stake { account: AccountId, amount: Credits },
     /// Moves stake back into earned credits.
@@ -243,6 +269,8 @@ struct Escrow {
 pub struct Ledger {
     balances: HashMap<AccountId, Balance>,
     escrows: HashMap<JobId, Escrow>,
+    /// Credits set aside for stored blobs, by the blob's root.
+    storage_escrows: HashMap<ContentHash, Escrow>,
     verification_fund: Credits,
     treasury: Credits,
 }
@@ -317,6 +345,51 @@ impl Ledger {
                 let Escrow { account, held } = self
                     .escrows
                     .remove(job_id)
+                    .ok_or(LedgerError::NothingEscrowed)?;
+                self.balances.entry(account).or_default().put_back(held);
+            }
+            LedgerEntry::StorageEscrow {
+                root,
+                account,
+                amount,
+            } => {
+                if self.storage_escrows.contains_key(root) {
+                    return Err(LedgerError::AlreadyEscrowed);
+                }
+                let balance = self.account(account)?;
+                if balance.spendable() < *amount {
+                    return Err(LedgerError::InsufficientCredits);
+                }
+                let held = balance.take(*amount);
+                let escrow = Escrow {
+                    account: *account,
+                    held,
+                };
+                self.storage_escrows.insert(*root, escrow);
+            }
+            LedgerEntry::StoragePay {
+                root,
+                account,
+                amount,
+            } => {
+                let escrow = self
+                    .storage_escrows
+                    .get_mut(root)
+                    .ok_or(LedgerError::NothingEscrowed)?;
+                if escrow.held.spendable() < *amount {
+                    return Err(LedgerError::FeeExceedsEscrow);
+                }
+                escrow.held.take(*amount);
+                let to_node = amount.percent(NODE_SHARE_PERCENT);
+                let to_fund = amount.percent(VERIFICATION_SHARE_PERCENT);
+                self.balances.entry(*account).or_default().earned += to_node;
+                self.verification_fund += to_fund;
+                self.treasury += *amount - to_node - to_fund;
+            }
+            LedgerEntry::StorageRefund { root } => {
+                let Escrow { account, held } = self
+                    .storage_escrows
+                    .remove(root)
                     .ok_or(LedgerError::NothingEscrowed)?;
                 self.balances.entry(account).or_default().put_back(held);
             }

@@ -9,9 +9,11 @@ mod job;
 mod jobs;
 mod keys;
 mod ledger;
+pub mod merkle;
 mod request;
 mod scores;
 mod splits;
+mod storage;
 
 pub use account::{Account, AccountOp, Accounts, Device, OpError};
 pub use envelope::{Envelope, EnvelopeError};
@@ -26,8 +28,11 @@ pub use ledger::{
     PROBATION_FORFEIT_PERCENT, STARTER_GRANT, fee,
 };
 pub use request::{
-    AccountStatus, Blob, BlobData, BlobRef, Call, CheckedIn, MAX_MESSAGE_BYTES, Refusal, Request,
-    Submitted,
+    AccountStatus, Blob, BlobData, BlobRef, Call, CheckedIn, MAX_MESSAGE_BYTES, Placement, Refusal,
+    Request, Submitted,
 };
 pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
 pub use splits::{Merge, Splits};
+pub use storage::{
+    Challenge, Located, Replica, Storage, StorageEntry, StorageError, StoreOrder, storage_fee,
+};

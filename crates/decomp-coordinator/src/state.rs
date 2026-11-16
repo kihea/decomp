@@ -18,10 +18,11 @@ use std::io;
 use std::path::Path;
 
 use decomp_core::{
-    Account, AccountId, AccountStatus, Accounts, Assignment, Closure, ContentHash, Credits,
-    Envelope, JobError, JobId, JobStatus, Jobs, Ledger, LedgerEntry, LedgerError, MAX_PIECES,
-    Manifest, Merge, OpError, PROBATION_FORFEIT_PERCENT, Penalty, PublicKey, ScoreEvent, Scores,
-    Splits, Standing, fee,
+    Account, AccountId, AccountStatus, Accounts, Assignment, Challenge, CheckedIn, Closure,
+    Conduct, ContentHash, Credits, Envelope, JobError, JobId, JobStatus, Jobs, Ledger, LedgerEntry,
+    LedgerError, Located, MAX_PIECES, Manifest, Merge, OpError, PROBATION_FORFEIT_PERCENT, Penalty,
+    Placement, PublicKey, ScoreEvent, Scores, Splits, Standing, Storage, StorageEntry,
+    StorageError, fee,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::{Mismatch, Signature};
@@ -30,6 +31,15 @@ use serde::de::DeserializeOwned;
 use crate::blobs::Blobs;
 use crate::log::Log;
 use crate::referee::{Case, Verdict};
+
+/// Why a blob was not accepted for storage.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
+}
 
 /// Why a job was not accepted.
 #[derive(Debug, thiserror::Error)]
@@ -66,10 +76,14 @@ pub struct Coordinator {
     /// `None` for a module that does not describe itself.
     signatures: HashMap<ContentHash, Option<Signature>>,
     receipts: Log,
+    storage: Storage,
+    storage_log: Log,
+    /// How long a stored blob goes between challenges, in seconds.
+    challenge_interval: u64,
 }
 
 impl Coordinator {
-    pub fn open(data_dir: &Path) -> io::Result<Self> {
+    pub fn open(data_dir: &Path, challenge_interval: u64) -> io::Result<Self> {
         fs::create_dir_all(data_dir)?;
 
         let mut accounts = Accounts::default();
@@ -85,6 +99,12 @@ impl Coordinator {
         let mut scores = Scores::default();
         let scores_log = replay(&data_dir.join("scores.jsonl"), |event: ScoreEvent| {
             scores.apply(&event);
+            Ok(())
+        })?;
+
+        let mut storage = Storage::default();
+        let storage_log = replay(&data_dir.join("storage.jsonl"), |entry: StorageEntry| {
+            storage.apply(&entry);
             Ok(())
         })?;
 
@@ -110,6 +130,9 @@ impl Coordinator {
             splits: Splits::default(),
             signatures: HashMap::new(),
             receipts: Log::open(&data_dir.join("receipts.jsonl"))?,
+            storage,
+            storage_log,
+            challenge_interval,
         })
     }
 
@@ -133,8 +156,27 @@ impl Coordinator {
             .standing(node, self.ledger.balance(account).staked)
     }
 
-    /// Records that a node is online and returns the job it should be running.
+    /// Records that a node is online and returns what it should be doing: the
+    /// job it should be running, blobs to take in, and a storage challenge.
     pub fn check_in(
+        &mut self,
+        node: PublicKey,
+        account: AccountId,
+        address: Option<String>,
+        now: u64,
+    ) -> CheckedIn {
+        self.storage.seen(node, account, address, now);
+        let interval = self.challenge_interval;
+        CheckedIn {
+            assignment: self.assignment_for(node, account, now),
+            store: self.storage.orders_for(&node),
+            challenge: self
+                .storage
+                .challenge_for(node, now, interval, &mut rand::rng()),
+        }
+    }
+
+    fn assignment_for(
         &mut self,
         node: PublicKey,
         account: AccountId,
@@ -276,6 +318,85 @@ impl Coordinator {
         self.splits.merged(merge.job_id, hash, now);
     }
 
+    /// Accepts a blob for storage: chooses the nodes to hold it and sets the
+    /// whole fee aside. The caller then uploads the blob to those nodes.
+    pub fn store_blob(
+        &mut self,
+        root: ContentHash,
+        size: u64,
+        owner: AccountId,
+        days: u32,
+        now: u64,
+    ) -> Result<Placement, StoreError> {
+        let (placed, escrow) =
+            self.storage
+                .place(root, size, owner, days, now, &mut rand::rng())?;
+        self.record(escrow)?;
+        let StorageEntry::Placed { replicas, .. } = &placed else {
+            unreachable!("placing a blob yields a Placed entry");
+        };
+        let addresses = replicas
+            .iter()
+            .map(|replica| replica.address.clone())
+            .collect();
+        self.note_storage(placed, None);
+        Ok(Placement { addresses })
+    }
+
+    /// A node says it has received a blob it was asked to hold.
+    pub fn confirm_stored(
+        &mut self,
+        root: ContentHash,
+        node: PublicKey,
+        now: u64,
+    ) -> Result<(), StorageError> {
+        let confirmed = self.storage.confirm(root, node, now)?;
+        self.note_storage(confirmed, None);
+        Ok(())
+    }
+
+    /// Checks a node's answer to a storage challenge and pays it if it passed.
+    pub fn answer_challenge(
+        &mut self,
+        node: PublicKey,
+        challenge: Challenge,
+        chunk: &[u8],
+        proof: &[ContentHash],
+        now: u64,
+    ) -> Result<(), StorageError> {
+        let (outcome, payment) = self.storage.answer(node, challenge, chunk, proof, now)?;
+        self.note_storage(outcome, payment);
+        Ok(())
+    }
+
+    /// Where a stored blob can be fetched from.
+    pub fn locate(&self, root: &ContentHash) -> Option<Located> {
+        self.storage.locate(root)
+    }
+
+    /// Applies and records a change to what is stored where, moves any credits
+    /// that go with it, and scores the node if it was challenged.
+    fn note_storage(&mut self, entry: StorageEntry, payment: Option<LedgerEntry>) {
+        self.storage.apply(&entry);
+        self.storage_log.append(&entry);
+        if let Some(payment) = payment {
+            // A payment never exceeds what was set aside: both are the same rate
+            // over time that lies inside the paid period.
+            self.record(payment)
+                .expect("storage payments fit what was set aside");
+        }
+        let scored = match entry {
+            StorageEntry::Passed { node, at, .. } => Some((node, at, Conduct::Finished)),
+            StorageEntry::Failed { node, at, .. } => Some((node, at, Conduct::Missed)),
+            _ => None,
+        };
+        if let Some((node, at, what)) = scored {
+            let event = ScoreEvent { node, at, what };
+            self.scores.apply(&event);
+            self.scores_log.append(&event);
+        }
+    }
+
     /// Moves credits and records the move.
     pub fn record(&mut self, entry: LedgerEntry) -> Result<(), LedgerError> {
         self.ledger.apply(&entry)?;
@@ -287,6 +408,9 @@ impl Coordinator {
     /// whose result stood, and returns the credits set aside for jobs that have
     /// none. Call after anything that can change a job.
     pub fn settle(&mut self, now: u64) {
+        for (entry, refund) in self.storage.sweep(now) {
+            self.note_storage(entry, refund);
+        }
         for event in self.jobs.take_events() {
             let penalty = self.scores.apply(&event);
             self.scores_log.append(&event);

@@ -14,16 +14,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use decomp_core::{
-    Account, AccountStatus, Accounts, Blob, BlobData, BlobRef, Call, CheckedIn, ContentHash,
-    Envelope, EnvelopeError, JobError, LedgerEntry, LedgerError, MAX_MESSAGE_BYTES, OpError,
-    Outcome, PublicKey, Refusal, Request, Submitted,
+    Account, AccountStatus, Accounts, Blob, BlobData, BlobRef, Call, ContentHash, Envelope,
+    EnvelopeError, JobError, LedgerEntry, LedgerError, MAX_MESSAGE_BYTES, OpError, Outcome,
+    PublicKey, Refusal, Request, StorageError, Submitted,
 };
 use decomp_sandbox::Sandbox;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 use crate::referee::referee;
-use crate::state::{Coordinator, SubmitError};
+use crate::state::{Coordinator, StoreError, SubmitError};
 
 /// How far a request's `issued_at` may be from the coordinator's clock. This bounds
 /// how long a captured request can be replayed.
@@ -163,9 +163,30 @@ fn answer(
             Json(coordinator.status(account.clone())).into_response()
         }
         Call::GetStanding => Json(coordinator.standing(&signer, &account.id)).into_response(),
-        Call::CheckIn => {
-            let assignment = coordinator.check_in(signer, account.id, now);
-            Json(CheckedIn { assignment }).into_response()
+        Call::CheckIn { address } => {
+            if let Some(address) = &address {
+                check_address(address)?;
+            }
+            Json(coordinator.check_in(signer, account.id, address, now)).into_response()
+        }
+        Call::StoreBlob { root, size, days } => {
+            Json(coordinator.store_blob(root, size, account.id, days, now)?).into_response()
+        }
+        Call::ConfirmStored { root } => {
+            coordinator.confirm_stored(root, signer, now)?;
+            Json(json!({})).into_response()
+        }
+        Call::LocateBlob { root } => {
+            let located = coordinator.locate(&root).ok_or(StorageError::UnknownBlob)?;
+            Json(located).into_response()
+        }
+        Call::AnswerChallenge {
+            challenge,
+            chunk,
+            proof,
+        } => {
+            coordinator.answer_challenge(signer, challenge, &chunk.0, &proof, now)?;
+            Json(json!({})).into_response()
         }
         Call::SubmitResult { result } => {
             if let Outcome::Completed { output } = &result.outcome {
@@ -196,6 +217,23 @@ fn member<'a>(accounts: &'a Accounts, signer: &PublicKey) -> Result<&'a Account,
         ));
     }
     Ok(account)
+}
+
+/// The longest address a node may declare.
+const MAX_ADDRESS_LENGTH: usize = 200;
+
+/// Refuses an address that is not a web address other devices could use.
+fn check_address(address: &str) -> Result<(), ApiError> {
+    let is_web = address.starts_with("http://") || address.starts_with("https://");
+    if is_web && address.len() <= MAX_ADDRESS_LENGTH {
+        return Ok(());
+    }
+    let message = "a node's address must start with http:// or https://";
+    Err(ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "bad_address",
+        message,
+    ))
 }
 
 fn require_blob(coordinator: &Coordinator, hash: &ContentHash) -> Result<(), ApiError> {
@@ -320,6 +358,29 @@ impl From<SubmitError> for ApiError {
             SubmitError::TooManyPieces => {
                 Self::new(StatusCode::BAD_REQUEST, "too_many_pieces", message)
             }
+        }
+    }
+}
+
+impl From<StorageError> for ApiError {
+    fn from(error: StorageError) -> Self {
+        let (status, code) = match error {
+            StorageError::AlreadyStored => (StatusCode::CONFLICT, "already_stored"),
+            StorageError::BadDuration => (StatusCode::BAD_REQUEST, "bad_duration"),
+            StorageError::NotEnoughNodes => (StatusCode::SERVICE_UNAVAILABLE, "not_enough_nodes"),
+            StorageError::UnknownBlob => (StatusCode::NOT_FOUND, "unknown_blob"),
+            StorageError::NotAsked => (StatusCode::FORBIDDEN, "not_asked"),
+            StorageError::NotChallenged => (StatusCode::CONFLICT, "not_challenged"),
+        };
+        Self::new(status, code, error.to_string())
+    }
+}
+
+impl From<StoreError> for ApiError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Storage(inner) => inner.into(),
+            StoreError::Ledger(inner) => inner.into(),
         }
     }
 }

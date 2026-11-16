@@ -9,6 +9,7 @@ use crate::account::Account;
 use crate::job::{Assignment, JobResult, Manifest};
 use crate::keys::{ContentHash, JobId};
 use crate::ledger::{Balance, Credits};
+use crate::storage::{Challenge, StoreOrder};
 
 /// The largest request or answer either side accepts. A blob travels inside one
 /// as base64, so this allows blobs of up to about 48 MB.
@@ -45,8 +46,33 @@ pub enum Call {
     Unstake { amount: Credits },
     /// How far the signing node is trusted. Answer: `Standing`.
     GetStanding,
-    /// A node reporting that it is online and asking for its work. Answer: `CheckedIn`.
-    CheckIn,
+    /// A node reporting that it is online and asking for its work. `address` is
+    /// where other devices can connect to it, if they can; a node that gives one
+    /// may be asked to hold data. Answer: `CheckedIn`.
+    CheckIn {
+        #[serde(default)]
+        address: Option<String>,
+    },
+    /// Pays to have a blob held by nodes for `days` days. The blob is named by its
+    /// hash-tree root (see `merkle`) and is then uploaded to the nodes in the
+    /// answer. Answer: `Placement`.
+    StoreBlob {
+        root: ContentHash,
+        size: u64,
+        days: u32,
+    },
+    /// A node saying it has received a blob it was asked to hold. Answer: an empty
+    /// object.
+    ConfirmStored { root: ContentHash },
+    /// Where a stored blob can be fetched from. Answer: `Located`.
+    LocateBlob { root: ContentHash },
+    /// A node answering a storage challenge with the chunk asked for and the
+    /// hashes that link it to the blob's root. Answer: an empty object.
+    AnswerChallenge {
+        challenge: Challenge,
+        chunk: Blob,
+        proof: Vec<ContentHash>,
+    },
     /// A node reporting what a job produced. Answer: an empty object.
     SubmitResult { result: JobResult },
 }
@@ -77,7 +103,20 @@ pub struct Submitted {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CheckedIn {
+    /// The job the node should be running, if any.
     pub assignment: Option<Assignment>,
+    /// Blobs the node has been asked to hold and has not yet confirmed.
+    #[serde(default)]
+    pub store: Vec<StoreOrder>,
+    /// A storage challenge to answer.
+    #[serde(default)]
+    pub challenge: Option<Challenge>,
+}
+
+/// The nodes a blob should be uploaded to.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Placement {
+    pub addresses: Vec<String>,
 }
 
 /// The body of every error answer. Programs branch on `error`, a stable code;

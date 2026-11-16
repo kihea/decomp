@@ -12,11 +12,20 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use decomp_core::{AccountStatus, ContentHash, Credits, JobStatus, Manifest, Outcome, Split};
+use decomp_core::{
+    AccountStatus, ContentHash, Credits, JobStatus, Manifest, Outcome, Split, merkle,
+};
 use decomp_node::client::{Client, unix_now};
+
+use crate::agent::Reachable;
 use decomp_sandbox::{Job, Sandbox};
 
 const NO_KEY: &str = "this device has no key yet; run `decomp-node link` first";
+
+/// How many times, and how far apart, `store` offers a file to a node that is
+/// not yet ready to take it.
+const UPLOAD_ATTEMPTS: u32 = 15;
+const UPLOAD_RETRY: Duration = Duration::from_secs(1);
 
 /// How often `submit` asks whether its job has finished.
 const JOB_POLL: Duration = Duration::from_secs(1);
@@ -56,7 +65,31 @@ enum Command {
         amount: Credits,
     },
     /// Work as a node: run the jobs the coordinator hands out, until stopped.
-    Start,
+    Start {
+        /// Also hold data for the network, serving it at this local address,
+        /// such as 0.0.0.0:9000. Other devices must be able to connect to it.
+        #[arg(long)]
+        listen: Option<String>,
+        /// The address other devices use to reach `--listen`, such as
+        /// http://203.0.113.5:9000. Without it, http:// and the listen address.
+        #[arg(long, requires = "listen")]
+        public_url: Option<String>,
+    },
+    /// Pay to have a file held by nodes, and upload it to them.
+    Store {
+        file: PathBuf,
+        /// How many days to pay for.
+        #[arg(long)]
+        days: u32,
+    },
+    /// Fetch a stored file from the nodes that hold it.
+    Fetch {
+        /// The root the file was stored under, as `store` printed it.
+        root: ContentHash,
+        /// Where to save the file.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Submit a job to the network and wait for its result.
     Submit {
         #[command(flatten)]
@@ -103,7 +136,17 @@ fn main() -> ExitCode {
     };
     let outcome = match cli.command {
         Command::Link => agent::link(&cli.dir, &cli.coordinator).map(|()| ExitCode::SUCCESS),
-        Command::Start => agent::start(&cli.dir, &cli.coordinator).map(|()| ExitCode::SUCCESS),
+        Command::Start { listen, public_url } => {
+            let public_url =
+                public_url.or_else(|| listen.as_ref().map(|at| format!("http://{at}")));
+            let reachable = listen.as_deref().zip(public_url.as_deref());
+            let reachable = reachable.map(|(listen, public_url)| Reachable { listen, public_url });
+            agent::start(&cli.dir, &cli.coordinator, reachable).map(|()| ExitCode::SUCCESS)
+        }
+        Command::Store { file, days } => connect().and_then(|client| store(&client, &file, days)),
+        Command::Fetch { root, output } => {
+            connect().and_then(|client| fetch(&client, root, &output))
+        }
         Command::Account => connect().and_then(|client| show_account(&client)),
         Command::Stake { amount } => connect().and_then(|client| {
             show_credits(&client.stake(amount)?);
@@ -228,6 +271,55 @@ fn submit(
         }
         Outcome::Failed { failure } => fail(&failure.to_string()),
     }
+}
+
+/// Pays for a file to be held by nodes and sends it to each of them.
+fn store(client: &Client, file: &Path, days: u32) -> Result<ExitCode, Box<dyn Error>> {
+    let bytes = fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let root = merkle::root(&bytes);
+    let placement = client.store_blob(root, bytes.len() as u64, days)?;
+    println!("root    {root}");
+
+    let mut holding = 0;
+    for address in &placement.addresses {
+        // A node refuses the blob until it has heard from the coordinator that it
+        // should hold it, which it does at its next check-in. So try for a while.
+        let sent = (0..UPLOAD_ATTEMPTS).find_map(|attempt| {
+            if attempt > 0 {
+                sleep(UPLOAD_RETRY);
+            }
+            decomp_node::store::upload(address, &root, &bytes).ok()
+        });
+        match sent {
+            Some(()) => holding += 1,
+            None => eprintln!("could not send the file to the node at {address}"),
+        }
+    }
+    println!(
+        "nodes   {holding} of {} hold the file",
+        placement.addresses.len()
+    );
+    Ok(if holding > 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Fetches a stored file from the first node that gives a true copy of it.
+fn fetch(client: &Client, root: ContentHash, output: &Path) -> Result<ExitCode, Box<dyn Error>> {
+    let located = client.locate(root)?;
+    for address in &located.addresses {
+        match decomp_node::store::download(address, &root, located.size) {
+            Ok(bytes) => {
+                fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
+                println!("fetched {} bytes from {address}", bytes.len());
+                return Ok(ExitCode::SUCCESS);
+            }
+            Err(reason) => eprintln!("the node at {address} did not give the file: {reason}"),
+        }
+    }
+    fail("no node that holds the file gave it")
 }
 
 fn run_locally(job: JobArgs) -> Result<ExitCode, Box<dyn Error>> {

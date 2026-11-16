@@ -3,9 +3,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decomp_core::{
-    AccountStatus, Assignment, Blob, BlobData, BlobRef, Call, CheckedIn, ContentHash, Credits,
-    Envelope, JobId, JobResult, JobStatus, MAX_MESSAGE_BYTES, Manifest, PublicKey, Refusal,
-    Request, SigningKey, Standing, Submitted,
+    AccountStatus, Blob, BlobData, BlobRef, Call, Challenge, CheckedIn, ContentHash, Credits,
+    Envelope, JobId, JobResult, JobStatus, Located, MAX_MESSAGE_BYTES, Manifest, Placement,
+    PublicKey, Refusal, Request, SigningKey, Standing, Submitted,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -97,9 +97,46 @@ impl Client {
         self.call(Call::GetJob { job_id })
     }
 
-    pub fn check_in(&self) -> Result<Option<Assignment>, ClientError> {
-        let checked_in: CheckedIn = self.call(Call::CheckIn)?;
-        Ok(checked_in.assignment)
+    /// Reports that this node is online and learns what it should be doing.
+    /// `address` is where other devices can connect to it, if they can.
+    pub fn check_in(&self, address: Option<&str>) -> Result<CheckedIn, ClientError> {
+        self.call(Call::CheckIn {
+            address: address.map(String::from),
+        })
+    }
+
+    /// Pays to have a blob held for `days` days; answers with where to upload it.
+    pub fn store_blob(
+        &self,
+        root: ContentHash,
+        size: u64,
+        days: u32,
+    ) -> Result<Placement, ClientError> {
+        self.call(Call::StoreBlob { root, size, days })
+    }
+
+    pub fn confirm_stored(&self, root: ContentHash) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::ConfirmStored { root })?;
+        Ok(())
+    }
+
+    /// Where a stored blob can be fetched from.
+    pub fn locate(&self, root: ContentHash) -> Result<Located, ClientError> {
+        self.call(Call::LocateBlob { root })
+    }
+
+    pub fn answer_challenge(
+        &self,
+        challenge: Challenge,
+        chunk: Blob,
+        proof: Vec<ContentHash>,
+    ) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::AnswerChallenge {
+            challenge,
+            chunk,
+            proof,
+        })?;
+        Ok(())
     }
 
     pub fn submit_result(&self, result: JobResult) -> Result<(), ClientError> {

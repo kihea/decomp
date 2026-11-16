@@ -3,6 +3,7 @@
 //! kept and when to work; this crate talks to the coordinator and runs the jobs.
 
 pub mod client;
+pub mod store;
 mod work;
 
 pub use work::{IDLE_POLL, RETRY_DELAY, work};
