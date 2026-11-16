@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::account::Account;
 use crate::envelope::Envelope;
 use crate::job::{Assignment, JobResult, Manifest};
-use crate::keys::{AccountId, ContentHash, JobId, PublicKey};
+use crate::keys::{AccountId, ContentHash, JobId, PublicKey, SealingKey};
 use crate::ledger::{Balance, Credits};
 use crate::relay::{Incoming, RelayOrder};
 use crate::storage::{Challenge, StoreOrder};
@@ -82,6 +82,12 @@ pub enum Call {
         chunk: Blob,
         proof: Vec<ContentHash>,
     },
+    /// A device publishing the key that data for it should be sealed to (see
+    /// `seal`). The signed request itself is kept, and handed to whoever asks, as
+    /// proof that the device chose the key. Answer: an empty object.
+    PublishSealingKey { key: SealingKey },
+    /// The sealing key a device has published. Answer: `PublishedKey`.
+    GetSealingKey { device: PublicKey },
     /// Opens a channel to the device `to` through a relay node, for up to `bytes`
     /// bytes, and sets the fee for that much aside (see `relay`). Answer: `Route`.
     OpenRelay { to: PublicKey, bytes: u64 },
@@ -138,6 +144,13 @@ pub struct CheckedIn {
     /// The open channels the node is asked to carry.
     #[serde(default)]
     pub relay: Vec<RelayOrder>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PublishedKey {
+    /// The device's signed request publishing its key, to be read with
+    /// `seal::published_key`, or nothing if it has published none.
+    pub proof: Option<Envelope>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

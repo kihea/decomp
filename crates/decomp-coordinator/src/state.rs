@@ -9,6 +9,7 @@
 //! | Receipts | `receipts.jsonl` | Yes |
 //! | Which nodes hold which blobs | `storage.jsonl`, replayed at startup | Yes |
 //! | Relay channels | `relays.jsonl`, replayed at startup | Yes |
+//! | The sealing key each device published | `sealing.jsonl`, replayed at startup | Yes |
 //! | What each shard of app state holds now | `state.jsonl`, replayed at startup | Yes |
 //! | Open jobs, online nodes, and unanswered challenges | Memory | No, by design (spec section 6) |
 //!
@@ -22,12 +23,12 @@ use std::path::Path;
 
 use decomp_core::{
     Account, AccountId, AccountStatus, Accounts, Assignment, Challenge, CheckedIn, Closure,
-    Conduct, ContentHash, Credits, Envelope, FollowUps, Hosts, Incoming, JobError, JobId,
-    JobStatus, Jobs, Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, MAX_READS,
+    Conduct, ContentHash, Credits, Envelope, EnvelopeError, FollowUps, Hosts, Incoming, JobError,
+    JobId, JobStatus, Jobs, Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, MAX_READS,
     MAX_SHARD_NAME_BYTES, Manifest, Merge, OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT,
     Penalty, Placement, PublicKey, RelayEntry, RelayError, Relays, Route, ScoreEvent, Scores,
-    ShardRef, Splits, SponsorError, Sponsored, Standing, StateEntry, States, Storage, StorageEntry,
-    StorageError, Storing, channel_id, fee,
+    SealingKeys, ShardRef, Splits, SponsorError, Sponsored, Standing, StateEntry, States, Storage,
+    StorageEntry, StorageError, Storing, channel_id, fee,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
@@ -113,6 +114,8 @@ pub struct Coordinator {
     relays_log: Log,
     states: States,
     states_log: Log,
+    sealing_keys: SealingKeys,
+    sealing_log: Log,
     /// How long a stored blob goes between challenges, in seconds.
     challenge_interval: u64,
 }
@@ -155,6 +158,12 @@ impl Coordinator {
             Ok(())
         })?;
 
+        let mut sealing_keys = SealingKeys::default();
+        let sealing_log = replay(&data_dir.join("sealing.jsonl"), |proof: Envelope| {
+            sealing_keys.apply(&proof).map_err(|e| e.to_string())?;
+            Ok(())
+        })?;
+
         // Open jobs do not survive a restart, so hand back what was set aside for
         // any job that was still open when the coordinator last stopped.
         for job_id in ledger.escrowed_jobs() {
@@ -185,6 +194,8 @@ impl Coordinator {
             relays_log,
             states,
             states_log,
+            sealing_keys,
+            sealing_log,
             challenge_interval,
         })
     }
@@ -468,6 +479,19 @@ impl Coordinator {
     /// Where a stored blob can be fetched from.
     pub fn locate(&self, root: &ContentHash) -> Option<Located> {
         self.storage.locate(root)
+    }
+
+    /// Keeps a device's signed request to publish its sealing key.
+    pub fn publish_sealing_key(&mut self, proof: &Envelope) -> Result<(), EnvelopeError> {
+        if self.sealing_keys.apply(proof)? {
+            self.sealing_log.append(proof);
+        }
+        Ok(())
+    }
+
+    /// The request in which a device published its sealing key, if it has.
+    pub fn sealing_key_proof(&self, device: &PublicKey) -> Option<Envelope> {
+        self.sealing_keys.proof(device).cloned()
     }
 
     /// The hash of the contents a shard of state has now, or `None` if it is empty.

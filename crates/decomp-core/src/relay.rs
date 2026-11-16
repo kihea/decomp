@@ -19,6 +19,10 @@
 //! nothing, a sender pays only for what arrived, and the most a relay can be
 //! cheated of is what it hands over in one answer before the receiver signs.
 //!
+//! A channel carries bytes and does not look inside them. What devices send each
+//! other is sealed to the receiving device's key first (see `seal`), so a relay
+//! cannot read it.
+//!
 //! What must last (the channels and what has been paid) changes only by applying
 //! entries, so a log of entries is a complete copy.
 
@@ -104,8 +108,9 @@ pub enum FrameError {
 }
 
 impl Frame {
-    /// Makes frame `seq` of `channel`, following `sent_before` bytes of data.
-    pub fn seal(
+    /// Makes frame `seq` of `channel`, following `sent_before` bytes of data,
+    /// signed by the sender.
+    pub fn signed(
         key: &SigningKey,
         channel: ContentHash,
         seq: u64,

@@ -33,6 +33,8 @@ pub fn link(dir: &Path, coordinator_url: &str) -> Result<(), Box<dyn Error>> {
         match client.account() {
             Ok(status) => {
                 println!("linked to account {}", status.account.id);
+                // So that other devices can send to this one from now on.
+                client.publish_sealing_key(device::opening_key(dir)?.sealing_key())?;
                 return Ok(());
             }
             Err(error) if error.is("not_linked") => {

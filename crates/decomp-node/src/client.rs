@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use decomp_core::{
     AccountId, AccountOp, AccountStatus, AppManifest, Blob, BlobData, BlobRef, Call, Challenge,
     CheckedIn, ContentHash, Credits, Envelope, Incoming, IncomingChannels, JobId, JobResult,
-    JobStatus, Located, MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey, Refusal, Request, Route,
-    ShardNow, SigningKey, Standing, Submitted,
+    JobStatus, Located, MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey, PublishedKey, Refusal,
+    Request, Route, SealingKey, ShardNow, SigningKey, Standing, Submitted, seal,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -166,6 +166,21 @@ impl Client {
             proof,
         })?;
         Ok(())
+    }
+
+    /// Publishes the key that data for this device should be sealed to.
+    pub fn publish_sealing_key(&self, key: SealingKey) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::PublishSealingKey { key })?;
+        Ok(())
+    }
+
+    /// The sealing key `device` has published, checked against that device's
+    /// own signature. `None` if it has published none.
+    pub fn sealing_key(&self, device: PublicKey) -> Result<Option<SealingKey>, ClientError> {
+        let published: PublishedKey = self.call(Call::GetSealingKey { device })?;
+        Ok(published
+            .proof
+            .and_then(|proof| seal::published_key(&device, &proof)))
     }
 
     /// Opens a channel to the device `to` through a relay node, paying for up

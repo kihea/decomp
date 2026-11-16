@@ -2,6 +2,9 @@
 //! that cannot connect to each other, and how a device sends and receives through
 //! such a node. The rules, and what a frame is, are in `decomp_core`'s relay module.
 //!
+//! A device seals what it sends to the receiving device's key, so the relay
+//! carries bytes it cannot read.
+//!
 //! A relay keeps a channel's frames in memory until the receiver signs for
 //! them, and claims its pay with what the receiver signed.
 
@@ -12,8 +15,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use decomp_core::{
-    Checked, ContentHash, Envelope, FRAME_BYTES, Frame, Incoming, MAX_CLOCK_SKEW_SECS, PublicKey,
-    REDEEM_GRACE_SECS, RelayOrder, Route, Take, Taken,
+    Checked, ContentHash, Envelope, FRAME_BYTES, Frame, Incoming, MAX_CLOCK_SKEW_SECS, OpeningKey,
+    PublicKey, REDEEM_GRACE_SECS, RelayOrder, Route, SEAL_OVERHEAD_BYTES, Take, Taken, seal,
 };
 use tiny_http::{Method, Request, Response};
 
@@ -293,29 +296,42 @@ pub enum TransferError {
     Tampered(String),
     #[error("the sender stopped before the end")]
     Incomplete,
+    #[error("the receiving device has not published a key to seal to")]
+    NoSealingKey,
+    #[error("what arrived was not sealed to this device")]
+    NotForThisDevice,
 }
 
-/// Sends `data` to the device `to` through a relay node. Returns the channel it
-/// went over once the relay has all of it; the receiver collects it from there.
+/// Sends `data` to the device `to` through a relay node, sealed so that only
+/// that device can read it. Returns the channel it went over once the relay has
+/// all of it; the receiver collects it from there.
 pub fn send(client: &Client, to: PublicKey, data: &[u8]) -> Result<Route, TransferError> {
-    let route = client.open_relay(to, data.len() as u64)?;
+    let sealing_key = client.sealing_key(to)?.ok_or(TransferError::NoSealingKey)?;
+    // Each frame is sealed on its own, so it carries a little less than a frame.
+    let mut pieces: Vec<&[u8]> = data.chunks(FRAME_BYTES - SEAL_OVERHEAD_BYTES).collect();
+    if pieces.is_empty() {
+        pieces.push(&[]);
+    }
+    let sealed_bytes = data.len() + pieces.len() * SEAL_OVERHEAD_BYTES;
+    let route = client.open_relay(to, sealed_bytes as u64)?;
     let address = format!("{}{CHANNEL_PATH}{}/{FRAMES}", route.address, route.channel);
     let http = peer::agent();
 
-    let last = data.len().saturating_sub(1) / FRAME_BYTES;
+    let last = pieces.len() - 1;
     let mut sent = 0;
-    for (seq, chunk) in data.chunks(FRAME_BYTES).enumerate() {
-        let end = seq == last;
-        let frame = Frame::seal(
+    for (seq, piece) in pieces.into_iter().enumerate() {
+        let sealed = seal::seal(&sealing_key, piece).ok_or(TransferError::NoSealingKey)?;
+        let carried = sealed.len() as u64;
+        let frame = Frame::signed(
             client.key(),
             route.channel,
             seq as u64,
             sent,
-            chunk.to_vec(),
-            end,
+            sealed,
+            seq == last,
         );
         offer(&http, &address, &frame)?;
-        sent += chunk.len() as u64;
+        sent += carried;
     }
     Ok(route)
 }
@@ -342,9 +358,14 @@ fn offer(http: &ureq::Agent, address: &str, frame: &Frame) -> Result<(), Transfe
 }
 
 /// Collects everything sent on a channel addressed to this device, checking each
-/// frame against the sender's signature. Returns `None` if nothing is waiting
-/// on the channel, which is the case for one already collected.
-pub fn receive(client: &Client, incoming: &Incoming) -> Result<Option<Vec<u8>>, TransferError> {
+/// frame against the sender's signature and opening it with this device's
+/// opening key. Returns `None` if nothing is waiting on the channel, which is
+/// the case for one already collected.
+pub fn receive(
+    client: &Client,
+    opening_key: &OpeningKey,
+    incoming: &Incoming,
+) -> Result<Option<Vec<u8>>, TransferError> {
     let Incoming {
         channel,
         from,
@@ -355,6 +376,8 @@ pub fn receive(client: &Client, incoming: &Incoming) -> Result<Option<Vec<u8>>, 
 
     let mut data = Vec::new();
     let mut frames = 0;
+    // How many bytes the frames so far carried, which is more than they held.
+    let mut carried = 0;
     let mut idle = 0;
     loop {
         let take = Take {
@@ -377,12 +400,14 @@ pub fn receive(client: &Client, incoming: &Incoming) -> Result<Option<Vec<u8>>, 
         idle = 0;
         for frame in taken.frames {
             let checked = frame
-                .check(channel, from, frames, data.len() as u64)
+                .check(channel, from, frames, carried)
                 .map_err(|error| TransferError::Tampered(error.to_string()))?;
             let Checked::Next(header) = checked else {
                 continue;
             };
-            data.extend(frame.data.0);
+            let opened = seal::open(opening_key, &frame.data.0);
+            data.extend(opened.ok_or(TransferError::NotForThisDevice)?);
+            carried = header.bytes;
             frames += 1;
             if header.end {
                 // Sign for the last frames, so the relay can be paid for them and

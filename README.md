@@ -120,6 +120,9 @@ are part of its result, so nodes are held to them like the output.
   that accepts connections. The sender opens a channel to the receiving device,
   and the coordinator picks the relay and sets aside the fee for the most the
   channel may carry. The data itself never passes through the coordinator.
+- What a device sends is sealed to the receiving device's key before it leaves,
+  so a relay carries bytes it cannot read. Each device publishes a sealing key
+  under its own signature, and a sender checks that signature itself.
 - The sender signs every frame it sends, so the receiver can tell that nothing
   was changed, dropped, or reordered on the way. Only the receiving device can
   collect a channel.
@@ -171,7 +174,7 @@ are part of its result, so nodes are held to them like the output.
 
 | Path | What it is |
 | --- | --- |
-| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage and relay rules, and every message shape. No I/O. |
+| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage and relay rules, sealing, app state, and every message shape. No I/O. |
 | `crates/decomp-schema` | How a job's input and output types are described and checked, and the byte form of a set of records. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
 | `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, and what it stores (logs, blobs). |
@@ -391,6 +394,16 @@ that can be reached take the data work; every node can still do compute, which
 needs only outgoing connections. The coordinator stays out of the data path: it
 decides who holds or carries what, checks them, and pays.
 
+**A device has a second key, for sealing.** A device signs with an Ed25519 key.
+Data is sealed to a separate X25519 key, because a browser can keep a signing key
+that cannot be used for anything else, and that is how the web app keeps its
+own. The device publishes the sealing key in a request signed with its device
+key. The coordinator keeps the signed request and hands it to anyone who asks,
+so a sender checks the device's signature and does not have to trust the
+coordinator about whose key it is. Sealing itself uses X25519, HKDF with SHA-256,
+and AES-256-GCM, all of which a browser does natively, so every kind of device
+seals the same way.
+
 **A relay is paid on the receiver's signature.** Paying a relay for whatever the
 sender handed it would pay a relay that threw the data away. So a claim needs two
 signatures: the sender's, on a frame header that counts the bytes sent so far,
@@ -426,7 +439,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | No automated tests | Tests are added only once the code is built, to guard against regressions. The flows were checked by hand. | Owner's go-ahead |
 | No test vectors shared by Rust and TypeScript | Same reason. Until then, a change to the envelope format must be checked end to end by hand. | First test pass |
 | The account key is the only controller | Passkeys, recovery keys, guardians, and email reset are build step 14. A device that loses its account key cannot be recovered. | Build step 14 |
-| The command-line node keeps its key in a plain file | It has no access to the system keychain. On Unix the file is readable by its owner only. | When the command needs it |
+| The command-line node keeps its keys in plain files | It has no access to the system keychain. On Unix the files are readable by their owner only. | When the command needs it |
 | A job is not handed to another node if one goes silent | It waits for its deadline and expires; the silent node loses availability. A working node now checks in, but the coordinator does not yet use that to tell a node that has gone from one that is busy. | Re-assignment of jobs |
 | Assignment draws on the coordinator's own randomness | The spec calls for a public source so anyone can recheck a draw. | With staked operators, build step 13 |
 | The price of a unit is fixed at one credit | The spec lets the base price float with load and each tier carry a premium that moves with supply and demand. Both need load measurements that a test network cannot give. | When there is real traffic to steer |
@@ -443,7 +456,6 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | A job that overflows the call stack may not fail the same way everywhere | Stack depth is measured in native stack bytes, which differ by processor type. Two honest nodes on different processors could disagree about such a job. | Before nodes on mixed hardware verify each other (build step 5) |
 | Modules are compiled again on every run | The agent has no cache of compiled modules yet. Compiling is fast next to running a job. | When measurements show it matters |
 | A torn final line in `ops.jsonl` stops the coordinator from starting | Acceptable for a development stand-in; the error names the line. | Build step 13 |
-| Relayed data is not encrypted | The spec has everything encrypted to the receiving device's key. Device keys only sign, and a browser's key cannot be turned into one that encrypts, so each device needs a second key. Until then a relay can read what it carries, though it cannot change it. | Build step 8, before Send carries anything real |
 | Devices never connect directly | Every transfer goes through a relay, even when the receiver could be reached. | Build step 8 |
 | Nothing waits for a device that is away for more than an hour | A channel lasts an hour. The spec has data for an offline device wait in network storage. | Build step 8 |
 | An abandoned channel running out has not been exercised | A channel lasts an hour, so the close and refund of one that was never finished had not been seen when this was written. Channels that end normally were. | A run that lasts an hour |
@@ -457,7 +469,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | A node's address is taken on trust | The coordinator does not check that a node can be reached where it says. A node that lies is never sent the blob, so it is never paid, but the blob ends up with fewer copies. | A reachability check at check-in |
 | Job blobs are still held by the coordinator | Modules, inputs, and outputs do not yet go through node storage. | Later in build step 7 |
 | The same blob cannot be stored twice | A second request for a root already stored is refused, even from another account. | When two accounts need the same data |
-| Stored blobs are readable by anyone with the root | There is no private mode yet. | Build step 9 |
+| Stored blobs are readable by anyone with the root | `store` keeps a file as it is. Sealing exists now, but who a stored file is sealed to is for the app that stores it to say. | Build step 8, when Send stores what waits for a device |
 | Logs can fall out of step on a crash | A storage or relay change and the credits that go with it are written to two files, one after the other. | Settlement, build step 13 |
 | An app's manifest lists no permissions or schemas | The one permission so far follows from the list of modules: only the app's own modules may be handed its state. Each module describes its own types. | With the first permission that cannot be read off the modules |
 | What an app has set aside for an account today is kept in memory | A restart forgets it, so a daily cap can be passed once for each restart. It counts the highest possible fee of each job, not what the job cost. | Settlement, build step 13 |

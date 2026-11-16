@@ -16,8 +16,8 @@ use axum::{Json, Router};
 use decomp_core::{
     Account, AccountStatus, Accounts, Blob, BlobData, BlobRef, Call, ContentHash, Envelope,
     EnvelopeError, IncomingChannels, JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS,
-    MAX_MESSAGE_BYTES, OpError, Outcome, PublicKey, Refusal, RelayError, Request, ShardNow,
-    ShardRef, SponsorError, StorageError, Submitted,
+    MAX_MESSAGE_BYTES, OpError, Outcome, PublicKey, PublishedKey, Refusal, RelayError, Request,
+    ShardNow, ShardRef, SponsorError, StorageError, Submitted,
 };
 use decomp_sandbox::Sandbox;
 use serde_json::json;
@@ -189,6 +189,14 @@ fn answer(
             coordinator.answer_challenge(signer, challenge, &chunk.0, &proof, now)?;
             Json(json!({})).into_response()
         }
+        Call::PublishSealingKey { .. } => {
+            coordinator.publish_sealing_key(&envelope)?;
+            Json(json!({})).into_response()
+        }
+        Call::GetSealingKey { device } => Json(PublishedKey {
+            proof: coordinator.sealing_key_proof(&device),
+        })
+        .into_response(),
         Call::OpenRelay { to, bytes } => {
             let payload = &envelope.payload;
             Json(coordinator.open_relay(signer, account.id, payload, to, bytes, now)?)

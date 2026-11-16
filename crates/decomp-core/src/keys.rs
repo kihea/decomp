@@ -162,3 +162,46 @@ impl ContentHash {
         Self(Sha256::digest(bytes).into())
     }
 }
+
+hex_newtype!(
+    /// A device's public key for sealing: data sealed to it can be opened only
+    /// with the device's opening key. An X25519 key, separate from the device's
+    /// Ed25519 key because the two do different work, and because some places a
+    /// device keeps its signing key cannot use it for anything else.
+    SealingKey,
+    32
+);
+
+/// The secret half of a sealing key. Like `SigningKey`, it has no text form and
+/// no `Debug` output.
+pub struct OpeningKey(x25519_dalek::StaticSecret);
+
+impl OpeningKey {
+    pub fn generate() -> Self {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).expect("the operating system provides randomness");
+        Self::from_seed(seed)
+    }
+
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self(x25519_dalek::StaticSecret::from(seed))
+    }
+
+    /// The 32 secret bytes this key can be rebuilt from.
+    pub fn seed(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+
+    pub fn sealing_key(&self) -> SealingKey {
+        SealingKey(x25519_dalek::PublicKey::from(&self.0).to_bytes())
+    }
+
+    /// What this key and `other` share, which the holder of `other`'s secret
+    /// half can also work out. `None` if `other` is not a usable key.
+    pub(crate) fn shared_with(&self, other: &SealingKey) -> Option<[u8; 32]> {
+        let shared = self
+            .0
+            .diffie_hellman(&x25519_dalek::PublicKey::from(other.0));
+        shared.was_contributory().then(|| shared.to_bytes())
+    }
+}

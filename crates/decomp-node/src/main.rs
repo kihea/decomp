@@ -16,7 +16,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
     AccountId, AccountStatus, AppManifest, ContentHash, Credits, JobId, JobStatus, Manifest,
-    Outcome, PublicKey, Receipt, ShardRef, Split, Sponsorship, merkle,
+    OpeningKey, Outcome, PublicKey, Receipt, ShardRef, Split, Sponsorship, merkle,
 };
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::relay;
@@ -207,7 +207,10 @@ fn main() -> ExitCode {
             sponsor_daily,
         } => connect().and_then(|client| publish(&client, name, &modules, sponsor_daily)),
         Command::Send { file, to } => connect().and_then(|client| send(&client, &file, to)),
-        Command::Receive { output } => connect().and_then(|client| receive(&client, &output)),
+        Command::Receive { output } => connect().and_then(|client| {
+            let opening_key = device::opening_key(&cli.dir)?;
+            receive(&client, &opening_key, &output)
+        }),
         Command::Account => connect().and_then(|client| show_account(&client)),
         Command::Stake { amount } => connect().and_then(|client| {
             show_credits(&client.stake(amount)?);
@@ -563,7 +566,13 @@ fn send(client: &Client, file: &Path, to: PublicKey) -> Result<ExitCode, Box<dyn
 
 /// Waits for a channel addressed to this device that has something on it, and
 /// saves what it carries.
-fn receive(client: &Client, output: &Path) -> Result<ExitCode, Box<dyn Error>> {
+fn receive(
+    client: &Client,
+    opening_key: &OpeningKey,
+    output: &Path,
+) -> Result<ExitCode, Box<dyn Error>> {
+    // A device that linked before sealing existed has not published a key yet.
+    client.publish_sealing_key(opening_key.sealing_key())?;
     println!("device  {}", client.device_key());
     println!("waiting for a file sent to this device...");
     // Channels that went wrong, which are not tried again.
@@ -573,7 +582,7 @@ fn receive(client: &Client, output: &Path) -> Result<ExitCode, Box<dyn Error>> {
             if broken.contains(&incoming.channel) {
                 continue;
             }
-            let bytes = match relay::receive(client, &incoming) {
+            let bytes = match relay::receive(client, opening_key, &incoming) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => continue,
                 Err(error) => {
