@@ -1,0 +1,10 @@
+# DeComp, the Decentralized Compute Protocol.
+#
+# This workspace stands alone. Nothing in it depends on, or knows about, anything
+# built on top of the protocol.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"

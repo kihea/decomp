@@ -1,0 +1,9 @@
+[package]
+name = "decomp-schema"
+version = "0.1.0"
+edition.workspace = true
+description = "How the types of a job's inputs and outputs are described and checked."
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

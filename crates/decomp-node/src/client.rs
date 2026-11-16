@@ -1,0 +1,144 @@
+//! Client for the coordinator's request endpoint, signing as this device.
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use decomp_core::{
+    AccountStatus, Assignment, Blob, BlobData, BlobRef, Call, CheckedIn, ContentHash, Credits,
+    Envelope, JobId, JobResult, JobStatus, MAX_MESSAGE_BYTES, Manifest, PublicKey, Refusal,
+    Request, SigningKey, Standing, Submitted,
+};
+use serde::de::{DeserializeOwned, IgnoredAny};
+
+/// How long one request may take, including sending or receiving a large blob.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    /// The coordinator understood the request and said no.
+    #[error("{message}")]
+    Refused { code: String, message: String },
+    #[error("could not reach the coordinator: {0}")]
+    Unreachable(String),
+    #[error("the coordinator sent a blob that does not match its hash")]
+    CorruptBlob,
+}
+
+impl ClientError {
+    /// Whether the coordinator refused with this error code.
+    pub fn is(&self, expected: &str) -> bool {
+        matches!(self, Self::Refused { code, .. } if code == expected)
+    }
+}
+
+pub struct Client {
+    endpoint: String,
+    key: SigningKey,
+    http: ureq::Agent,
+}
+
+impl Client {
+    pub fn new(coordinator_url: &str, key: SigningKey) -> Self {
+        let http = ureq::Agent::config_builder()
+            // Read error bodies ourselves: they carry the coordinator's reason.
+            .http_status_as_error(false)
+            .timeout_global(Some(REQUEST_TIMEOUT))
+            .build()
+            .new_agent();
+        let endpoint = format!("{}/v1/request", coordinator_url.trim_end_matches('/'));
+        Self {
+            endpoint,
+            key,
+            http,
+        }
+    }
+
+    pub fn device_key(&self) -> PublicKey {
+        self.key.public_key()
+    }
+
+    pub fn account(&self) -> Result<AccountStatus, ClientError> {
+        self.call(Call::GetAccount)
+    }
+
+    pub fn stake(&self, amount: Credits) -> Result<AccountStatus, ClientError> {
+        self.call(Call::Stake { amount })
+    }
+
+    pub fn unstake(&self, amount: Credits) -> Result<AccountStatus, ClientError> {
+        self.call(Call::Unstake { amount })
+    }
+
+    /// How far the coordinator trusts this device as a node.
+    pub fn standing(&self) -> Result<Standing, ClientError> {
+        self.call(Call::GetStanding)
+    }
+
+    pub fn put_blob(&self, bytes: Vec<u8>) -> Result<ContentHash, ClientError> {
+        let stored: BlobRef = self.call(Call::PutBlob { data: Blob(bytes) })?;
+        Ok(stored.hash)
+    }
+
+    /// Fetches a blob and checks it against its hash, so a wrong or damaged blob
+    /// is never run or handed on.
+    pub fn get_blob(&self, hash: ContentHash) -> Result<Vec<u8>, ClientError> {
+        let BlobData { data: Blob(bytes) } = self.call(Call::GetBlob { hash })?;
+        if ContentHash::of(&bytes) != hash {
+            return Err(ClientError::CorruptBlob);
+        }
+        Ok(bytes)
+    }
+
+    pub fn submit_job(&self, manifest: Manifest) -> Result<JobId, ClientError> {
+        let submitted: Submitted = self.call(Call::SubmitJob { manifest })?;
+        Ok(submitted.job_id)
+    }
+
+    pub fn job(&self, job_id: JobId) -> Result<JobStatus, ClientError> {
+        self.call(Call::GetJob { job_id })
+    }
+
+    pub fn check_in(&self) -> Result<Option<Assignment>, ClientError> {
+        let checked_in: CheckedIn = self.call(Call::CheckIn)?;
+        Ok(checked_in.assignment)
+    }
+
+    pub fn submit_result(&self, result: JobResult) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::SubmitResult { result })?;
+        Ok(())
+    }
+
+    fn call<R: DeserializeOwned>(&self, call: Call) -> Result<R, ClientError> {
+        let request = Request {
+            issued_at: unix_now(),
+            call,
+        };
+        let envelope = Envelope::seal(&self.key, &request);
+        let unreachable = |error: ureq::Error| ClientError::Unreachable(error.to_string());
+
+        let mut response = self
+            .http
+            .post(&self.endpoint)
+            .send_json(&envelope)
+            .map_err(unreachable)?;
+        let succeeded = response.status().is_success();
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_MESSAGE_BYTES as u64);
+        if succeeded {
+            return body.read_json().map_err(unreachable);
+        }
+        let Refusal { error, message } = body.read_json().map_err(unreachable)?;
+        Err(ClientError::Refused {
+            code: error,
+            message,
+        })
+    }
+}
+
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock is after 1970")
+        .as_secs()
+}

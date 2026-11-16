@@ -1,0 +1,335 @@
+//! The coordinator's HTTP API. Every request body is a signed envelope; there are
+//! no sessions or tokens, so who is asking is always proven by the signature.
+//!
+//! - `POST /v1/ops` takes an `AccountOp`: a change to an account, which is logged.
+//! - `POST /v1/request` takes a `Request`: everything else.
+
+use std::io;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
+use decomp_core::{
+    Account, AccountStatus, Accounts, Blob, BlobData, BlobRef, Call, CheckedIn, ContentHash,
+    Envelope, EnvelopeError, JobError, LedgerEntry, LedgerError, MAX_MESSAGE_BYTES, OpError,
+    Outcome, PublicKey, Refusal, Request, Submitted,
+};
+use decomp_sandbox::Sandbox;
+use serde_json::json;
+use tower_http::cors::CorsLayer;
+
+use crate::referee::referee;
+use crate::state::{Coordinator, SubmitError};
+
+/// How far a request's `issued_at` may be from the coordinator's clock. This bounds
+/// how long a captured request can be replayed.
+const MAX_CLOCK_SKEW_SECS: u64 = 300;
+
+struct App {
+    coordinator: Mutex<Coordinator>,
+    /// For refereeing disputes, which means running the disputed job.
+    sandbox: Sandbox,
+}
+
+pub fn router(coordinator: Coordinator) -> Router {
+    let app = App {
+        coordinator: Mutex::new(coordinator),
+        sandbox: Sandbox::new(),
+    };
+    Router::new()
+        .route("/v1/ops", post(submit_op))
+        .route("/v1/request", post(request))
+        .layer(DefaultBodyLimit::max(MAX_MESSAGE_BYTES))
+        // Requests carry no cookies or credentials, so any web origin may call.
+        .layer(CorsLayer::permissive())
+        .with_state(Arc::new(app))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock is after 1970")
+        .as_secs()
+}
+
+async fn submit_op(
+    State(app): State<Arc<App>>,
+    Json(envelope): Json<Envelope>,
+) -> Result<Json<AccountStatus>, ApiError> {
+    let status = app
+        .coordinator
+        .lock()
+        .expect("coordinator lock")
+        .apply_op(&envelope)?;
+    Ok(Json(status))
+}
+
+async fn request(
+    State(app): State<Arc<App>>,
+    Json(envelope): Json<Envelope>,
+) -> Result<Response, ApiError> {
+    let Request { issued_at, call } = envelope.open()?;
+    let now = unix_now();
+    if now.abs_diff(issued_at) > MAX_CLOCK_SKEW_SECS {
+        let message = "the request's issued_at is too far from the coordinator's clock";
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "stale_request",
+            message,
+        ));
+    }
+
+    let (answer, cases) = {
+        let mut coordinator = app.coordinator.lock().expect("coordinator lock");
+        let account = member(&coordinator.accounts, &envelope.signer)?.clone();
+        let answer = answer(
+            &mut coordinator,
+            &app.sandbox,
+            call,
+            &account,
+            envelope,
+            now,
+        );
+        // Any call can find that a job's deadline has passed, so settle after each.
+        coordinator.settle(now);
+        (answer, coordinator.take_cases())
+    };
+    // Refereeing runs the disputed job, which can take as long as the job did, so
+    // it happens off to the side and the coordinator stays free meanwhile.
+    for case in cases {
+        let app = Arc::clone(&app);
+        tokio::task::spawn_blocking(move || {
+            let verdict = referee(&app.sandbox, &case);
+            let mut coordinator = app.coordinator.lock().expect("coordinator lock");
+            coordinator.resolve(&case, &verdict, unix_now());
+        });
+    }
+    answer
+}
+
+fn answer(
+    coordinator: &mut Coordinator,
+    sandbox: &Sandbox,
+    call: Call,
+    account: &Account,
+    envelope: Envelope,
+    now: u64,
+) -> Result<Response, ApiError> {
+    let signer = envelope.signer;
+    Ok(match call {
+        Call::GetAccount => Json(coordinator.status(account.clone())).into_response(),
+        Call::PutBlob { data } => Json(BlobRef {
+            hash: coordinator.blobs.put(&data.0)?,
+        })
+        .into_response(),
+        Call::GetBlob { hash } => {
+            let bytes = coordinator
+                .blobs
+                .get(&hash)?
+                .ok_or_else(|| unknown_blob(&hash))?;
+            Json(BlobData { data: Blob(bytes) }).into_response()
+        }
+        Call::SubmitJob { manifest } => {
+            let payload = &envelope.payload;
+            let job_id =
+                coordinator.submit_job(&signer, account.id, payload, manifest, now, sandbox)?;
+            Json(Submitted { job_id }).into_response()
+        }
+        Call::GetJob { job_id } => {
+            Json(coordinator.job_status(job_id, account.id, now)?).into_response()
+        }
+        Call::Stake { amount } => {
+            coordinator.record(LedgerEntry::Stake {
+                account: account.id,
+                amount,
+            })?;
+            Json(coordinator.status(account.clone())).into_response()
+        }
+        Call::Unstake { amount } => {
+            // Stake must still be there when a job in progress turns out wrong.
+            if coordinator.jobs.is_working(&account.id) {
+                let message =
+                    "stake cannot be taken back while one of the account's nodes is on a job";
+                return Err(ApiError::new(StatusCode::CONFLICT, "node_working", message));
+            }
+            coordinator.record(LedgerEntry::Unstake {
+                account: account.id,
+                amount,
+            })?;
+            Json(coordinator.status(account.clone())).into_response()
+        }
+        Call::GetStanding => Json(coordinator.standing(&signer, &account.id)).into_response(),
+        Call::CheckIn => {
+            let assignment = coordinator.check_in(signer, account.id, now);
+            Json(CheckedIn { assignment }).into_response()
+        }
+        Call::SubmitResult { result } => {
+            if let Outcome::Completed { output } = &result.outcome {
+                require_blob(coordinator, output)?;
+            }
+            require_blob(coordinator, &result.checkpoints)?;
+            coordinator
+                .jobs
+                .report(signer, result, envelope, now, &mut rand::rng())?;
+            Json(json!({})).into_response()
+        }
+    })
+}
+
+/// The account `signer` may act for. Only approved devices (and the account key)
+/// get past this, so every request below it comes from a member of an account.
+fn member<'a>(accounts: &'a Accounts, signer: &PublicKey) -> Result<&'a Account, ApiError> {
+    let account = accounts.account_of(signer).ok_or_else(|| {
+        let message = "this key does not belong to an account";
+        ApiError::new(StatusCode::NOT_FOUND, "not_linked", message)
+    })?;
+    if !account.authorizes(signer) {
+        let message = "this device has been revoked";
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "device_revoked",
+            message,
+        ));
+    }
+    Ok(account)
+}
+
+fn require_blob(coordinator: &Coordinator, hash: &ContentHash) -> Result<(), ApiError> {
+    if coordinator.blobs.contains(hash) {
+        Ok(())
+    } else {
+        Err(unknown_blob(hash))
+    }
+}
+
+fn unknown_blob(hash: &ContentHash) -> ApiError {
+    let message = format!("no blob with hash {hash} has been stored");
+    ApiError::new(StatusCode::NOT_FOUND, "unknown_blob", message)
+}
+
+/// An error answer: an HTTP status and a `Refusal` body.
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = Refusal {
+            error: self.code.into(),
+            message: self.message,
+        };
+        (self.status, Json(body)).into_response()
+    }
+}
+
+impl From<EnvelopeError> for ApiError {
+    fn from(error: EnvelopeError) -> Self {
+        let code = match error {
+            EnvelopeError::BadSignature => "bad_signature",
+            EnvelopeError::BadPayload(_) => "bad_payload",
+        };
+        Self::new(StatusCode::BAD_REQUEST, code, error.to_string())
+    }
+}
+
+impl From<OpError> for ApiError {
+    fn from(error: OpError) -> Self {
+        let (status, code) = match error {
+            OpError::Envelope(inner) => return inner.into(),
+            OpError::AccountExists => (StatusCode::CONFLICT, "account_exists"),
+            OpError::UnknownAccount => (StatusCode::NOT_FOUND, "unknown_account"),
+            OpError::StaleSeq { .. } => (StatusCode::CONFLICT, "stale_seq"),
+            OpError::NotAuthorized => (StatusCode::FORBIDDEN, "not_authorized"),
+            OpError::DeviceTaken => (StatusCode::CONFLICT, "device_taken"),
+            OpError::UnknownDevice => (StatusCode::NOT_FOUND, "unknown_device"),
+            OpError::AlreadyRevoked => (StatusCode::CONFLICT, "already_revoked"),
+        };
+        Self::new(status, code, error.to_string())
+    }
+}
+
+impl From<JobError> for ApiError {
+    fn from(error: JobError) -> Self {
+        let (status, code) = match error {
+            JobError::JobExists => (StatusCode::CONFLICT, "job_exists"),
+            JobError::NoNodes => (StatusCode::BAD_REQUEST, "no_nodes"),
+            JobError::DeadlinePassed => (StatusCode::BAD_REQUEST, "deadline_passed"),
+            JobError::NoComputeCap => (StatusCode::BAD_REQUEST, "no_compute_cap"),
+            JobError::UnknownJob => (StatusCode::NOT_FOUND, "unknown_job"),
+            JobError::JobClosed => (StatusCode::CONFLICT, "job_closed"),
+            JobError::NotAssigned => (StatusCode::FORBIDDEN, "not_assigned"),
+            JobError::AlreadyReported => (StatusCode::CONFLICT, "already_reported"),
+            JobError::UnitsOverCap => (StatusCode::BAD_REQUEST, "units_over_cap"),
+        };
+        Self::new(status, code, error.to_string())
+    }
+}
+
+impl From<LedgerError> for ApiError {
+    fn from(error: LedgerError) -> Self {
+        let (status, code) = match error {
+            LedgerError::InsufficientCredits => {
+                (StatusCode::PAYMENT_REQUIRED, "insufficient_credits")
+            }
+            LedgerError::InsufficientEarnedCredits => {
+                (StatusCode::PAYMENT_REQUIRED, "insufficient_earned_credits")
+            }
+            LedgerError::InsufficientStake => (StatusCode::CONFLICT, "insufficient_stake"),
+            LedgerError::UnknownAccount => (StatusCode::NOT_FOUND, "unknown_account"),
+            LedgerError::AlreadyEscrowed => (StatusCode::CONFLICT, "job_exists"),
+            LedgerError::NothingEscrowed | LedgerError::FeeExceedsEscrow => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "ledger_failed")
+            }
+        };
+        Self::new(status, code, error.to_string())
+    }
+}
+
+impl From<SubmitError> for ApiError {
+    fn from(error: SubmitError) -> Self {
+        let message = error.to_string();
+        match error {
+            SubmitError::Job(inner) => inner.into(),
+            SubmitError::Ledger(inner) => inner.into(),
+            SubmitError::Storage(inner) => inner.into(),
+            SubmitError::UnknownBlob(_) => {
+                Self::new(StatusCode::NOT_FOUND, "unknown_blob", message)
+            }
+            SubmitError::FeeCapTooLow(_) => {
+                Self::new(StatusCode::BAD_REQUEST, "over_fee_cap", message)
+            }
+            SubmitError::TypeMismatch(_) | SubmitError::TypedJobSplitByBytes => {
+                Self::new(StatusCode::BAD_REQUEST, "type_mismatch", message)
+            }
+            SubmitError::TooManyPieces => {
+                Self::new(StatusCode::BAD_REQUEST, "too_many_pieces", message)
+            }
+        }
+    }
+}
+
+impl From<io::Error> for ApiError {
+    fn from(error: io::Error) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_failed",
+            error.to_string(),
+        )
+    }
+}
