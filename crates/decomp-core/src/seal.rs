@@ -42,29 +42,34 @@ pub fn published_key(device: &PublicKey, proof: &Envelope) -> Option<SealingKey>
 /// published them. A log of those requests is a complete copy.
 #[derive(Default)]
 pub struct SealingKeys {
-    /// By device: when its request was made, and the request.
-    published: HashMap<PublicKey, (u64, Envelope)>,
+    /// By device: the key, when the request publishing it was made, and the
+    /// request.
+    published: HashMap<PublicKey, (SealingKey, u64, Envelope)>,
 }
 
 impl SealingKeys {
-    /// Takes in a device's request to publish a key. Returns whether it is the
-    /// newest from that device, which is when it should be logged.
+    /// Takes in a device's request to publish a key. Returns whether it changed
+    /// the device's key, which is when it should be logged. A device publishes
+    /// its key again each time it starts, and the same key is not news.
     pub fn apply(&mut self, proof: &Envelope) -> Result<bool, EnvelopeError> {
         let request: Request = proof.open()?;
-        let newest = self
+        let Call::PublishSealingKey { key } = request.call else {
+            return Ok(false);
+        };
+        let changed = self
             .published
             .get(&proof.signer)
-            .is_none_or(|(at, _)| *at < request.issued_at);
-        if newest {
-            let kept = (request.issued_at, proof.clone());
+            .is_none_or(|(old, at, _)| *old != key && *at < request.issued_at);
+        if changed {
+            let kept = (key, request.issued_at, proof.clone());
             self.published.insert(proof.signer, kept);
         }
-        Ok(newest)
+        Ok(changed)
     }
 
     /// The request in which `device` published its current key, if it has.
     pub fn proof(&self, device: &PublicKey) -> Option<&Envelope> {
-        self.published.get(device).map(|(_, proof)| proof)
+        self.published.get(device).map(|(_, _, proof)| proof)
     }
 }
 
