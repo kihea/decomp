@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use decomp_core::{Assignment, JobResult, Outcome};
+use decomp_core::{Assignment, JobResult, Outcome, Spawn};
 use decomp_sandbox::{Blobs, Job, Sandbox};
 use decomp_schema::records::{self, Records};
 
@@ -60,6 +60,17 @@ pub fn work(
                     .state
                     .map(|left| client.put_blob(left))
                     .transpose()?,
+                spawned: produced
+                    .spawned
+                    .into_iter()
+                    .map(|asked| {
+                        Ok(Spawn {
+                            module: asked.module,
+                            input: client.put_blob(asked.input)?,
+                            compute_cap: asked.compute_cap,
+                        })
+                    })
+                    .collect::<Result<_, ClientError>>()?,
             },
             Err(failure) => Outcome::Failed { failure },
         },

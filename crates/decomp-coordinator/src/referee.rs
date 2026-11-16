@@ -11,7 +11,7 @@
 //! That needs a way to restore a job's state mid-run, which a compiled engine does
 //! not offer, so the job is re-run from its start up to the checkpoint instead.
 
-use decomp_core::{ContentHash, JobId, JobResult, Outcome, PublicKey};
+use decomp_core::{ContentHash, JobId, JobResult, Outcome, PublicKey, Spawn};
 use decomp_sandbox::{
     Blobs, Checkpoint, INSTRUCTIONS_PER_CHECKPOINT, INSTRUCTIONS_PER_UNIT, Job, Sandbox,
 };
@@ -86,6 +86,15 @@ pub fn referee(sandbox: &Sandbox, case: &Case) -> Verdict {
                 output: ContentHash::of(&produced.output),
                 blobs: produced.blobs.iter().map(|b| ContentHash::of(b)).collect(),
                 state: produced.state.as_ref().map(|left| ContentHash::of(left)),
+                spawned: produced
+                    .spawned
+                    .iter()
+                    .map(|asked| Spawn {
+                        module: asked.module,
+                        input: ContentHash::of(&asked.input),
+                        compute_cap: asked.compute_cap,
+                    })
+                    .collect(),
             },
             Err(failure) => Outcome::Failed { failure: *failure },
         };

@@ -17,6 +17,9 @@ pub const UNPROVEN_REDUNDANCY: u32 = 2;
 /// The most blobs a job may be given to read, besides its input.
 pub const MAX_READS: usize = 64;
 
+/// The most follow-up jobs one job may ask for.
+pub const MAX_SPAWNED: usize = 64;
+
 /// The highest size tier. Jobs of 16 units or more all fall in it.
 pub const MAX_TIER: u32 = 4;
 
@@ -126,10 +129,27 @@ pub enum Outcome {
         /// The contents the job left its shard with, if it changed them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<ContentHash>,
+        /// The follow-up jobs the job asked for with `job.spawn`, in order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        spawned: Vec<Spawn>,
     },
     Failed {
         failure: Failure,
     },
+}
+
+/// A follow-up job that a job asked for (spec section 7, `job.spawn`). It is
+/// started once the job that asked is verified, with that job's deadline, node
+/// count, sponsor, and blobs to read, and is paid for out of what that job left
+/// of its fee cap. Follow-ups are started in order for as long as that covers
+/// the most each could cost; the rest are not started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Spawn {
+    /// The module to run: one of the blobs the asking job was given to read.
+    pub module: ContentHash,
+    pub input: ContentHash,
+    pub compute_cap: u64,
 }
 
 /// Why a job did not complete. These are results, not errors: every honest node

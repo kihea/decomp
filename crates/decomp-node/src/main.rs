@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
-    AccountId, AccountStatus, AppManifest, ContentHash, Credits, JobStatus, Manifest, Outcome,
-    PublicKey, ShardRef, Split, Sponsorship, merkle,
+    AccountId, AccountStatus, AppManifest, ContentHash, Credits, JobId, JobStatus, Manifest,
+    Outcome, PublicKey, Receipt, ShardRef, Split, Sponsorship, merkle,
 };
-use decomp_node::client::{Client, unix_now};
+use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::relay;
 
 use crate::agent::Reachable;
@@ -145,6 +145,10 @@ enum Command {
         /// and the shard's name. The module must be one of that app's.
         #[arg(long, value_parser = parse_shard)]
         state: Option<ShardRef>,
+        /// Credits to set aside, on top of the job's own highest fee, for the
+        /// follow-up jobs it may ask for. What is not spent comes back.
+        #[arg(long, default_value = "0")]
+        follow_up_credits: Credits,
     },
     /// Show the records in a shard of an app's state.
     State {
@@ -220,6 +224,7 @@ fn main() -> ExitCode {
             split_bytes,
             sponsor,
             state,
+            follow_up_credits,
         } => connect().and_then(|client| {
             let limits = Limits {
                 deadline_secs,
@@ -227,6 +232,7 @@ fn main() -> ExitCode {
                 split_bytes,
                 sponsor,
                 state,
+                follow_up_credits,
             };
             submit(&client, job, limits)
         }),
@@ -333,6 +339,51 @@ struct Limits {
     split_bytes: Option<u64>,
     sponsor: Option<AccountId>,
     state: Option<ShardRef>,
+    follow_up_credits: Credits,
+}
+
+/// Waits until a job closes. Gives its receipt, or says why it has none.
+fn wait_for(
+    client: &Client,
+    job_id: JobId,
+) -> Result<Result<Box<Receipt>, &'static str>, ClientError> {
+    loop {
+        match client.job(job_id)? {
+            JobStatus::Waiting | JobStatus::Running => sleep(JOB_POLL),
+            JobStatus::Verified { receipt } => return Ok(Ok(receipt)),
+            JobStatus::Disputed => return Ok(Err("the nodes disagreed and none was right")),
+            JobStatus::Expired => {
+                return Ok(Err("the deadline passed before the job had a result"));
+            }
+        }
+    }
+}
+
+/// Waits for one follow-up job and says how it went, on one line.
+fn show_follow_up(client: &Client, job_id: JobId) -> Result<(), Box<dyn Error>> {
+    let went = match wait_for(client, job_id) {
+        // The job that asked for it had not left enough of its fee cap.
+        Err(error) if error.is("unknown_job") => "not started".to_string(),
+        Err(error) => return Err(error.into()),
+        Ok(Err(reason)) => reason.to_string(),
+        Ok(Ok(receipt)) => match receipt.outcome {
+            Outcome::Completed {
+                output, spawned, ..
+            } if spawned.is_empty() => {
+                format!("output {output}, fee {} credits", receipt.fee.total)
+            }
+            Outcome::Completed {
+                output, spawned, ..
+            } => format!(
+                "output {output}, fee {} credits, asked for {} more",
+                receipt.fee.total,
+                spawned.len()
+            ),
+            Outcome::Failed { failure } => format!("failed: {failure}"),
+        },
+    };
+    println!("follow-up {job_id}: {went}");
+    Ok(())
 }
 
 /// Reads a shard as it is written on the command line: the app's ID, a slash,
@@ -372,6 +423,7 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
         split_bytes,
         sponsor,
         state,
+        follow_up_credits,
     } = limits;
     let JobFiles {
         module,
@@ -395,21 +447,19 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
             .collect::<Result<_, _>>()?,
         state,
     };
-    // Set aside the most the job can cost; what is not spent comes back.
+    // Set aside the most the job can cost, and what its follow-ups may; what is
+    // not spent comes back.
     for _ in 0..pieces {
         manifest.max_fee += manifest.highest_fee();
     }
+    manifest.max_fee += follow_up_credits;
     println!("module  {}", manifest.module);
     let job_id = client.submit_job(manifest)?;
     println!("job     {job_id}");
 
-    let receipt = loop {
-        match client.job(job_id)? {
-            JobStatus::Waiting | JobStatus::Running => sleep(JOB_POLL),
-            JobStatus::Verified { receipt } => break receipt,
-            JobStatus::Disputed => return fail("the nodes disagreed and none was right"),
-            JobStatus::Expired => return fail("the deadline passed before the job had a result"),
-        }
+    let receipt = match wait_for(client, job_id)? {
+        Ok(receipt) => receipt,
+        Err(reason) => return fail(reason),
     };
     if receipt.pieces.is_empty() {
         println!(
@@ -430,12 +480,16 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
             output,
             blobs,
             state,
+            spawned,
         } => {
             for blob in blobs {
                 println!("stored  {blob}");
             }
             if let Some(contents) = state {
                 println!("state   {contents}");
+            }
+            for index in 0..spawned.len() {
+                show_follow_up(client, JobId::follow_up(&job_id, index as u64))?;
             }
             let bytes = client.get_blob(output)?;
             report_output(&bytes, job.output.as_deref())?;

@@ -139,6 +139,16 @@ impl JobId {
         hasher.update(payload);
         Self(hasher.finalize().into())
     }
+
+    /// The ID of the follow-up job that `parent` asked for at place `index` in
+    /// its result, counting from zero.
+    pub fn follow_up(parent: &JobId, index: u64) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(parent.0);
+        hasher.update(b"follow-up");
+        hasher.update(index.to_le_bytes());
+        Self(hasher.finalize().into())
+    }
 }
 
 impl AccountId {

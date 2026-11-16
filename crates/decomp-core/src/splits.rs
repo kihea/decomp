@@ -121,6 +121,7 @@ impl Splits {
                     output,
                     blobs: Vec::new(),
                     state: None,
+                    spawned: Vec::new(),
                 },
             ));
             job.status = JobStatus::Verified { receipt };

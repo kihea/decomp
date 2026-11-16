@@ -16,7 +16,7 @@ use rand::{Rng, RngExt};
 
 use crate::envelope::Envelope;
 use crate::job::{
-    Assignment, JobResult, JobStatus, Manifest, Outcome, Receipt, UNPROVEN_REDUNDANCY,
+    Assignment, JobResult, JobStatus, Manifest, Outcome, Receipt, Spawn, UNPROVEN_REDUNDANCY,
 };
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey};
 use crate::ledger::{Credits, FeeSplit, fee};
@@ -79,6 +79,8 @@ pub enum Closure {
         receipt: Box<Receipt>,
         node_accounts: Vec<AccountId>,
         checker: Option<AccountId>,
+        /// The follow-up jobs the job asked for, if any, for the caller to start.
+        follow_ups: Option<FollowUps>,
     },
     /// No node was right. The submitter is refunded.
     Disputed,
@@ -86,6 +88,17 @@ pub enum Closure {
     Expired,
     /// A node got a known-answer job right and is paid from the verification fund.
     KnownAnswerPassed { account: AccountId, reward: Credits },
+}
+
+/// The follow-up jobs a verified job asked for. The caller starts them in order,
+/// each like a job its submitter had sent, for as long as `spare` covers what
+/// is set aside for them.
+pub struct FollowUps {
+    /// The account that submitted the job that asked.
+    pub submitter: AccountId,
+    /// What that job left of its fee cap.
+    pub spare: Credits,
+    pub jobs: Vec<(JobId, Manifest)>,
 }
 
 /// Nodes disagreed about a job. The caller referees it (which means running the
@@ -482,10 +495,38 @@ impl Jobs {
                 self.known.pop_front();
             }
         }
+        let follow_ups = match (&job.kind, &receipt.outcome) {
+            (Kind::Submitted { submitter }, Outcome::Completed { spawned, .. })
+                if !spawned.is_empty() =>
+            {
+                let ask = |(index, spawn): (usize, &Spawn)| {
+                    let asked = Manifest {
+                        module: spawn.module,
+                        input: spawn.input,
+                        compute_cap: spawn.compute_cap,
+                        split: None,
+                        state: None,
+                        ..job.manifest.clone()
+                    };
+                    let manifest = Manifest {
+                        max_fee: asked.highest_fee(),
+                        ..asked
+                    };
+                    (JobId::follow_up(&job_id, index as u64), manifest)
+                };
+                Some(FollowUps {
+                    submitter: *submitter,
+                    spare: job.manifest.max_fee - receipt.fee.total,
+                    jobs: spawned.iter().enumerate().map(ask).collect(),
+                })
+            }
+            _ => None,
+        };
         let how = Closure::Verified {
             receipt: Box::new(receipt),
             node_accounts,
             checker,
+            follow_ups,
         };
         self.closed.push(ClosedJob { job_id, how });
     }

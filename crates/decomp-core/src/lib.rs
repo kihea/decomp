@@ -26,10 +26,10 @@ pub use app::{
 pub use envelope::{Envelope, EnvelopeError};
 pub use hosts::{Host, Hosts};
 pub use job::{
-    Assignment, Failure, JobResult, JobStatus, MAX_PIECES, MAX_READS, MAX_TIER, Manifest, Outcome,
-    Receipt, Split, UNPROVEN_REDUNDANCY,
+    Assignment, Failure, JobResult, JobStatus, MAX_PIECES, MAX_READS, MAX_SPAWNED, MAX_TIER,
+    Manifest, Outcome, Receipt, Spawn, Split, UNPROVEN_REDUNDANCY,
 };
-pub use jobs::{ClosedJob, Closure, Dispute, JobError, Jobs};
+pub use jobs::{ClosedJob, Closure, Dispute, FollowUps, JobError, Jobs};
 pub use keys::{AccountId, ContentHash, JobId, PublicKey, Signature, SigningKey};
 pub use ledger::{
     BASE_PRICE, Balance, Credits, FeeSplit, Ledger, LedgerEntry, LedgerError,

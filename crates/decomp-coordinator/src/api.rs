@@ -207,9 +207,13 @@ fn answer(
                 output,
                 blobs,
                 state,
+                spawned,
             } = &result.outcome
             {
-                for hash in blobs.iter().chain([output]).chain(state) {
+                let asked = spawned
+                    .iter()
+                    .flat_map(|spawn| [&spawn.module, &spawn.input]);
+                for hash in blobs.iter().chain([output]).chain(state).chain(asked) {
                     require_blob(coordinator, hash)?;
                 }
             }

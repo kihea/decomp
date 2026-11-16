@@ -22,12 +22,12 @@ use std::path::Path;
 
 use decomp_core::{
     Account, AccountId, AccountStatus, Accounts, Assignment, Challenge, CheckedIn, Closure,
-    Conduct, ContentHash, Credits, Envelope, Hosts, Incoming, JobError, JobId, JobStatus, Jobs,
-    Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, MAX_READS, MAX_SHARD_NAME_BYTES,
-    Manifest, Merge, OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT, Penalty, Placement,
-    PublicKey, RelayEntry, RelayError, Relays, Route, ScoreEvent, Scores, ShardRef, Splits,
-    SponsorError, Sponsored, Standing, StateEntry, States, Storage, StorageEntry, StorageError,
-    Storing, channel_id, fee,
+    Conduct, ContentHash, Credits, Envelope, FollowUps, Hosts, Incoming, JobError, JobId,
+    JobStatus, Jobs, Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, MAX_READS,
+    MAX_SHARD_NAME_BYTES, Manifest, Merge, OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT,
+    Penalty, Placement, PublicKey, RelayEntry, RelayError, Relays, Route, ScoreEvent, Scores,
+    ShardRef, Splits, SponsorError, Sponsored, Standing, StateEntry, States, Storage, StorageEntry,
+    StorageError, Storing, channel_id, fee,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
@@ -591,6 +591,7 @@ impl Coordinator {
         }
         for closed in self.jobs.take_closed() {
             let job_id = closed.job_id;
+            let mut asked = None;
             if let Some(merge) = self.splits.piece_closed(&closed, now) {
                 self.merge(merge, now);
             }
@@ -602,7 +603,9 @@ impl Coordinator {
                     receipt,
                     node_accounts,
                     checker,
+                    follow_ups,
                 } => {
+                    asked = follow_ups;
                     // What the job left its shard with is what the next job on
                     // that shard is handed.
                     if let (
@@ -643,6 +646,42 @@ impl Coordinator {
             for entry in entries.into_iter().flatten() {
                 self.record(entry).expect("a closed job can be settled");
             }
+            // The job has been paid for and the rest of its fee cap returned,
+            // which is what its follow-ups are paid from.
+            if let Some(follow_ups) = asked {
+                self.start_follow_ups(follow_ups, now);
+            }
+        }
+    }
+
+    /// Starts the follow-up jobs a verified job asked for, in the order it asked,
+    /// for as long as what it left of its fee cap covers the most each could
+    /// cost. The rest are not started. A follow-up's input is not checked against
+    /// its module's types: a wrong one fails when it runs.
+    fn start_follow_ups(&mut self, follow_ups: FollowUps, now: u64) {
+        let FollowUps {
+            submitter,
+            mut spare,
+            jobs,
+        } = follow_ups;
+        for (id, manifest) in jobs {
+            let amount = manifest.max_fee;
+            let account = manifest.sponsor.unwrap_or(submitter);
+            if amount > spare || self.jobs.check(&id, &manifest, now).is_err() {
+                break;
+            }
+            let escrow = LedgerEntry::Escrow {
+                job_id: id,
+                account,
+                amount,
+            };
+            if self.record(escrow).is_err() {
+                break;
+            }
+            spare = spare - amount;
+            self.jobs
+                .submit(id, submitter, manifest, now)
+                .expect("the job was checked just above");
         }
     }
 

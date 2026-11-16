@@ -157,6 +157,16 @@ are part of its result, so nodes are held to them like the output.
 - A job that fails changes nothing.
 - Anyone can ask what a shard holds now and read its records.
 
+**Follow-up jobs** (also build step 7).
+
+- A job can ask for more jobs with `job.spawn`: a module, an input, and a
+  compute cap for each. The module must be one of the blobs the job was given
+  to read.
+- They are started once the job that asked is verified, in the order it asked,
+  and paid for out of what that job left of its fee cap. Those the rest does not
+  cover are not started. They keep the asking job's deadline, node count, and
+  payer, and belong to the same submitter.
+
 ## Layout
 
 | Path | What it is |
@@ -237,6 +247,10 @@ cargo run -p decomp-node -- submit path/to/module.wasm --input path/to/input --c
 
 A job may be given files to read as blobs with `--read path/to/file`, once for
 each file. The module asks for one by the hash of its contents.
+
+A job that asks for follow-up jobs needs room for them in its fee cap:
+`--follow-up-credits 5` sets aside five credits more than the job itself can
+cost. `submit` waits for the follow-ups and shows how each went.
 
 A job may be handed a shard of an app's state with `--state <app ID>/<shard>`,
 if its module is one of that app's. The records a shard holds:
@@ -361,6 +375,12 @@ redone because another got in first. The price is that a job reads and writes
 its whole shard, so shards are small, 8 MiB at most, and an app with more state
 uses more shards.
 
+**Follow-up jobs wait for the verdict.** A job's request for more jobs is part
+of its result, so it counts only once the result stands. Nothing a job that was
+wrong, or failed, asked for is ever run. The follow-ups are funded from what the
+job left of its own fee cap, so one cap, set by the submitter, bounds what a job
+and everything it sets off can cost.
+
 **Data services are node work.** Storing, serving, and relaying data are done by
 nodes and paid for in credits. DeComp does not lean on an outside peer-to-peer
 network for them.
@@ -442,7 +462,8 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | An app's manifest lists no permissions or schemas | The one permission so far follows from the list of modules: only the app's own modules may be handed its state. Each module describes its own types. | With the first permission that cannot be read off the modules |
 | What an app has set aside for an account today is kept in memory | A restart forgets it, so a daily cap can be passed once for each restart. It counts the highest possible fee of each job, not what the job cost. | Settlement, build step 13 |
 | A daily cap limits an account, not a person | Accounts are free to make, so someone can get around an app's cap with new ones. What the app's account holds is the real limit. | Sign-in, build step 14 |
-| Two host functions are missing | Follow-up jobs, and sealing data to a key. | Follow-up jobs next in build step 7; sealing with private mode, build step 9 |
+| One host function is missing | Sealing data to a key. | Private mode, build step 9 |
+| A follow-up job gets less than a submitted one | Its input is not checked against its module's types before it runs, so a wrong one fails when run. It cannot be split or handed state. | With the first app that needs any of these |
 | A job reads and writes its whole shard | Every job on a shard fetches all its records and stores all of them again, which is why a shard is capped at 8 MiB. | A hash tree over the records, if apps need larger shards |
 | Every past version of a shard is kept | Each is a blob on the coordinator, and nothing removes old ones. | With job blobs moving to node storage |
 | Records have no declared types and cannot be removed | The SDK reads and writes them as JSON of whatever type the module asks for, and the spec lists no call to delete one. | With the first app that needs either |

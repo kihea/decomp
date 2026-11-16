@@ -37,12 +37,16 @@
 //! | `result.read` | `(dest)` | Copies what the last `blob.get`, `kv.get`, or `kv.scan` found into memory at `dest` |
 //!
 //! The three `kv` functions end a job that was handed no shard.
+//!
+//! | Function | Signature | Effect |
+//! | --- | --- | --- |
+//! | `job.spawn` | `(module, input, len, compute_cap)` | Asks for a follow-up job: the module whose hash is the 32 bytes at `module`, which must be one of the blobs the job was given to read, run on the `len` bytes at `input` with the 64-bit `compute_cap`. It is started only if this job completes and is verified |
 
 mod meter;
 
 use std::collections::HashMap;
 
-use decomp_core::{ContentHash, PublicKey, Signature};
+use decomp_core::{ContentHash, MAX_SPAWNED, PublicKey, Signature};
 use decomp_schema::records::{self, Records, record_bytes};
 use sha2::{Digest, Sha256};
 use wasmtime::{
@@ -128,6 +132,17 @@ pub struct Produced {
     /// The records the job left its shard with, in their byte form, if it
     /// changed them.
     pub state: Option<Vec<u8>>,
+    /// The follow-up jobs the job asked for, in order.
+    pub spawned: Vec<Spawned>,
+}
+
+/// A follow-up job a job asked for.
+#[derive(Debug)]
+pub struct Spawned {
+    /// The module to run: one of the blobs the asking job was given to read.
+    pub module: ContentHash,
+    pub input: Vec<u8>,
+    pub compute_cap: u64,
 }
 
 /// What running a job produced and what it cost.
@@ -194,6 +209,10 @@ enum Halt {
     KeyTooLong,
     #[error("the job left its shard holding more than a shard may")]
     TooMuchState,
+    #[error(
+        "a follow-up job runs one of the blobs the job was given to read, on a compute cap of at least 1, and a job may ask for at most {MAX_SPAWNED}"
+    )]
+    BadFollowUp,
 }
 
 /// Per-job state the host functions work on.
@@ -210,6 +229,8 @@ struct State {
     records_bytes: usize,
     /// What the module last looked up, until it reads it.
     found: Option<Found>,
+    /// The follow-up jobs the job has asked for.
+    spawned: Vec<Spawned>,
     limits: StoreLimits,
     /// The most instructions the job may execute.
     cap: u64,
@@ -275,6 +296,7 @@ impl Sandbox {
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "kv.get", kv_get))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "kv.put", kv_put))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "kv.scan", kv_scan))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "job.spawn", job_spawn))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, METER_IMPORT, meter))
             .expect("host function names are unique");
         Self { engine, linker }
@@ -370,6 +392,7 @@ impl Sandbox {
             records: records.flatten(),
             records_bytes: job.state.map_or(0, <[u8]>::len),
             found: None,
+            spawned: Vec::new(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(SLOT_MEMORY_BYTES)
                 .build(),
@@ -410,6 +433,7 @@ impl Sandbox {
                         .records
                         .map(|records| records::encode(&records))
                         .filter(|left| Some(left.as_slice()) != job.state),
+                    spawned: state.spawned,
                 }),
                 Err(error) => Err(failure_of(&error)),
             },
@@ -544,7 +568,8 @@ fn output_write(mut caller: Caller<'_, State>, src: u32, len: u32) -> wasmtime::
 /// Ends the job if handing back `more` bytes would take it past what it may.
 fn make_room(state: &State, more: usize) -> Result<(), Halt> {
     let stored: usize = state.stored.iter().map(Vec::len).sum();
-    if state.output.len() + stored + more > MAX_PRODUCED_BYTES {
+    let inputs: usize = state.spawned.iter().map(|asked| asked.input.len()).sum();
+    if state.output.len() + stored + inputs + more > MAX_PRODUCED_BYTES {
         Err(Halt::TooMuchProduced)
     } else {
         Ok(())
@@ -569,6 +594,30 @@ fn result_read(mut caller: Caller<'_, State>, dest: u32) -> wasmtime::Result<()>
     let len = bytes.len();
     range_mut(memory, dest, len)?.copy_from_slice(bytes);
     charge_for_bytes(state, len)?;
+    Ok(())
+}
+
+fn job_spawn(
+    mut caller: Caller<'_, State>,
+    module: u32,
+    input: u32,
+    len: u32,
+    compute_cap: i64,
+) -> wasmtime::Result<()> {
+    let (memory, state) = memory_and_state(&mut caller);
+    charge_for_bytes(state, len as usize)?;
+    make_room(state, len as usize)?;
+    let module = ContentHash::from_bytes(range(memory, module, 32)?.try_into().expect("32 bytes"));
+    let allowed =
+        state.blobs.contains_key(&module) && compute_cap >= 1 && state.spawned.len() < MAX_SPAWNED;
+    if !allowed {
+        return Err(Halt::BadFollowUp.into());
+    }
+    state.spawned.push(Spawned {
+        module,
+        input: range(memory, input, len as usize)?.to_vec(),
+        compute_cap: compute_cap as u64,
+    });
     Ok(())
 }
 
