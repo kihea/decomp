@@ -4,6 +4,7 @@
 //! networking and storage and call into it, so every party applies the same rules.
 
 mod account;
+mod app;
 mod envelope;
 mod hosts;
 mod job;
@@ -18,6 +19,9 @@ mod splits;
 mod storage;
 
 pub use account::{Account, AccountOp, Accounts, Device, OpError};
+pub use app::{
+    AppManifest, MAX_APP_MODULES, MAX_APP_NAME_BYTES, SponsorError, Sponsored, Sponsorship,
+};
 pub use envelope::{Envelope, EnvelopeError};
 pub use hosts::{Host, Hosts};
 pub use job::{

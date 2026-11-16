@@ -101,7 +101,7 @@ enum Kind {
     },
     /// Reissued to one node to see whether it reports what is already known.
     KnownAnswer {
-        expected: Known,
+        expected: Box<Known>,
     },
 }
 
@@ -570,7 +570,12 @@ impl Jobs {
         let mut manifest = expected.manifest.clone();
         manifest.deadline = now + KNOWN_ANSWER_DEADLINE_SECS;
 
-        let mut job = Job::new(Kind::KnownAnswer { expected }, manifest);
+        let mut job = Job::new(
+            Kind::KnownAnswer {
+                expected: Box::new(expected),
+            },
+            manifest,
+        );
         job.workers.push(Worker {
             node,
             account,

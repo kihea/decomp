@@ -24,19 +24,34 @@ export type Balance = {
   staked: number;
 };
 
+/** What an account's app is made of. The account's ID is the app's ID. */
+export type AppManifest = {
+  name: string;
+  /** The app's job modules, by hash. */
+  modules: string[];
+  /** Left out, the app pays for no jobs. */
+  sponsorship?: {
+    /** The most the app sets aside in a day for one account's jobs, in millionths. */
+    per_account_daily: number;
+  };
+};
+
 export type Account = {
   id: string;
   account_key: string;
   /** Number of changes so far. The next change must carry this value. */
   seq: number;
   devices: Device[];
+  /** The app this account has published, if any. */
+  app?: AppManifest;
   balance: Balance;
 };
 
 export type AccountOp =
   | { type: 'create_account'; device_key: string }
   | { type: 'approve_device'; account_id: string; seq: number; device_key: string }
-  | { type: 'revoke_device'; account_id: string; seq: number; device_key: string };
+  | { type: 'revoke_device'; account_id: string; seq: number; device_key: string }
+  | { type: 'publish_app'; account_id: string; seq: number; app: AppManifest };
 
 /**
  * A signed request for anything other than changing an account. Of the calls

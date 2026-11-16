@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::Envelope;
-use crate::keys::{ContentHash, JobId};
+use crate::keys::{AccountId, ContentHash, JobId};
 use crate::ledger::{Credits, FeeSplit, fee};
 
 /// How many nodes run a job when the first node drawn for it is still on
@@ -40,6 +40,11 @@ pub struct Manifest {
     /// Credits set aside for the job. It must cover the highest possible fee:
     /// every paid node using the whole compute cap. What is not spent is returned.
     pub max_fee: Credits,
+    /// The app that pays for the job, by its ID. Left out, the account that
+    /// submits the job pays. An app pays only for jobs that run its own modules,
+    /// and only up to what its manifest allows (see `app`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sponsor: Option<AccountId>,
 }
 
 /// The rule for cutting a job into pieces (spec section 2, "Decomposition"). The

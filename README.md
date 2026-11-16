@@ -131,6 +131,16 @@ declares, made when the job is submitted and before any node runs it.
 - A node keeps checking in while it runs a job, so taking in blobs, answering
   storage challenges, and carrying channels do not wait for the job to finish.
 
+**Apps and the jobs they pay for** (also build step 7).
+
+- An account can publish an app: a name, the hashes of its job modules, and
+  whether it pays for its users' jobs. The app's ID is the account's ID, and the
+  app's credit pool is the account's balance.
+- A job is charged to whoever submits it, unless its manifest names an app as
+  sponsor. The app then pays, if the job runs one of the app's own modules and
+  the submitter is within what the app allows one account in a day.
+- Publishing again replaces the manifest.
+
 ## Layout
 
 | Path | What it is |
@@ -189,6 +199,18 @@ cargo run -p decomp-node -- receive --output path/to/copy
 
 ```bash
 cargo run -p decomp-node -- send path/to/file --to <device code>
+```
+
+An app published by this device's account, which pays for up to 5 credits of
+each user's jobs a day, and a job another account runs at the app's expense. The
+app ID is the one `publish` prints:
+
+```bash
+cargo run -p decomp-node -- publish --name "My app" --module path/to/module.wasm --sponsor-daily 5
+```
+
+```bash
+cargo run -p decomp-node -- submit path/to/module.wasm --input path/to/input --compute-cap 4 --sponsor <app ID>
 ```
 
 A job sent to the network, from a linked device:
@@ -284,6 +306,15 @@ repeats the message shapes and the signing convention in TypeScript, and must
 change together with the Rust. It holds no keys: a caller hands it a `Signer`, so
 each platform keeps secrets in its own secure storage.
 
+**An app is an account.** The spec gives each app an ID that is the hash of its
+developer's signing key, a manifest signed with that key, and a credit pool of
+its own. An account already is all three: its ID is the hash of its key, changes
+to it are signed and ordered, and it has a balance. So publishing an app is one
+more kind of change to an account, and nothing new had to be built to hold apps,
+fund them, or replay them at startup. A developer with two apps uses two
+accounts. As with other changes to an account, a device the account has approved
+may sign for it.
+
 **Data services are node work.** Storing, serving, and relaying data are done by
 nodes and paid for in credits. DeComp does not lean on an outside peer-to-peer
 network for them.
@@ -362,5 +393,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | The same blob cannot be stored twice | A second request for a root already stored is refused, even from another account. | When two accounts need the same data |
 | Stored blobs are readable by anyone with the root | There is no private mode yet. | Build step 9 |
 | Logs can fall out of step on a crash | A storage or relay change and the credits that go with it are written to two files, one after the other. | Settlement, build step 13 |
-| No app manifests or sponsored jobs | An application cannot yet register itself or pay for its users' jobs from a pool of its own. | Build step 7 |
+| An app's manifest lists no permissions or schemas | Each module already describes its own types, and there is nothing to permit until jobs can reach state and stored blobs. | With the host functions that need permission |
+| What an app has set aside for an account today is kept in memory | A restart forgets it, so a daily cap can be passed once for each restart. It counts the highest possible fee of each job, not what the job cost. | Settlement, build step 13 |
+| A daily cap limits an account, not a person | Accounts are free to make, so someone can get around an app's cap with new ones. What the app's account holds is the real limit. | Sign-in, build step 14 |
 | Four host functions are missing | State (`kv`), blobs by hash, follow-up jobs, and sealing data to a key. | With storage (state, blobs), sponsorship (follow-up jobs), and private mode (sealing) |

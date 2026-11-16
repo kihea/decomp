@@ -3,9 +3,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decomp_core::{
-    AccountStatus, Blob, BlobData, BlobRef, Call, Challenge, CheckedIn, ContentHash, Credits,
-    Envelope, Incoming, IncomingChannels, JobId, JobResult, JobStatus, Located, MAX_MESSAGE_BYTES,
-    Manifest, Placement, PublicKey, Refusal, Request, Route, SigningKey, Standing, Submitted,
+    AccountOp, AccountStatus, AppManifest, Blob, BlobData, BlobRef, Call, Challenge, CheckedIn,
+    ContentHash, Credits, Envelope, Incoming, IncomingChannels, JobId, JobResult, JobStatus,
+    Located, MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey, Refusal, Request, Route,
+    SigningKey, Standing, Submitted,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -31,7 +32,9 @@ impl ClientError {
 }
 
 pub struct Client {
+    /// Where requests go, and where changes to an account go.
     endpoint: String,
+    ops_endpoint: String,
     key: SigningKey,
     http: ureq::Agent,
 }
@@ -44,9 +47,10 @@ impl Client {
             .timeout_global(Some(REQUEST_TIMEOUT))
             .build()
             .new_agent();
-        let endpoint = format!("{}/v1/request", coordinator_url.trim_end_matches('/'));
+        let base = coordinator_url.trim_end_matches('/');
         Self {
-            endpoint,
+            endpoint: format!("{base}/v1/request"),
+            ops_endpoint: format!("{base}/v1/ops"),
             key,
             http,
         }
@@ -64,6 +68,18 @@ impl Client {
 
     pub fn account(&self) -> Result<AccountStatus, ClientError> {
         self.call(Call::GetAccount)
+    }
+
+    /// Publishes this device's account's app, or replaces the one it has
+    /// published. The account's ID is the app's ID.
+    pub fn publish_app(&self, app: AppManifest) -> Result<AccountStatus, ClientError> {
+        let account = self.account()?.account;
+        let op = AccountOp::PublishApp {
+            account_id: account.id,
+            seq: account.seq,
+            app,
+        };
+        self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
     }
 
     pub fn stake(&self, amount: Credits) -> Result<AccountStatus, ClientError> {
@@ -174,13 +190,20 @@ impl Client {
             issued_at: unix_now(),
             call,
         };
-        let envelope = Envelope::seal(&self.key, &request);
+        self.send(&self.endpoint, &Envelope::seal(&self.key, &request))
+    }
+
+    fn send<R: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        envelope: &Envelope,
+    ) -> Result<R, ClientError> {
         let unreachable = |error: ureq::Error| ClientError::Unreachable(error.to_string());
 
         let mut response = self
             .http
-            .post(&self.endpoint)
-            .send_json(&envelope)
+            .post(endpoint)
+            .send_json(envelope)
             .map_err(unreachable)?;
         let succeeded = response.status().is_success();
         let body = response

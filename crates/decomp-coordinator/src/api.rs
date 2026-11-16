@@ -16,8 +16,8 @@ use axum::{Json, Router};
 use decomp_core::{
     Account, AccountStatus, Accounts, Blob, BlobData, BlobRef, Call, ContentHash, Envelope,
     EnvelopeError, IncomingChannels, JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS,
-    MAX_MESSAGE_BYTES, OpError, Outcome, PublicKey, Refusal, RelayError, Request, StorageError,
-    Submitted,
+    MAX_MESSAGE_BYTES, OpError, Outcome, PublicKey, Refusal, RelayError, Request, SponsorError,
+    StorageError, Submitted,
 };
 use decomp_sandbox::Sandbox;
 use serde_json::json;
@@ -307,6 +307,7 @@ impl From<OpError> for ApiError {
             OpError::DeviceTaken => (StatusCode::CONFLICT, "device_taken"),
             OpError::UnknownDevice => (StatusCode::NOT_FOUND, "unknown_device"),
             OpError::AlreadyRevoked => (StatusCode::CONFLICT, "already_revoked"),
+            OpError::BadApp(_) => (StatusCode::BAD_REQUEST, "bad_app"),
         };
         Self::new(status, code, error.to_string())
     }
@@ -367,6 +368,18 @@ impl From<SubmitError> for ApiError {
             }
             SubmitError::TooManyPieces => {
                 Self::new(StatusCode::BAD_REQUEST, "too_many_pieces", message)
+            }
+            SubmitError::Sponsor(inner) => {
+                let (status, code) = match inner {
+                    SponsorError::UnknownApp => (StatusCode::NOT_FOUND, "unknown_app"),
+                    SponsorError::NotSponsoring | SponsorError::NotItsModule => {
+                        (StatusCode::FORBIDDEN, "not_sponsored")
+                    }
+                    SponsorError::OverDailyCap => {
+                        (StatusCode::PAYMENT_REQUIRED, "over_sponsor_cap")
+                    }
+                };
+                Self::new(status, code, message)
             }
         }
     }

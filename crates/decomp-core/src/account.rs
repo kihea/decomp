@@ -10,11 +10,12 @@ use std::collections::hash_map::Entry;
 
 use serde::{Deserialize, Serialize};
 
+use crate::app::AppManifest;
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{AccountId, PublicKey};
 
 /// A signed request to create or change an account.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AccountOp {
     /// Creates the account whose key signed this. `device_key` is its first device.
@@ -31,6 +32,13 @@ pub enum AccountOp {
         seq: u64,
         device_key: PublicKey,
     },
+    /// Publishes the account's app, or replaces the one it has published (see
+    /// `app`). Signed by the account key or by an approved device.
+    PublishApp {
+        account_id: AccountId,
+        seq: u64,
+        app: AppManifest,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -41,6 +49,9 @@ pub struct Account {
     /// which orders changes and stops a captured one from being replayed.
     pub seq: u64,
     pub devices: Vec<Device>,
+    /// The app this account has published, if any. The account's ID is the app's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<AppManifest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,6 +85,8 @@ pub enum OpError {
     UnknownDevice,
     #[error("this device is already revoked")]
     AlreadyRevoked,
+    #[error("{0}")]
+    BadApp(&'static str),
 }
 
 /// Every account record, changed only through [`Accounts::apply`].
@@ -104,6 +117,7 @@ impl Accounts {
                         key: device_key,
                         revoked: false,
                     }],
+                    app: None,
                 }))
             }
             AccountOp::ApproveDevice {
@@ -138,7 +152,24 @@ impl Accounts {
                 account.seq += 1;
                 Ok(account)
             }
+            AccountOp::PublishApp {
+                account_id,
+                seq,
+                app,
+            } => {
+                let account = authorized(&mut self.by_id, account_id, seq, &signer)?;
+                if let Some(problem) = app.problem() {
+                    return Err(OpError::BadApp(problem));
+                }
+                account.app = Some(app);
+                account.seq += 1;
+                Ok(account)
+            }
         }
+    }
+
+    pub fn get(&self, id: &AccountId) -> Option<&Account> {
+        self.by_id.get(id)
     }
 
     /// The account `key` belongs to, as its account key or as one of its devices

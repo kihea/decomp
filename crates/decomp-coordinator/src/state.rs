@@ -24,8 +24,8 @@ use decomp_core::{
     Conduct, ContentHash, Credits, Envelope, Hosts, Incoming, JobError, JobId, JobStatus, Jobs,
     Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, Manifest, Merge, OpError, Opening,
     PROBATION_FORFEIT_PERCENT, Penalty, Placement, PublicKey, RelayEntry, RelayError, Relays,
-    Route, ScoreEvent, Scores, Splits, Standing, Storage, StorageEntry, StorageError, Storing,
-    channel_id, fee,
+    Route, ScoreEvent, Scores, Splits, SponsorError, Sponsored, Standing, Storage, StorageEntry,
+    StorageError, Storing, channel_id, fee,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::{Mismatch, Signature};
@@ -74,6 +74,8 @@ pub enum SubmitError {
     TypeMismatch(Mismatch),
     #[error("a job with typed input cannot be split by byte count")]
     TypedJobSplitByBytes,
+    #[error(transparent)]
+    Sponsor(#[from] SponsorError),
 }
 
 pub struct Coordinator {
@@ -85,6 +87,8 @@ pub struct Coordinator {
     scores_log: Log,
     pub blobs: Blobs,
     pub jobs: Jobs,
+    /// What each app has set aside today for each account's jobs.
+    sponsored: Sponsored,
     splits: Splits,
     /// What each module says its job takes and returns, read once per module.
     /// `None` for a module that does not describe itself.
@@ -151,6 +155,7 @@ impl Coordinator {
             scores_log,
             blobs: Blobs::open(data_dir.join("blobs"))?,
             jobs: Jobs::default(),
+            sponsored: Sponsored::default(),
             splits: Splits::default(),
             signatures: HashMap::new(),
             receipts: Log::open(&data_dir.join("receipts.jsonl"))?,
@@ -224,7 +229,8 @@ impl Coordinator {
     }
 
     /// Accepts a job: checks it, sets its highest possible fee aside, and queues
-    /// it. A job with a split rule is cut into pieces here, each queued as a job
+    /// it. The fee comes from the submitter's account, or from the app the
+    /// manifest names as sponsor if that app agrees to pay. A job with a split rule is cut into pieces here, each queued as a job
     /// of its own on its own part of the input.
     pub fn submit_job(
         &mut self,
@@ -281,17 +287,27 @@ impl Coordinator {
             self.jobs.check(id, run, now)?;
         }
         let to_set_aside = total(|run| run.max_fee);
-        if self.ledger.balance(&account).spendable() < to_set_aside {
+        let payer = manifest.sponsor.unwrap_or(account);
+        if let Some(app) = manifest.sponsor {
+            let published = self.accounts.get(&app).and_then(|owner| owner.app.as_ref());
+            let module = &manifest.module;
+            self.sponsored
+                .check((app, published), account, module, to_set_aside, now)?;
+        }
+        if self.ledger.balance(&payer).spendable() < to_set_aside {
             return Err(LedgerError::InsufficientCredits.into());
         }
 
         for (id, run) in &runs {
             self.record(LedgerEntry::Escrow {
                 job_id: *id,
-                account,
+                account: payer,
                 amount: run.max_fee,
             })?;
             self.jobs.submit(*id, account, run.clone(), now)?;
+        }
+        if let Some(app) = manifest.sponsor {
+            self.sponsored.count(app, account, to_set_aside, now);
         }
         if manifest.split.is_some() {
             let pieces = runs.iter().map(|(id, _)| *id).collect();
