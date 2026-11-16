@@ -146,6 +146,8 @@ between them.
 - If it is not waiting, the data is left in storage for it, sealed and with the
   sender's signature inside, for as many days as the sender pays for. The device
   is told it is there the next time it asks.
+- The command-line node and the TypeScript client both do all of this, and send
+  to each other. A node's data server answers web pages, so a browser can reach it.
 
 **Apps and the jobs they pay for** (also build step 7).
 
@@ -190,7 +192,7 @@ between them.
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
 | `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, and what it stores (logs, blobs). |
 | `crates/decomp-node` | The node agent, as a library and as the `decomp-node` command: joins an account, works as a node, holds and relays data, submits jobs, stores files, and sends files to other devices. |
-| `client-ts` | The TypeScript client: message shapes, signing, and calls. It has no dependencies. |
+| `client-ts` | The TypeScript client: message shapes, signing, calls, and sending to and collecting from other devices. It has no dependencies: a device supplies its keys and its cryptography, and a ready-made one for platforms with WebCrypto is included. |
 
 ## Run it
 
@@ -481,6 +483,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | A relay keeps frames in memory | A relay that restarts loses what it had not delivered and the pay it had not claimed. | When relays carry more than tests |
 | A sender can make a relay take in data nobody collects | Up to 8 MiB a channel, for which the relay is not paid. Opening a channel costs the sender nothing if it is not used. | A small charge for opening a channel |
 | Relays and storage nodes are picked at random | Bandwidth is not scored, and a relay that does not deliver loses its pay but not its standing. | With the bandwidth score |
+| A node serves plain HTTP | A web page loaded over HTTPS is not allowed to call it, so a hosted web app cannot yet reach nodes. | TLS for nodes, before the web app is hosted |
 | A receiver polls its relay | It asks twice a second, and each frame is its own request. Good enough for files; too slow for anything live. | Real-time apps |
 | The storage and relay prices are not confirmed | 180 credits a gibibyte-day and 2,500 credits a gibibyte relayed are derived from the spec's compute price, not chosen by the owner. | Owner's decision |
 | A blob's paid time running out has not been exercised | The shortest time that can be paid for is a day, so the end of a deal, the refund of what was not paid out, and nodes deleting the blob were not run. | A run that lasts a day, or tests |

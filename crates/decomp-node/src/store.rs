@@ -19,6 +19,7 @@ use tiny_http::{Method, Request, Response};
 
 use crate::client::Client;
 use crate::peer;
+use crate::server::respond;
 
 /// Where a node's server keeps blobs, in its web addresses.
 pub(crate) const BLOB_PATH: &str = "/v1/stored/";
@@ -95,18 +96,27 @@ impl Store {
 /// is the rest of the address after `BLOB_PATH`.
 pub(crate) fn answer(store: &Store, path: &str, mut request: Request) -> io::Result<()> {
     let Ok(root) = path.parse::<ContentHash>() else {
-        return request.respond(Response::from_string("no such address").with_status_code(404));
+        return respond(
+            request,
+            Response::from_string("no such address").with_status_code(404),
+        );
     };
     match request.method() {
         Method::Get => match store.read(&root) {
-            Ok(bytes) => request.respond(Response::from_data(bytes)),
-            Err(_) => request.respond(Response::from_string("no such blob").with_status_code(404)),
+            Ok(bytes) => respond(request, Response::from_data(bytes)),
+            Err(_) => respond(
+                request,
+                Response::from_string("no such blob").with_status_code(404),
+            ),
         },
         Method::Put => match store.accept(&root, request.as_reader()) {
-            Ok(()) => request.respond(Response::empty(204)),
-            Err(reason) => request.respond(Response::from_string(reason).with_status_code(409)),
+            Ok(()) => respond(request, Response::empty(204)),
+            Err(reason) => respond(request, Response::from_string(reason).with_status_code(409)),
         },
-        _ => request.respond(Response::from_string("not supported").with_status_code(405)),
+        _ => respond(
+            request,
+            Response::from_string("not supported").with_status_code(405),
+        ),
     }
 }
 

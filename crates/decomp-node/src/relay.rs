@@ -22,6 +22,7 @@ use tiny_http::{Method, Request, Response};
 
 use crate::client::{Client, ClientError, unix_now};
 use crate::peer;
+use crate::server::respond;
 
 /// Where a node's server keeps channels, in its web addresses. A channel's
 /// frames are sent to `{channel}/frames` and collected from `{channel}/take`.
@@ -255,7 +256,10 @@ pub(crate) fn answer(relay: &Relay, path: &str, mut request: Request) -> io::Res
         Some((channel, action))
     });
     let Some((channel, action)) = named.filter(|_| *request.method() == Method::Post) else {
-        return request.respond(Response::from_string("no such address").with_status_code(404));
+        return respond(
+            request,
+            Response::from_string("no such address").with_status_code(404),
+        );
     };
     let body = request.as_reader().take(MAX_REQUEST_BYTES);
     let now = unix_now();
@@ -271,14 +275,15 @@ pub(crate) fn answer(relay: &Relay, path: &str, mut request: Request) -> io::Res
         _ => Err((NOT_KNOWN, String::new())),
     };
     match outcome {
-        Ok(None) => request.respond(Response::empty(204)),
+        Ok(None) => respond(request, Response::empty(204)),
         Ok(Some(taken)) => {
             let body = serde_json::to_vec(&taken).expect("frames serialize");
-            request.respond(Response::from_data(body))
+            respond(request, Response::from_data(body))
         }
-        Err((status, reason)) => {
-            request.respond(Response::from_string(reason).with_status_code(status))
-        }
+        Err((status, reason)) => respond(
+            request,
+            Response::from_string(reason).with_status_code(status),
+        ),
     }
 }
 

@@ -1,6 +1,6 @@
 /** Talks to a coordinator's HTTP API (crates/decomp-coordinator/src/api.rs). */
 
-import { type Account, type AccountOp, type Envelope, seal, type Signer } from './protocol';
+import { type Account, type AccountOp, type Call, type Envelope, now, seal, type Signer } from './protocol';
 
 /** A request the coordinator refused or that never reached it. */
 export class CoordinatorError extends Error {
@@ -19,11 +19,13 @@ export type Coordinator = {
   submitOp(signer: Signer, op: AccountOp): Promise<Account>;
   /** Fetches the account `signer` belongs to. */
   fetchAccount(signer: Signer): Promise<Account>;
+  /** Signs and sends a request; resolves with the answer `decomp-core` names for that call. */
+  request<Answer>(signer: Signer, call: Call): Promise<Answer>;
 };
 
 /** Makes a client for the coordinator at `url`, such as `http://127.0.0.1:8787`. */
 export function connect(url: string): Coordinator {
-  async function post(path: string, envelope: Envelope): Promise<Account> {
+  async function post<Answer>(path: string, envelope: Envelope): Promise<Answer> {
     let response: Response;
     try {
       response = await fetch(url + path, {
@@ -44,11 +46,13 @@ export function connect(url: string): Coordinator {
     return body;
   }
 
+  async function request<Answer>(signer: Signer, call: Call): Promise<Answer> {
+    return post('/v1/request', await seal(signer, { issued_at: now(), call }));
+  }
+
   return {
     submitOp: async (signer, op) => post('/v1/ops', await seal(signer, op)),
-    fetchAccount: async (signer) => {
-      const issued_at = Math.floor(Date.now() / 1000);
-      return post('/v1/request', await seal(signer, { issued_at, call: { type: 'get_account' } }));
-    },
+    fetchAccount: (signer) => request(signer, { type: 'get_account' }),
+    request,
   };
 }

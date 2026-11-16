@@ -1,11 +1,11 @@
 //! The web server other devices reach a node through: for the blobs it holds and
 //! the channels it relays. Only a node that other devices can connect to runs one.
 
-use std::io;
+use std::io::{self, Read};
 use std::sync::Arc;
 use std::thread;
 
-use tiny_http::{Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::relay::{self, Relay};
 use crate::store::{self, Store};
@@ -30,13 +30,39 @@ pub fn serve(listen: &str, store: Arc<Store>, relay: Arc<Relay>) -> io::Result<(
     Ok(())
 }
 
+/// Headers that let a web page call this server. Requests carry no cookies or
+/// credentials, and what a caller may do is decided by what it has signed, so any
+/// web origin may call.
+const WEB_ACCESS: [(&str, &str); 3] = [
+    ("Access-Control-Allow-Origin", "*"),
+    ("Access-Control-Allow-Methods", "GET, PUT, POST"),
+    ("Access-Control-Allow-Headers", "content-type"),
+];
+
+/// Answers a request. Every answer goes through here so that a web page can
+/// read it.
+pub(crate) fn respond<R: Read>(request: Request, response: Response<R>) -> io::Result<()> {
+    let response = WEB_ACCESS.iter().fold(response, |response, (name, value)| {
+        let header = Header::from_bytes(*name, *value).expect("the header is plain text");
+        response.with_header(header)
+    });
+    request.respond(response)
+}
+
 fn route(store: &Store, relay: &Relay, request: Request) -> io::Result<()> {
+    // A browser asks first whether a page may make the request it is about to.
+    if *request.method() == Method::Options {
+        return respond(request, Response::empty(204));
+    }
     let url = request.url().to_owned();
     if let Some(path) = url.strip_prefix(store::BLOB_PATH) {
         store::answer(store, path, request)
     } else if let Some(path) = url.strip_prefix(relay::CHANNEL_PATH) {
         relay::answer(relay, path, request)
     } else {
-        request.respond(Response::from_string("no such address").with_status_code(404))
+        respond(
+            request,
+            Response::from_string("no such address").with_status_code(404),
+        )
     }
 }
