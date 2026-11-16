@@ -22,7 +22,7 @@ use decomp_node::client::{Client, unix_now};
 use decomp_node::relay;
 
 use crate::agent::Reachable;
-use decomp_sandbox::{Job, Sandbox};
+use decomp_sandbox::{Blobs, Job, Sandbox};
 
 const NO_KEY: &str = "this device has no key yet; run `decomp-node link` first";
 
@@ -155,6 +155,10 @@ struct JobArgs {
     /// File holding the job's input. Without it, the input is empty.
     #[arg(long)]
     input: Option<PathBuf>,
+    /// A file the job may read as a blob, by the hash of its contents. Repeat
+    /// for each one.
+    #[arg(long = "read")]
+    reads: Vec<PathBuf>,
     /// File to write the job's output to. Without it, only its hash is shown.
     #[arg(long)]
     output: Option<PathBuf>,
@@ -323,7 +327,11 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
         split_bytes,
         sponsor,
     } = limits;
-    let (module, input) = read_job(&job)?;
+    let JobFiles {
+        module,
+        input,
+        blobs,
+    } = read_job(&job)?;
     let split = split_bytes.map(|chunk_bytes| Split { chunk_bytes });
     let pieces = split.map_or(1, |split| split.pieces(input.len() as u64));
     let mut manifest = Manifest {
@@ -335,6 +343,10 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
         split,
         max_fee: Credits::ZERO,
         sponsor,
+        reads: blobs
+            .into_values()
+            .map(|blob| client.put_blob(blob))
+            .collect::<Result<_, _>>()?,
     };
     // Set aside the most the job can cost; what is not spent comes back.
     for _ in 0..pieces {
@@ -367,7 +379,10 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
     }
     println!("fee     {} credits", receipt.fee.total);
     match receipt.outcome {
-        Outcome::Completed { output } => {
+        Outcome::Completed { output, blobs } => {
+            for blob in blobs {
+                println!("stored  {blob}");
+            }
             let bytes = client.get_blob(output)?;
             report_output(&bytes, job.output.as_deref())?;
             Ok(ExitCode::SUCCESS)
@@ -473,7 +488,11 @@ fn receive(client: &Client, output: &Path) -> Result<ExitCode, Box<dyn Error>> {
 }
 
 fn run_locally(job: JobArgs) -> Result<ExitCode, Box<dyn Error>> {
-    let (module, input) = read_job(&job)?;
+    let JobFiles {
+        module,
+        input,
+        blobs,
+    } = read_job(&job)?;
     // Off the network a job has no ID to draw its randomness from, so the seed is
     // fixed: every local run of a job draws the same bytes.
     let sandbox = Sandbox::new();
@@ -482,6 +501,7 @@ fn run_locally(job: JobArgs) -> Result<ExitCode, Box<dyn Error>> {
         input: &input,
         compute_cap: job.compute_cap,
         seed: [0; 32],
+        blobs: &blobs,
     })?;
 
     println!("module  {}", ContentHash::of(&module));
@@ -495,22 +515,42 @@ fn run_locally(job: JobArgs) -> Result<ExitCode, Box<dyn Error>> {
         run.checkpoints.len()
     );
     match run.result {
-        Ok(bytes) => {
-            report_output(&bytes, job.output.as_deref())?;
+        Ok(produced) => {
+            for blob in &produced.blobs {
+                println!("stored  {} ({} bytes)", ContentHash::of(blob), blob.len());
+            }
+            report_output(&produced.output, job.output.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         Err(failure) => fail(&failure.to_string()),
     }
 }
 
-/// The module and input a job's arguments name.
-fn read_job(job: &JobArgs) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
+/// The files a job's arguments name.
+struct JobFiles {
+    module: Vec<u8>,
+    input: Vec<u8>,
+    /// The blobs the job may read.
+    blobs: Blobs,
+}
+
+fn read_job(job: &JobArgs) -> Result<JobFiles, Box<dyn Error>> {
     let read = |path: &Path| fs::read(path).map_err(|e| format!("{}: {e}", path.display()));
     let input = match &job.input {
         Some(path) => read(path)?,
         None => Vec::new(),
     };
-    Ok((read(&job.module)?, input))
+    let mut blobs = Blobs::new();
+    for path in &job.reads {
+        let bytes = read(path)?;
+        println!("read    {}  {}", ContentHash::of(&bytes), path.display());
+        blobs.insert(ContentHash::of(&bytes), bytes);
+    }
+    Ok(JobFiles {
+        module: read(&job.module)?,
+        input,
+        blobs,
+    })
 }
 
 fn report_output(bytes: &[u8], save_to: Option<&Path>) -> Result<(), Box<dyn Error>> {

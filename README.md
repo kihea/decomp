@@ -89,10 +89,12 @@ disputes**.
   back when none of its nodes is on a job. A node sent back to probation costs
   its account a tenth of its stake.
 
-Also built, from build step 7: three host functions a job can call (SHA-256
-hashing, Ed25519 signature checks, and randomness fixed by the job, so every node
-draws the same bytes), and a check of a job's input against the types its module
-declares, made when the job is submitted and before any node runs it.
+Also built, from build step 7: host functions a job can call (SHA-256 hashing,
+Ed25519 signature checks, randomness fixed by the job, so every node draws the
+same bytes, and reading and storing blobs), and a check of a job's input against
+the types its module declares, made when the job is submitted and before any
+node runs it. A job reads the blobs its manifest names, and the blobs it stores
+are part of its result, so nodes are held to them like the output.
 
 **Storage, done by nodes** (the first of the data services in build step 7).
 
@@ -219,6 +221,9 @@ A job sent to the network, from a linked device:
 cargo run -p decomp-node -- submit path/to/module.wasm --input path/to/input --compute-cap 4
 ```
 
+A job may be given files to read as blobs with `--read path/to/file`, once for
+each file. The module asks for one by the hash of its contents.
+
 The same job on this device alone, without the network:
 
 ```bash
@@ -299,7 +304,16 @@ second. The owner confirmed this value on 2026-11-16.
 
 **Everything that grows with data is billed.** Every byte a host function copies
 costs one instruction, and so does every byte a module copies or fills with a
-single bulk instruction, so a module cannot do unmetered work either way.
+single bulk instruction, so a module cannot do unmetered work either way. What a
+job hands back, its output and the blobs it stores, is also bounded by a slot's
+memory, so a job cannot fill its host's memory for the price of one unit.
+
+**A job's blobs are named before it runs.** The spec lets a job fetch any blob by
+its hash. But whether a blob exists changes over time: a node that ran a job
+before some blob was stored and a node that ran it after would both be honest
+and would disagree, and the first would be judged wrong. So a job's manifest
+lists the blobs it may read, each must exist when the job is submitted, and
+asking for any other blob gives the same answer on every node: not given.
 
 **Clients in other languages mirror `decomp-core`.** `client-ts/src/protocol.ts`
 repeats the message shapes and the signing convention in TypeScript, and must
@@ -396,4 +410,4 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | An app's manifest lists no permissions or schemas | Each module already describes its own types, and there is nothing to permit until jobs can reach state and stored blobs. | With the host functions that need permission |
 | What an app has set aside for an account today is kept in memory | A restart forgets it, so a daily cap can be passed once for each restart. It counts the highest possible fee of each job, not what the job cost. | Settlement, build step 13 |
 | A daily cap limits an account, not a person | Accounts are free to make, so someone can get around an app's cap with new ones. What the app's account holds is the real limit. | Sign-in, build step 14 |
-| Four host functions are missing | State (`kv`), blobs by hash, follow-up jobs, and sealing data to a key. | With storage (state, blobs), sponsorship (follow-up jobs), and private mode (sealing) |
+| Three host functions are missing | State (`kv`), follow-up jobs, and sealing data to a key. | State and follow-up jobs next in build step 7; sealing with private mode, build step 9 |

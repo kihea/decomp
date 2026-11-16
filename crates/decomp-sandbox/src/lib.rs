@@ -29,10 +29,15 @@
 //! | `hash` | `(src, len, dest)` | Writes the SHA-256 hash of `len` bytes at `src` to the 32 bytes at `dest` |
 //! | `sig.verify` | `(key, message, len, signature) -> valid` | 1 if the 64 bytes at `signature` are the Ed25519 signature, by the 32-byte public key at `key`, of the `len` bytes at `message`; otherwise 0 |
 //! | `rand.seeded` | `(dest, len)` | Fills `len` bytes at `dest` from a stream fixed by the job's seed, so every node draws the same bytes |
+//! | `blob.get` | `(hash) -> len` | Looks up the blob whose SHA-256 hash is the 32 bytes at `hash` among those the job was given to read, and returns its length as a 64-bit integer, or -1 if it is not one of them. `result.read` then copies it |
+//! | `blob.put` | `(src, len, dest)` | Stores the `len` bytes at `src` as a blob and writes its hash to the 32 bytes at `dest`. The blob is kept only if the job completes |
+//! | `result.read` | `(dest)` | Copies the blob the last `blob.get` found into memory at `dest` |
 
 mod meter;
 
-use decomp_core::{PublicKey, Signature};
+use std::collections::HashMap;
+
+use decomp_core::{ContentHash, PublicKey, Signature};
 use sha2::{Digest, Sha256};
 use wasmtime::{
     Caller, Config, Engine, Extern, ExternType, Linker, Module, Store, StoreLimits,
@@ -64,6 +69,11 @@ const HOST_INSTRUCTIONS_PER_BYTE: u64 = 1;
 /// Checking takes the host roughly as long as this many instructions take a module.
 const SIGNATURE_CHECK_INSTRUCTIONS: u64 = 500_000;
 
+/// The most a job may hand back in all: its output and the blobs it stores. A
+/// job holds no more than a slot's memory, so it has no use for more, and without
+/// a bound a job could fill its host's memory for the price of one unit.
+pub const MAX_PRODUCED_BYTES: usize = SLOT_MEMORY_BYTES;
+
 /// The most a module may be charged for describing its signature.
 const SIGNATURE_COMPUTE_CAP: u64 = 1;
 
@@ -85,6 +95,19 @@ pub struct Job<'a> {
     /// What the job's randomness is drawn from. Runs with the same seed draw the
     /// same bytes.
     pub seed: [u8; 32],
+    /// The blobs the job may read with `blob.get`: those its manifest names.
+    pub blobs: &'a Blobs,
+}
+
+/// Blobs by the hash of their contents.
+pub type Blobs = HashMap<ContentHash, Vec<u8>>;
+
+/// What a job that ran to its end handed back.
+#[derive(Debug, Default)]
+pub struct Produced {
+    pub output: Vec<u8>,
+    /// The blobs the job stored, in the order it stored them.
+    pub blobs: Vec<Vec<u8>>,
 }
 
 /// What running a job produced and what it cost.
@@ -93,7 +116,7 @@ pub struct Run {
     /// Compute units to bill: instructions executed, rounded up to whole units.
     /// A failed job is billed for the work it did before failing.
     pub units: u64,
-    pub result: Result<Vec<u8>, Failure>,
+    pub result: Result<Produced, Failure>,
     /// The job's state every `INSTRUCTIONS_PER_CHECKPOINT` instructions. When two
     /// nodes disagree, the first checkpoint where their lists differ shows how
     /// far the job has to be re-run to find out which is right.
@@ -104,8 +127,8 @@ pub struct Run {
 /// which two runs of a job are compared.
 pub struct Finding {
     pub units: u64,
-    /// The job's output, or why it has none.
-    pub output: Result<Vec<u8>, decomp_core::Failure>,
+    /// What the job handed back, or why it handed back nothing.
+    pub produced: Result<Produced, decomp_core::Failure>,
     /// The job's checkpoints, one 32-byte hash after another.
     pub checkpoints: Vec<u8>,
 }
@@ -139,12 +162,22 @@ enum Halt {
     /// The caller asked for one checkpoint only, and it has been taken.
     #[error("the job was stopped at the checkpoint it was run for")]
     CheckpointReached,
+    #[error("the job handed back more than a slot's memory holds")]
+    TooMuchProduced,
+    #[error("the module asked for a blob it had not just looked up")]
+    NothingToRead,
 }
 
 /// Per-job state the host functions work on.
 struct State {
     input: Vec<u8>,
     output: Vec<u8>,
+    /// The blobs the job may read.
+    blobs: Blobs,
+    /// The blobs the job has stored.
+    stored: Vec<Vec<u8>>,
+    /// The blob the last `blob.get` found, until the module reads it.
+    found: Option<ContentHash>,
     limits: StoreLimits,
     /// The most instructions the job may execute.
     cap: u64,
@@ -196,6 +229,9 @@ impl Sandbox {
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "hash", hash))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "sig.verify", sig_verify))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "rand.seeded", rand_seeded))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "blob.get", blob_get))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "blob.put", blob_put))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "result.read", result_read))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, METER_IMPORT, meter))
             .expect("host function names are unique");
         Self { engine, linker }
@@ -213,7 +249,7 @@ impl Sandbox {
         match self.run(job) {
             Ok(run) => Finding {
                 units: run.units,
-                output: run.result.map_err(|failure| match failure {
+                produced: run.result.map_err(|failure| match failure {
                     Failure::ComputeCapExceeded => decomp_core::Failure::ComputeCapExceeded,
                     Failure::Trapped(_) => decomp_core::Failure::Trapped,
                 }),
@@ -221,7 +257,7 @@ impl Sandbox {
             },
             Err(_) => Finding {
                 units: 0,
-                output: Err(decomp_core::Failure::InvalidJob),
+                produced: Err(decomp_core::Failure::InvalidJob),
                 checkpoints: Vec::new(),
             },
         }
@@ -243,9 +279,10 @@ impl Sandbox {
             input: &[],
             compute_cap: SIGNATURE_COMPUTE_CAP,
             seed: [0; 32],
+            blobs: &Blobs::new(),
         };
         match self.execute(&job, SIGNATURE_EXPORT, None) {
-            Ok(run) => Ok(run.result.ok()),
+            Ok(run) => Ok(run.result.ok().map(|produced| produced.output)),
             Err(RunError::InvalidModule(_)) if self.run_is_possible(module) => Ok(None),
             Err(error) => Err(error),
         }
@@ -279,6 +316,9 @@ impl Sandbox {
         let state = State {
             input: job.input.to_vec(),
             output: Vec::new(),
+            blobs: job.blobs.clone(),
+            stored: Vec::new(),
+            found: None,
             limits: StoreLimitsBuilder::new()
                 .memory_size(SLOT_MEMORY_BYTES)
                 .build(),
@@ -312,7 +352,10 @@ impl Sandbox {
         Ok(Run {
             units: used.div_ceil(INSTRUCTIONS_PER_UNIT).max(1),
             result: match finished {
-                Ok(()) => Ok(state.output),
+                Ok(()) => Ok(Produced {
+                    output: state.output,
+                    blobs: state.stored,
+                }),
                 Err(error) => Err(failure_of(&error)),
             },
             checkpoints: state.checkpoints,
@@ -436,9 +479,48 @@ fn input_read(mut caller: Caller<'_, State>, dest: u32) -> wasmtime::Result<()> 
 fn output_write(mut caller: Caller<'_, State>, src: u32, len: u32) -> wasmtime::Result<()> {
     let (memory, state) = memory_and_state(&mut caller);
     charge_for_bytes(state, len as usize)?;
+    make_room(state, len as usize)?;
     state
         .output
         .extend_from_slice(range(memory, src, len as usize)?);
+    Ok(())
+}
+
+/// Ends the job if handing back `more` bytes would take it past what it may.
+fn make_room(state: &State, more: usize) -> Result<(), Halt> {
+    let stored: usize = state.stored.iter().map(Vec::len).sum();
+    if state.output.len() + stored + more > MAX_PRODUCED_BYTES {
+        Err(Halt::TooMuchProduced)
+    } else {
+        Ok(())
+    }
+}
+
+fn blob_get(mut caller: Caller<'_, State>, hash: u32) -> wasmtime::Result<i64> {
+    let (memory, state) = memory_and_state(&mut caller);
+    let hash = ContentHash::from_bytes(range(memory, hash, 32)?.try_into().expect("32 bytes"));
+    let len = state.blobs.get(&hash).map(Vec::len);
+    state.found = len.map(|_| hash);
+    Ok(len.map_or(-1, |len| len as i64))
+}
+
+fn result_read(mut caller: Caller<'_, State>, dest: u32) -> wasmtime::Result<()> {
+    let (memory, state) = memory_and_state(&mut caller);
+    let found = state.found.take().ok_or(Halt::NothingToRead)?;
+    let len = state.blobs[&found].len();
+    charge_for_bytes(state, len)?;
+    range_mut(memory, dest, len)?.copy_from_slice(&state.blobs[&found]);
+    Ok(())
+}
+
+fn blob_put(mut caller: Caller<'_, State>, src: u32, len: u32, dest: u32) -> wasmtime::Result<()> {
+    let (memory, state) = memory_and_state(&mut caller);
+    charge_for_bytes(state, len as usize)?;
+    make_room(state, len as usize)?;
+    let bytes = range(memory, src, len as usize)?.to_vec();
+    let hash = ContentHash::of(&bytes);
+    range_mut(memory, dest, 32)?.copy_from_slice(hash.as_bytes());
+    state.stored.push(bytes);
     Ok(())
 }
 

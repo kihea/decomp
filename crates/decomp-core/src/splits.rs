@@ -96,7 +96,7 @@ impl Splits {
                     receipt: Box::new(job.receipt(job_id, failure.clone())),
                 }),
                 PieceEnd::Verified {
-                    outcome: Outcome::Completed { output },
+                    outcome: Outcome::Completed { output, .. },
                     ..
                 } => {
                     outputs.push(*output);
@@ -115,7 +115,13 @@ impl Splits {
     /// Closes a split job whose pieces' outputs have been joined into `output`.
     pub fn merged(&mut self, id: JobId, output: ContentHash, now: u64) {
         if let Some(job) = self.jobs.get_mut(&id) {
-            let receipt = Box::new(job.receipt(id, Outcome::Completed { output }));
+            let receipt = Box::new(job.receipt(
+                id,
+                Outcome::Completed {
+                    output,
+                    blobs: Vec::new(),
+                },
+            ));
             job.status = JobStatus::Verified { receipt };
             job.closed_at = Some(now);
         }

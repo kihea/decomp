@@ -199,8 +199,10 @@ fn answer(
             Json(json!({})).into_response()
         }
         Call::SubmitResult { result } => {
-            if let Outcome::Completed { output } = &result.outcome {
-                require_blob(coordinator, output)?;
+            if let Outcome::Completed { output, blobs } = &result.outcome {
+                for hash in blobs.iter().chain([output]) {
+                    require_blob(coordinator, hash)?;
+                }
             }
             require_blob(coordinator, &result.checkpoints)?;
             coordinator
@@ -368,6 +370,9 @@ impl From<SubmitError> for ApiError {
             }
             SubmitError::TooManyPieces => {
                 Self::new(StatusCode::BAD_REQUEST, "too_many_pieces", message)
+            }
+            SubmitError::TooManyReads => {
+                Self::new(StatusCode::BAD_REQUEST, "too_many_reads", message)
             }
             SubmitError::Sponsor(inner) => {
                 let (status, code) = match inner {

@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use decomp_core::{Assignment, JobResult, Outcome};
-use decomp_sandbox::{Job, Sandbox};
+use decomp_sandbox::{Blobs, Job, Sandbox};
 
 use crate::client::{Client, ClientError};
 
@@ -24,19 +24,29 @@ pub fn work(
     let manifest = &assignment.manifest;
     let module = client.get_blob(manifest.module)?;
     let input = client.get_blob(manifest.input)?;
+    let mut blobs = Blobs::new();
+    for hash in &manifest.reads {
+        blobs.insert(*hash, client.get_blob(*hash)?);
+    }
     let finding = sandbox.find(&Job {
         module: &module,
         input: &input,
         compute_cap: manifest.compute_cap,
         seed: *assignment.seed.as_bytes(),
+        blobs: &blobs,
     });
 
     let result = JobResult {
         job_id: assignment.job_id,
         units: finding.units,
-        outcome: match finding.output {
-            Ok(output) => Outcome::Completed {
-                output: client.put_blob(output)?,
+        outcome: match finding.produced {
+            Ok(produced) => Outcome::Completed {
+                output: client.put_blob(produced.output)?,
+                blobs: produced
+                    .blobs
+                    .into_iter()
+                    .map(|blob| client.put_blob(blob))
+                    .collect::<Result<_, _>>()?,
             },
             Err(failure) => Outcome::Failed { failure },
         },

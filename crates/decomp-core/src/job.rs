@@ -13,6 +13,9 @@ use crate::ledger::{Credits, FeeSplit, fee};
 /// probation and the submitter has not asked for a number.
 pub const UNPROVEN_REDUNDANCY: u32 = 2;
 
+/// The most blobs a job may be given to read, besides its input.
+pub const MAX_READS: usize = 64;
+
 /// The highest size tier. Jobs of 16 units or more all fall in it.
 pub const MAX_TIER: u32 = 4;
 
@@ -45,6 +48,12 @@ pub struct Manifest {
     /// and only up to what its manifest allows (see `app`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sponsor: Option<AccountId>,
+    /// Blobs the job may read with `blob.get`, besides its input. Each must be
+    /// stored before the job is submitted. A job cannot read any other blob: if
+    /// it could, a node that ran it before some blob was stored and a node that
+    /// ran it after would honestly disagree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<ContentHash>,
 }
 
 /// The rule for cutting a job into pieces (spec section 2, "Decomposition"). The
@@ -103,8 +112,15 @@ pub struct JobResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Outcome {
-    Completed { output: ContentHash },
-    Failed { failure: Failure },
+    Completed {
+        output: ContentHash,
+        /// The blobs the job stored with `blob.put`, in the order it stored them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blobs: Vec<ContentHash>,
+    },
+    Failed {
+        failure: Failure,
+    },
 }
 
 /// Why a job did not complete. These are results, not errors: every honest node

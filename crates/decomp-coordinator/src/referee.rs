@@ -13,7 +13,7 @@
 
 use decomp_core::{ContentHash, JobId, JobResult, Outcome, PublicKey};
 use decomp_sandbox::{
-    Checkpoint, INSTRUCTIONS_PER_CHECKPOINT, INSTRUCTIONS_PER_UNIT, Job, Sandbox,
+    Blobs, Checkpoint, INSTRUCTIONS_PER_CHECKPOINT, INSTRUCTIONS_PER_UNIT, Job, Sandbox,
 };
 
 /// A dispute with everything needed to decide it.
@@ -21,6 +21,8 @@ pub struct Case {
     pub job_id: JobId,
     pub module: Vec<u8>,
     pub input: Vec<u8>,
+    /// The blobs the job may read.
+    pub blobs: Blobs,
     pub compute_cap: u64,
     pub reports: Vec<(PublicKey, JobResult)>,
     /// Each node's checkpoints, in the order of `reports`.
@@ -47,6 +49,7 @@ pub fn referee(sandbox: &Sandbox, case: &Case) -> Verdict {
         input: &case.input,
         compute_cap: case.compute_cap,
         seed: *case.job_id.as_bytes(),
+        blobs: &case.blobs,
     };
     let mut standing: Vec<usize> = (0..case.reports.len()).collect();
     let mut units = 0;
@@ -75,9 +78,10 @@ pub fn referee(sandbox: &Sandbox, case: &Case) -> Verdict {
         .any(|&node| result_of(node) != result_of(standing[0]));
     if disagree {
         let finding = sandbox.find(&job);
-        let outcome = match &finding.output {
-            Ok(output) => Outcome::Completed {
-                output: ContentHash::of(output),
+        let outcome = match &finding.produced {
+            Ok(produced) => Outcome::Completed {
+                output: ContentHash::of(&produced.output),
+                blobs: produced.blobs.iter().map(|b| ContentHash::of(b)).collect(),
             },
             Err(failure) => Outcome::Failed { failure: *failure },
         };

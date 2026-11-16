@@ -22,10 +22,10 @@ use std::path::Path;
 use decomp_core::{
     Account, AccountId, AccountStatus, Accounts, Assignment, Challenge, CheckedIn, Closure,
     Conduct, ContentHash, Credits, Envelope, Hosts, Incoming, JobError, JobId, JobStatus, Jobs,
-    Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, Manifest, Merge, OpError, Opening,
-    PROBATION_FORFEIT_PERCENT, Penalty, Placement, PublicKey, RelayEntry, RelayError, Relays,
-    Route, ScoreEvent, Scores, Splits, SponsorError, Sponsored, Standing, Storage, StorageEntry,
-    StorageError, Storing, channel_id, fee,
+    Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, MAX_READS, Manifest, Merge, OpError,
+    Opening, PROBATION_FORFEIT_PERCENT, Penalty, Placement, PublicKey, RelayEntry, RelayError,
+    Relays, Route, ScoreEvent, Scores, Splits, SponsorError, Sponsored, Standing, Storage,
+    StorageEntry, StorageError, Storing, channel_id, fee,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::{Mismatch, Signature};
@@ -70,6 +70,8 @@ pub enum SubmitError {
     FeeCapTooLow(Credits),
     #[error("the split rule would cut the job into more than {MAX_PIECES} pieces")]
     TooManyPieces,
+    #[error("a job may be given at most {MAX_READS} blobs to read")]
+    TooManyReads,
     #[error("{0}")]
     TypeMismatch(Mismatch),
     #[error("a job with typed input cannot be split by byte count")]
@@ -241,9 +243,15 @@ impl Coordinator {
         now: u64,
         sandbox: &Sandbox,
     ) -> Result<JobId, SubmitError> {
-        for hash in [manifest.module, manifest.input] {
-            if !self.blobs.contains(&hash) {
-                return Err(SubmitError::UnknownBlob(hash));
+        if manifest.reads.len() > MAX_READS {
+            return Err(SubmitError::TooManyReads);
+        }
+        for hash in [manifest.module, manifest.input]
+            .iter()
+            .chain(&manifest.reads)
+        {
+            if !self.blobs.contains(hash) {
+                return Err(SubmitError::UnknownBlob(*hash));
             }
         }
         self.check_types(&manifest, sandbox)?;
@@ -590,6 +598,12 @@ impl Coordinator {
                 job_id: dispute.job_id,
                 module: blob(&dispute.manifest.module),
                 input: blob(&dispute.manifest.input),
+                blobs: dispute
+                    .manifest
+                    .reads
+                    .iter()
+                    .map(|hash| (*hash, blob(hash)))
+                    .collect(),
                 compute_cap: dispute.manifest.compute_cap,
                 checkpoint_lists: dispute
                     .reports
