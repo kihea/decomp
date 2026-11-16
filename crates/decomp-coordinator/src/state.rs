@@ -23,12 +23,12 @@ use std::path::Path;
 
 use decomp_core::{
     Account, AccountId, AccountStatus, Accounts, Assignment, Challenge, CheckedIn, Closure,
-    Conduct, ContentHash, Credits, Envelope, EnvelopeError, FollowUps, Hosts, Incoming, JobError,
-    JobId, JobStatus, Jobs, Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES, MAX_READS,
-    MAX_SHARD_NAME_BYTES, Manifest, Merge, OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT,
-    Penalty, Placement, PublicKey, RelayEntry, RelayError, Relays, Route, ScoreEvent, Scores,
-    SealingKeys, ShardRef, Splits, SponsorError, Sponsored, Standing, StateEntry, States, Storage,
-    StorageEntry, StorageError, Storing, channel_id, fee,
+    Conduct, ContentHash, Credits, Envelope, EnvelopeError, FollowUps, Hosts, IncomingChannels,
+    JobError, JobId, JobStatus, Jobs, Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES,
+    MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, Merge, OpError, Opening, Outcome,
+    PROBATION_FORFEIT_PERCENT, Penalty, Placement, PublicKey, RelayEntry, RelayError, Relays,
+    Route, ScoreEvent, Scores, SealingKeys, ShardRef, Splits, SponsorError, Sponsored, Standing,
+    StateEntry, States, Storage, StorageEntry, StorageError, Storing, channel_id, fee,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
@@ -46,6 +46,8 @@ pub enum StoreError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Ledger(#[from] LedgerError),
+    #[error("the receiving key is not a device in any account")]
+    UnknownDevice,
 }
 
 /// Why a channel was not opened.
@@ -422,20 +424,12 @@ impl Coordinator {
 
     /// Accepts a blob for storage: chooses the nodes to hold it and sets the
     /// whole fee aside. The caller then uploads the blob to those nodes.
-    pub fn store_blob(
-        &mut self,
-        root: ContentHash,
-        size: u64,
-        owner: AccountId,
-        days: u32,
-        now: u64,
-    ) -> Result<Placement, StoreError> {
-        let blob = Storing {
-            root,
-            size,
-            owner,
-            days,
-        };
+    pub fn store_blob(&mut self, blob: Storing, now: u64) -> Result<Placement, StoreError> {
+        if let Some(addressed) = &blob.addressed
+            && !self.is_device(&addressed.to)
+        {
+            return Err(StoreError::UnknownDevice);
+        }
         let online = self.hosts.online(now);
         let (placed, escrow) = self.storage.place(blob, online, now, &mut rand::rng())?;
         self.record(escrow)?;
@@ -511,8 +505,7 @@ impl Coordinator {
         bytes: u64,
         now: u64,
     ) -> Result<Route, OpenRelayError> {
-        let known = self.accounts.account_of(&to);
-        if !known.is_some_and(|account| account.authorizes(&to)) {
+        if !self.is_device(&to) {
             return Err(OpenRelayError::UnknownDevice);
         }
         let channel = channel_id(&from, payload);
@@ -534,9 +527,20 @@ impl Coordinator {
         Ok(Route { channel, address })
     }
 
-    /// The open channels addressed to a device.
-    pub fn incoming(&self, to: &PublicKey, now: u64) -> Vec<Incoming> {
-        self.relays.incoming(to, now)
+    /// Whether `key` is a device some account has approved and not revoked.
+    fn is_device(&self, key: &PublicKey) -> bool {
+        let account = self.accounts.account_of(key);
+        account.is_some_and(|account| account.authorizes(key))
+    }
+
+    /// What is addressed to a device: open channels and stored blobs left for
+    /// it. Asking shows that the device is waiting to receive.
+    pub fn incoming(&mut self, to: &PublicKey, now: u64) -> IncomingChannels {
+        self.relays.listening(*to, now);
+        IncomingChannels {
+            channels: self.relays.incoming(to, now),
+            stored: self.storage.waiting_for(to),
+        }
     }
 
     /// Pays a relay node for the bytes a channel's receiver has signed for.

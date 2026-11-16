@@ -300,6 +300,8 @@ pub enum TransferError {
     NoSealingKey,
     #[error("what arrived was not sealed to this device")]
     NotForThisDevice,
+    #[error("no node took the data to hold")]
+    NotStored,
 }
 
 /// Sends `data` to the device `to` through a relay node, sealed so that only

@@ -11,10 +11,13 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread::sleep;
+use std::time::Duration;
 
-use decomp_core::{ContentHash, StoreOrder, merkle};
+use decomp_core::{ContentHash, Placement, StoreOrder, merkle};
 use tiny_http::{Method, Request, Response};
 
+use crate::client::Client;
 use crate::peer;
 
 /// Where a node's server keeps blobs, in its web addresses.
@@ -105,6 +108,43 @@ pub(crate) fn answer(store: &Store, path: &str, mut request: Request) -> io::Res
         },
         _ => request.respond(Response::from_string("not supported").with_status_code(405)),
     }
+}
+
+/// How many times, and how far apart, a blob is offered to a node that is not
+/// yet ready to take it. A node refuses a blob until it has heard from the
+/// coordinator that it should hold it, which it does at its next check-in.
+const UPLOAD_ATTEMPTS: u32 = 15;
+const UPLOAD_RETRY: Duration = Duration::from_secs(1);
+
+/// Sends a blob to each node chosen to hold it. Returns how many took it.
+pub fn upload_to(placement: &Placement, root: &ContentHash, bytes: &[u8]) -> usize {
+    let took = |address: &String| {
+        (0..UPLOAD_ATTEMPTS).any(|attempt| {
+            if attempt > 0 {
+                sleep(UPLOAD_RETRY);
+            }
+            upload(address, root, bytes).is_ok()
+        })
+    };
+    placement
+        .addresses
+        .iter()
+        .filter(|address| took(address))
+        .count()
+}
+
+/// Fetches a stored blob from the first node that gives a true copy of it.
+pub fn fetch(client: &Client, root: ContentHash) -> Result<Vec<u8>, String> {
+    let located = client.locate(root).map_err(|error| error.to_string())?;
+    let mut reasons = Vec::new();
+    for address in &located.addresses {
+        match download(address, &root, located.size) {
+            Ok(bytes) => return Ok(bytes),
+            Err(reason) => reasons.push(format!("{address}: {reason}")),
+        }
+    }
+    reasons.push("no node that holds the blob gave it".into());
+    Err(reasons.join("; "))
 }
 
 /// Sends a blob to the node at `address`. Fails if the node refuses it, which it

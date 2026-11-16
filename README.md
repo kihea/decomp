@@ -136,6 +136,17 @@ are part of its result, so nodes are held to them like the output.
 - A node keeps checking in while it runs a job, so taking in blobs, answering
   storage challenges, and carrying channels do not wait for the job to finish.
 
+**Three ways to a device** (the base of build step 8). A sender does not choose
+between them.
+
+- A device shows that it is waiting to receive by asking what is addressed to
+  it. If it is waiting and other devices can connect to it, the sender's channel
+  goes straight to it, and nobody is paid.
+- If it is waiting and cannot be reached, the channel goes through a relay.
+- If it is not waiting, the data is left in storage for it, sealed and with the
+  sender's signature inside, for as many days as the sender pays for. The device
+  is told it is there the next time it asks.
+
 **Apps and the jobs they pay for** (also build step 7).
 
 - An account can publish an app: a name, the hashes of its job modules, and
@@ -219,8 +230,10 @@ cargo run -p decomp-node -- store path/to/file --days 7
 cargo run -p decomp-node -- fetch <root> --output path/to/copy
 ```
 
-A file sent to another device through a relay node. The receiving device runs
-`receive`, which shows its code and waits; the sender names that code:
+A file sent to another device. The receiving device runs `receive`, which shows
+its code and waits; the sender names that code. If the receiver is not waiting,
+`send` leaves the file in storage for it, for 7 days unless `--keep-days` says
+otherwise, and the next `receive` there collects it:
 
 ```bash
 cargo run -p decomp-node -- receive --output path/to/copy
@@ -404,6 +417,13 @@ coordinator about whose key it is. Sealing itself uses X25519, HKDF with SHA-256
 and AES-256-GCM, all of which a browser does natively, so every kind of device
 seals the same way.
 
+**Asking is how a device shows it is there.** Only nodes check in, so the
+coordinator cannot otherwise tell whether a device is around to receive. A device
+that wants to receive asks, every second or so, what is addressed to it, and
+that is taken as waiting for the next fifteen seconds. A channel is opened only
+to a waiting device, so a sender finds out at once that it should use storage
+instead, and no relay holds data for a device that may never come.
+
 **A relay is paid on the receiver's signature.** Paying a relay for whatever the
 sender handed it would pay a relay that threw the data away. So a claim needs two
 signatures: the sender's, on a frame header that counts the bytes sent so far,
@@ -456,8 +476,8 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | A job that overflows the call stack may not fail the same way everywhere | Stack depth is measured in native stack bytes, which differ by processor type. Two honest nodes on different processors could disagree about such a job. | Before nodes on mixed hardware verify each other (build step 5) |
 | Modules are compiled again on every run | The agent has no cache of compiled modules yet. Compiling is fast next to running a job. | When measurements show it matters |
 | A torn final line in `ops.jsonl` stops the coordinator from starting | Acceptable for a development stand-in; the error names the line. | Build step 13 |
-| Devices never connect directly | Every transfer goes through a relay, even when the receiver could be reached. | Build step 8 |
-| Nothing waits for a device that is away for more than an hour | A channel lasts an hour. The spec has data for an offline device wait in network storage. | Build step 8 |
+| A device behind a home router cannot be reached directly | The direct path needs the receiver to run a node that listens. Two devices that are both behind routers always go through a relay. | If relays turn out to cost too much |
+| A stored file stays listed until its paid time ends | The receiving device remembers what it has collected. The sender is not told, and cannot end the storage early to get the rest of the fee back. | Build step 8, with the Send screens |
 | A relay keeps frames in memory | A relay that restarts loses what it had not delivered and the pay it had not claimed. | When relays carry more than tests |
 | A sender can make a relay take in data nobody collects | Up to 8 MiB a channel, for which the relay is not paid. Opening a channel costs the sender nothing if it is not used. | A small charge for opening a channel |
 | Relays and storage nodes are picked at random | Bandwidth is not scored, and a relay that does not deliver loses its pay but not its standing. | With the bandwidth score |

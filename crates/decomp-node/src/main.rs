@@ -7,7 +7,8 @@ mod device;
 
 use std::collections::HashSet;
 use std::error::Error;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread::sleep;
@@ -19,6 +20,7 @@ use decomp_core::{
     OpeningKey, Outcome, PublicKey, Receipt, ShardRef, Split, Sponsorship, merkle,
 };
 use decomp_node::client::{Client, ClientError, unix_now};
+use decomp_node::deliver::{self, Delivered};
 use decomp_node::relay;
 
 use crate::agent::Reachable;
@@ -27,10 +29,9 @@ use decomp_schema::records;
 
 const NO_KEY: &str = "this device has no key yet; run `decomp-node link` first";
 
-/// How many times, and how far apart, `store` offers a file to a node that is
-/// not yet ready to take it.
-const UPLOAD_ATTEMPTS: u32 = 15;
-const UPLOAD_RETRY: Duration = Duration::from_secs(1);
+/// The file, in this device's directory, listing the stored files it has
+/// already collected, one root to a line.
+const COLLECTED_FILE: &str = "collected";
 
 /// How often `submit` asks whether its job has finished.
 const JOB_POLL: Duration = Duration::from_secs(1);
@@ -115,6 +116,10 @@ enum Command {
         /// The receiving device's code, as `link` or `account` shows it.
         #[arg(long)]
         to: PublicKey,
+        /// If the device is not waiting to receive, the file is left in storage
+        /// for it. This is how many days to pay for.
+        #[arg(long, default_value_t = 7)]
+        keep_days: u32,
     },
     /// Wait for a file sent to this device, and save it.
     Receive {
@@ -206,10 +211,14 @@ fn main() -> ExitCode {
             modules,
             sponsor_daily,
         } => connect().and_then(|client| publish(&client, name, &modules, sponsor_daily)),
-        Command::Send { file, to } => connect().and_then(|client| send(&client, &file, to)),
+        Command::Send {
+            file,
+            to,
+            keep_days,
+        } => connect().and_then(|client| send(&client, &file, to, keep_days)),
         Command::Receive { output } => connect().and_then(|client| {
             let opening_key = device::opening_key(&cli.dir)?;
-            receive(&client, &opening_key, &output)
+            receive(&client, &cli.dir, &opening_key, &output)
         }),
         Command::Account => connect().and_then(|client| show_account(&client)),
         Command::Stake { amount } => connect().and_then(|client| {
@@ -506,24 +515,9 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
 fn store(client: &Client, file: &Path, days: u32) -> Result<ExitCode, Box<dyn Error>> {
     let bytes = fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let root = merkle::root(&bytes);
-    let placement = client.store_blob(root, bytes.len() as u64, days)?;
+    let placement = client.store_blob(root, bytes.len() as u64, days, None)?;
     println!("root    {root}");
-
-    let mut holding = 0;
-    for address in &placement.addresses {
-        // A node refuses the blob until it has heard from the coordinator that it
-        // should hold it, which it does at its next check-in. So try for a while.
-        let sent = (0..UPLOAD_ATTEMPTS).find_map(|attempt| {
-            if attempt > 0 {
-                sleep(UPLOAD_RETRY);
-            }
-            decomp_node::store::upload(address, &root, &bytes).ok()
-        });
-        match sent {
-            Some(()) => holding += 1,
-            None => eprintln!("could not send the file to the node at {address}"),
-        }
-    }
+    let holding = decomp_node::store::upload_to(&placement, &root, &bytes);
     println!(
         "nodes   {holding} of {} hold the file",
         placement.addresses.len()
@@ -537,37 +531,41 @@ fn store(client: &Client, file: &Path, days: u32) -> Result<ExitCode, Box<dyn Er
 
 /// Fetches a stored file from the first node that gives a true copy of it.
 fn fetch(client: &Client, root: ContentHash, output: &Path) -> Result<ExitCode, Box<dyn Error>> {
-    let located = client.locate(root)?;
-    for address in &located.addresses {
-        match decomp_node::store::download(address, &root, located.size) {
-            Ok(bytes) => {
-                fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
-                println!("fetched {} bytes from {address}", bytes.len());
-                return Ok(ExitCode::SUCCESS);
-            }
-            Err(reason) => eprintln!("the node at {address} did not give the file: {reason}"),
-        }
-    }
-    fail("no node that holds the file gave it")
-}
-
-/// Sends a file to another device through a relay node.
-fn send(client: &Client, file: &Path, to: PublicKey) -> Result<ExitCode, Box<dyn Error>> {
-    let bytes = fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
-    let route = relay::send(client, to, &bytes)?;
-    println!("channel {}", route.channel);
-    println!(
-        "sent    {} bytes to the relay at {}",
-        bytes.len(),
-        route.address
-    );
+    let bytes = decomp_node::store::fetch(client, root)?;
+    fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
+    println!("fetched {} bytes", bytes.len());
     Ok(ExitCode::SUCCESS)
 }
 
-/// Waits for a channel addressed to this device that has something on it, and
-/// saves what it carries.
+/// Sends a file to another device: over a channel if the device is waiting, and
+/// otherwise into storage to wait for it.
+fn send(
+    client: &Client,
+    file: &Path,
+    to: PublicKey,
+    keep_days: u32,
+) -> Result<ExitCode, Box<dyn Error>> {
+    let bytes = fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    match deliver::deliver(client, to, &bytes, keep_days)? {
+        Delivered::Sent(route) => {
+            println!("channel {}", route.channel);
+            println!("sent    {} bytes by way of {}", bytes.len(), route.address);
+        }
+        Delivered::Stored { root, nodes } => {
+            println!("root    {root}");
+            println!(
+                "stored  {} bytes on {nodes} nodes for {keep_days} days; the device was not waiting",
+                bytes.len()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Waits for something sent to this device, and saves it.
 fn receive(
     client: &Client,
+    dir: &Path,
     opening_key: &OpeningKey,
     output: &Path,
 ) -> Result<ExitCode, Box<dyn Error>> {
@@ -575,32 +573,37 @@ fn receive(
     client.publish_sealing_key(opening_key.sealing_key())?;
     println!("device  {}", client.device_key());
     println!("waiting for a file sent to this device...");
-    // Channels that went wrong, which are not tried again.
-    let mut broken = HashSet::new();
+    // Stored files stay listed after they are collected, so remember them.
+    let collected = dir.join(COLLECTED_FILE);
+    let mut skip: HashSet<ContentHash> = fs::read_to_string(&collected)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|root| root.parse().ok())
+        .collect();
     loop {
-        for incoming in client.incoming()? {
-            if broken.contains(&incoming.channel) {
-                continue;
-            }
-            let bytes = match relay::receive(client, opening_key, &incoming) {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => continue,
-                Err(error) => {
-                    eprintln!("channel {}: {error}", incoming.channel);
-                    broken.insert(incoming.channel);
-                    continue;
+        match deliver::collect(client, opening_key, &mut skip) {
+            Ok(Some(found)) => {
+                fs::write(output, &found.data).map_err(|e| format!("{}: {e}", output.display()))?;
+                println!("from    {}", found.from);
+                match found.stored_as {
+                    Some(root) => {
+                        let mut list = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&collected)?;
+                        writeln!(list, "{root}")?;
+                        println!(
+                            "saved   {} bytes, which were waiting in storage",
+                            found.data.len()
+                        );
+                    }
+                    None => println!("saved   {} bytes, sent just now", found.data.len()),
                 }
-            };
-            fs::write(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
-            println!("from    {}", incoming.from);
-            println!(
-                "saved   {} bytes, relayed by {}",
-                bytes.len(),
-                incoming.address
-            );
-            return Ok(ExitCode::SUCCESS);
+                return Ok(ExitCode::SUCCESS);
+            }
+            Ok(None) => sleep(relay::TAKE_POLL),
+            Err(error) => eprintln!("skipping one: {error}"),
         }
-        sleep(relay::TAKE_POLL);
     }
 }
 

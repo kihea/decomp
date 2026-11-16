@@ -19,6 +19,12 @@
 //! nothing, a sender pays only for what arrived, and the most a relay can be
 //! cheated of is what it hands over in one answer before the receiver signs.
 //!
+//! A channel is opened only to a device that is waiting to receive, which it
+//! shows by asking what is addressed to it. If that device can itself be
+//! connected to, it is its own relay: the sender connects straight to it and
+//! nobody is paid. Data for a device that is not waiting goes into storage
+//! instead (see `storage`).
+//!
 //! A channel carries bytes and does not look inside them. What devices send each
 //! other is sealed to the receiving device's key first (see `seal`), so a relay
 //! cannot read it.
@@ -53,6 +59,10 @@ pub const FRAME_BYTES: usize = 256 * 1024;
 
 /// How long a channel stays open for sending and receiving.
 pub const CHANNEL_SECS: u64 = 3600;
+
+/// How long a device counts as waiting to receive after it last asked what is
+/// addressed to it. A waiting device asks every second or so.
+pub const LISTEN_WINDOW_SECS: u64 = 15;
 
 /// How long after a channel closes its relay may still claim its pay.
 pub const REDEEM_GRACE_SECS: u64 = 300;
@@ -243,6 +253,8 @@ pub enum RelayError {
     BadSize,
     #[error("no node that can relay is online")]
     NoRelay,
+    #[error("the receiving device is not waiting to receive")]
+    ReceiverAway,
     #[error("no such open channel")]
     UnknownChannel,
     #[error("this node does not carry that channel")]
@@ -277,10 +289,30 @@ struct Channel {
     redeemed: u64,
 }
 
+impl Channel {
+    /// What carrying the channel's first `bytes` bytes is worth: nothing, if the
+    /// far end of the channel is the receiving device itself.
+    fn fee(&self, bytes: u64) -> Credits {
+        fee_through(&self.relay, &self.to, bytes)
+    }
+}
+
+/// What `relay` is paid to carry `bytes` bytes to the device `to`.
+fn fee_through(relay: &Host, to: &PublicKey, bytes: u64) -> Credits {
+    if relay.node == *to {
+        Credits::ZERO
+    } else {
+        relay_fee(bytes)
+    }
+}
+
 /// The open channels.
 #[derive(Default)]
 pub struct Relays {
     channels: HashMap<ContentHash, Channel>,
+    /// When each device last asked what is addressed to it. Not kept across a
+    /// restart: a waiting device asks again within a second or so.
+    listening: HashMap<PublicKey, u64>,
 }
 
 impl Relays {
@@ -317,8 +349,16 @@ impl Relays {
         }
     }
 
-    /// Opens a channel through one of the `online` hosts. Returns the entry that
-    /// records it and the ledger entry that sets the whole fee aside.
+    /// Notes that a device asked what is addressed to it, which is how it shows
+    /// that it is waiting to receive.
+    pub fn listening(&mut self, device: PublicKey, now: u64) {
+        self.listening.insert(device, now);
+    }
+
+    /// Opens a channel to a device that is waiting to receive: straight to it if
+    /// it is one of the `online` hosts, otherwise through one of them. Returns
+    /// the entry that records it and the ledger entry that sets the whole fee
+    /// aside.
     pub fn open(
         &self,
         opening: Opening,
@@ -339,7 +379,15 @@ impl Relays {
         if bytes == 0 || bytes > MAX_CHANNEL_BYTES {
             return Err(RelayError::BadSize);
         }
-        let relay = online.choose(rng).ok_or(RelayError::NoRelay)?.clone();
+        let last_asked = self.listening.get(&to);
+        if last_asked.is_none_or(|at| now.saturating_sub(*at) > LISTEN_WINDOW_SECS) {
+            return Err(RelayError::ReceiverAway);
+        }
+        let relay = match online.iter().find(|host| host.node == to) {
+            Some(receiver) => receiver.clone(),
+            None => online.choose(rng).ok_or(RelayError::NoRelay)?.clone(),
+        };
+        let amount = fee_through(&relay, &to, bytes);
         Ok((
             RelayEntry::Opened {
                 channel,
@@ -352,7 +400,7 @@ impl Relays {
             LedgerEntry::DataEscrow {
                 id: channel,
                 account: payer,
-                amount: relay_fee(bytes),
+                amount,
             },
         ))
     }
@@ -423,7 +471,7 @@ impl Relays {
             let pay = LedgerEntry::DataPay {
                 id: channel,
                 account: open.relay.account,
-                amount: relay_fee(bytes) - relay_fee(open.redeemed),
+                amount: open.fee(bytes) - open.fee(open.redeemed),
             };
             entries.push((RelayEntry::Redeemed { channel, bytes }, pay));
         }

@@ -40,8 +40,8 @@ pub use ledger::{
 };
 pub use relay::{
     CHANNEL_SECS, CREDITS_PER_GIB_RELAYED, Checked, FRAME_BYTES, Frame, FrameError, FrameHeader,
-    Incoming, MAX_CHANNEL_BYTES, Opening, REDEEM_GRACE_SECS, RelayEntry, RelayError, RelayOrder,
-    Relays, Route, Take, Taken, channel_id, relay_fee,
+    Incoming, LISTEN_WINDOW_SECS, MAX_CHANNEL_BYTES, Opening, REDEEM_GRACE_SECS, RelayEntry,
+    RelayError, RelayOrder, Relays, Route, Take, Taken, channel_id, relay_fee,
 };
 pub use request::{
     AccountStatus, Blob, BlobData, BlobRef, Call, CheckedIn, IncomingChannels, MAX_CLOCK_SKEW_SECS,
@@ -52,5 +52,6 @@ pub use seal::{SEAL_OVERHEAD_BYTES, SealingKeys};
 pub use splits::{Merge, Splits};
 pub use state::{MAX_SHARD_NAME_BYTES, ShardRef, StateEntry, States};
 pub use storage::{
-    Challenge, Located, Storage, StorageEntry, StorageError, StoreOrder, Storing, storage_fee,
+    Addressed, Challenge, Located, Storage, StorageEntry, StorageError, StoreOrder, Storing,
+    Waiting, storage_fee,
 };

@@ -65,6 +65,9 @@ pub enum StorageEntry {
         owner: AccountId,
         replicas: Vec<Host>,
         until: u64,
+        /// Who the blob was left for, if it was left for a device.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        addressed: Option<Addressed>,
     },
     /// A node received the blob. It is paid from this moment.
     Confirmed {
@@ -113,6 +116,25 @@ pub struct Storing {
     /// The account that pays.
     pub owner: AccountId,
     pub days: u32,
+    /// Who the blob is left for, if it is left for a device.
+    pub addressed: Option<Addressed>,
+}
+
+/// A stored blob left by one device for another, which is told it is waiting.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Addressed {
+    pub from: PublicKey,
+    pub to: PublicKey,
+}
+
+/// A stored blob waiting for a device.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Waiting {
+    pub root: ContentHash,
+    pub size: u64,
+    /// The device that left it, as the coordinator recorded. What is inside
+    /// should say for itself who it is from.
+    pub from: PublicKey,
 }
 
 /// What a node is asked to hold.
@@ -142,6 +164,7 @@ struct Deal {
     size: u64,
     until: u64,
     holders: Vec<Holder>,
+    addressed: Option<Addressed>,
 }
 
 struct Holder {
@@ -185,6 +208,7 @@ impl Storage {
                 size,
                 replicas,
                 until,
+                addressed,
                 ..
             } => {
                 let holders = replicas
@@ -198,6 +222,7 @@ impl Storage {
                     size: *size,
                     until: *until,
                     holders,
+                    addressed: *addressed,
                 };
                 self.deals.insert(*root, deal);
             }
@@ -254,6 +279,7 @@ impl Storage {
             size,
             owner,
             days,
+            addressed,
         } = blob;
         if self.deals.contains_key(&root) {
             return Err(StorageError::AlreadyStored);
@@ -285,6 +311,7 @@ impl Storage {
                 owner,
                 replicas,
                 until,
+                addressed,
             },
             LedgerEntry::DataEscrow {
                 id: root,
@@ -292,6 +319,27 @@ impl Storage {
                 amount,
             },
         ))
+    }
+
+    /// The stored blobs left for `device` that it can fetch now. A blob stays
+    /// here until its paid time runs out, whether or not the device has fetched it.
+    pub fn waiting_for(&self, device: &PublicKey) -> Vec<Waiting> {
+        self.deals
+            .iter()
+            .filter(|(_, deal)| {
+                deal.holders
+                    .iter()
+                    .any(|holder| matches!(holder.state, Holding::Held { .. }))
+            })
+            .filter_map(|(root, deal)| {
+                let addressed = deal.addressed.filter(|addressed| addressed.to == *device)?;
+                Some(Waiting {
+                    root: *root,
+                    size: deal.size,
+                    from: addressed.from,
+                })
+            })
+            .collect()
     }
 
     /// The blobs `node` has been asked to hold and has not yet said it received.

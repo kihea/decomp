@@ -11,7 +11,7 @@ use crate::job::{Assignment, JobResult, Manifest};
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, SealingKey};
 use crate::ledger::{Balance, Credits};
 use crate::relay::{Incoming, RelayOrder};
-use crate::storage::{Challenge, StoreOrder};
+use crate::storage::{Challenge, StoreOrder, Waiting};
 
 /// The largest request or answer either side accepts. A blob travels inside one
 /// as base64, so this allows blobs of up to about 48 MB.
@@ -64,11 +64,14 @@ pub enum Call {
     },
     /// Pays to have a blob held by nodes for `days` days. The blob is named by its
     /// hash-tree root (see `merkle`) and is then uploaded to the nodes in the
-    /// answer. Answer: `Placement`.
+    /// answer. With `to`, the blob is left for that device, which is told it is
+    /// waiting when it asks what is addressed to it. Answer: `Placement`.
     StoreBlob {
         root: ContentHash,
         size: u64,
         days: u32,
+        #[serde(default)]
+        to: Option<PublicKey>,
     },
     /// A node saying it has received a blob it was asked to hold. Answer: an empty
     /// object.
@@ -91,7 +94,9 @@ pub enum Call {
     /// Opens a channel to the device `to` through a relay node, for up to `bytes`
     /// bytes, and sets the fee for that much aside (see `relay`). Answer: `Route`.
     OpenRelay { to: PublicKey, bytes: u64 },
-    /// The open channels addressed to the signing device. Answer: `IncomingChannels`.
+    /// What is addressed to the signing device: open channels, and stored blobs
+    /// left for it. Asking is also how a device shows that it is waiting to
+    /// receive. Answer: `IncomingChannels`.
     ListIncoming,
     /// A relay node claiming its pay: a frame header from a channel's sender, and
     /// a `Take` in which the receiver signed for that frame. Answer: an empty
@@ -156,6 +161,9 @@ pub struct PublishedKey {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IncomingChannels {
     pub channels: Vec<Incoming>,
+    /// Stored blobs left for the device.
+    #[serde(default)]
+    pub stored: Vec<Waiting>,
 }
 
 /// The nodes a blob should be uploaded to.

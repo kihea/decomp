@@ -14,10 +14,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use decomp_core::{
-    Account, AccountStatus, Accounts, Blob, BlobData, BlobRef, Call, ContentHash, Envelope,
-    EnvelopeError, IncomingChannels, JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS,
+    Account, AccountStatus, Accounts, Addressed, Blob, BlobData, BlobRef, Call, ContentHash,
+    Envelope, EnvelopeError, JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS,
     MAX_MESSAGE_BYTES, OpError, Outcome, PublicKey, PublishedKey, Refusal, RelayError, Request,
-    ShardNow, ShardRef, SponsorError, StorageError, Submitted,
+    ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted,
 };
 use decomp_sandbox::Sandbox;
 use serde_json::json;
@@ -170,8 +170,20 @@ fn answer(
             }
             Json(coordinator.check_in(signer, account.id, address, now)).into_response()
         }
-        Call::StoreBlob { root, size, days } => {
-            Json(coordinator.store_blob(root, size, account.id, days, now)?).into_response()
+        Call::StoreBlob {
+            root,
+            size,
+            days,
+            to,
+        } => {
+            let blob = Storing {
+                root,
+                size,
+                owner: account.id,
+                days,
+                addressed: to.map(|to| Addressed { from: signer, to }),
+            };
+            Json(coordinator.store_blob(blob, now)?).into_response()
         }
         Call::ConfirmStored { root } => {
             coordinator.confirm_stored(root, signer, now)?;
@@ -202,10 +214,7 @@ fn answer(
             Json(coordinator.open_relay(signer, account.id, payload, to, bytes, now)?)
                 .into_response()
         }
-        Call::ListIncoming => Json(IncomingChannels {
-            channels: coordinator.incoming(&signer, now),
-        })
-        .into_response(),
+        Call::ListIncoming => Json(coordinator.incoming(&signer, now)).into_response(),
         Call::RedeemRelay { header, receipt } => {
             coordinator.redeem_relay(&signer, &header, &receipt)?;
             Json(json!({})).into_response()
@@ -437,6 +446,7 @@ impl From<RelayError> for ApiError {
             RelayError::ChannelExists => (StatusCode::CONFLICT, "channel_exists"),
             RelayError::BadSize => (StatusCode::BAD_REQUEST, "bad_size"),
             RelayError::NoRelay => (StatusCode::SERVICE_UNAVAILABLE, "no_relay"),
+            RelayError::ReceiverAway => (StatusCode::CONFLICT, "receiver_away"),
             RelayError::UnknownChannel => (StatusCode::NOT_FOUND, "unknown_channel"),
             RelayError::NotTheRelay => (StatusCode::FORBIDDEN, "not_the_relay"),
             RelayError::NotFromSender => (StatusCode::BAD_REQUEST, "not_from_sender"),
@@ -462,9 +472,13 @@ impl From<OpenRelayError> for ApiError {
 
 impl From<StoreError> for ApiError {
     fn from(error: StoreError) -> Self {
+        let message = error.to_string();
         match error {
             StoreError::Storage(inner) => inner.into(),
             StoreError::Ledger(inner) => inner.into(),
+            StoreError::UnknownDevice => {
+                Self::new(StatusCode::NOT_FOUND, "unknown_device", message)
+            }
         }
     }
 }

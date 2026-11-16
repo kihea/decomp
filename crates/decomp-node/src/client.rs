@@ -4,9 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decomp_core::{
     AccountId, AccountOp, AccountStatus, AppManifest, Blob, BlobData, BlobRef, Call, Challenge,
-    CheckedIn, ContentHash, Credits, Envelope, Incoming, IncomingChannels, JobId, JobResult,
-    JobStatus, Located, MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey, PublishedKey, Refusal,
-    Request, Route, SealingKey, ShardNow, SigningKey, Standing, Submitted, seal,
+    CheckedIn, ContentHash, Credits, Envelope, IncomingChannels, JobId, JobResult, JobStatus,
+    Located, MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey, PublishedKey, Refusal, Request,
+    Route, SealingKey, ShardNow, SigningKey, Standing, Submitted, seal,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -135,13 +135,20 @@ impl Client {
     }
 
     /// Pays to have a blob held for `days` days; answers with where to upload it.
+    /// With `to`, the blob is left for that device to collect.
     pub fn store_blob(
         &self,
         root: ContentHash,
         size: u64,
         days: u32,
+        to: Option<PublicKey>,
     ) -> Result<Placement, ClientError> {
-        self.call(Call::StoreBlob { root, size, days })
+        self.call(Call::StoreBlob {
+            root,
+            size,
+            days,
+            to,
+        })
     }
 
     pub fn confirm_stored(&self, root: ContentHash) -> Result<(), ClientError> {
@@ -189,10 +196,10 @@ impl Client {
         self.call(Call::OpenRelay { to, bytes })
     }
 
-    /// The open channels addressed to this device.
-    pub fn incoming(&self) -> Result<Vec<Incoming>, ClientError> {
-        let incoming: IncomingChannels = self.call(Call::ListIncoming)?;
-        Ok(incoming.channels)
+    /// What is addressed to this device: open channels, and stored blobs left
+    /// for it. Asking also shows that this device is waiting to receive.
+    pub fn incoming(&self) -> Result<IncomingChannels, ClientError> {
+        self.call(Call::ListIncoming)
     }
 
     /// Claims a relay node's pay with a frame header from a channel's sender and

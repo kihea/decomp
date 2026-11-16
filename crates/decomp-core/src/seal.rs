@@ -23,7 +23,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 
 use crate::envelope::{Envelope, EnvelopeError};
-use crate::keys::{OpeningKey, PublicKey, SealingKey};
+use crate::keys::{OpeningKey, PublicKey, SealingKey, Signature, SigningKey};
 use crate::request::{Call, Request};
 
 /// The sealing key a device published, read from its own signed request to
@@ -96,6 +96,50 @@ pub fn open(key: &OpeningKey, sealed: &[u8]) -> Option<Vec<u8>> {
     let once = SealingKey::from_bytes(once.try_into().ok()?);
     let cipher = cipher(&key.shared_with(&once)?, &once, &key.sealing_key());
     cipher.decrypt(&Nonce::from(NONCE), encrypted).ok()
+}
+
+/// Mixed into what a sender signs, so the signature is no use for anything else.
+const SENDER_PURPOSE: &[u8] = b"decomp/v1 sealed from\n";
+
+/// Seals `message` to the device `device`, whose sealing key is `to`, with the
+/// sender's signature inside. Use this when nothing else says who the data is
+/// from, as with data left in storage. The signature covers the receiving
+/// device, so what was sealed for one device cannot be passed on to another as
+/// if the sender had sent it there.
+pub fn seal_from(
+    sender: &SigningKey,
+    device: &PublicKey,
+    to: &SealingKey,
+    message: &[u8],
+) -> Option<Vec<u8>> {
+    let signature = sender.sign(&signed_part(device, message));
+    let sender = sender.public_key();
+    seal(
+        to,
+        &[sender.as_bytes().as_slice(), signature.as_bytes(), message].concat(),
+    )
+}
+
+/// Opens what `seal_from` sealed for the device `device`. Returns the device
+/// that sent it and the message, or `None` if it was not sealed to this key, was
+/// changed, or does not carry a sender's signature for this device.
+pub fn open_from(
+    key: &OpeningKey,
+    device: &PublicKey,
+    sealed: &[u8],
+) -> Option<(PublicKey, Vec<u8>)> {
+    let opened = open(key, sealed)?;
+    let (sender, rest) = opened.split_at_checked(32)?;
+    let (signature, message) = rest.split_at_checked(64)?;
+    let sender = PublicKey::from_bytes(sender.try_into().ok()?);
+    let signature = Signature::from_bytes(signature.try_into().ok()?);
+    sender
+        .verifies(&signed_part(device, message), &signature)
+        .then(|| (sender, message.to_vec()))
+}
+
+fn signed_part(device: &PublicKey, message: &[u8]) -> Vec<u8> {
+    [SENDER_PURPOSE, device.as_bytes(), message].concat()
 }
 
 /// The cipher for one message, from what its two sides share. Both public keys
