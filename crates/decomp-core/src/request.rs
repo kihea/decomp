@@ -11,6 +11,7 @@ use crate::job::{Assignment, JobResult, Manifest};
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, SealingKey};
 use crate::ledger::{Balance, Credits};
 use crate::relay::{Incoming, RelayOrder};
+use crate::settlement::{Change, Through};
 use crate::storage::{Challenge, StoreOrder, Waiting};
 
 /// The largest request or answer either side accepts. A blob travels inside one
@@ -114,6 +115,21 @@ pub enum Call {
     /// from zero, at most `MAX_LOG_PAGE` of them. Each is a `Draw` signed by
     /// the operator (see `draw`). Answer: `LogPage`.
     GetDraws { from: u64 },
+    /// An operator asking for the records behind another operator's batches,
+    /// from the places `from` gives, at most `MAX_LOG_PAGE` of each kind.
+    /// Account records are not public, so only an operator is answered: a
+    /// device of an account that has stake. Answer: `BatchRecords`.
+    GetRecords { from: Through },
+    /// An operator disputing a batch it has audited: `fingerprint` and
+    /// `changes` are what the records behind batch number `batch` give. If the
+    /// keeper of the log finds the same, the signed request goes into the log
+    /// and the operator that posted the batch forfeits its stake. Answer: an
+    /// empty object.
+    DisputeBatch {
+        batch: u64,
+        fingerprint: ContentHash,
+        changes: Vec<Change>,
+    },
 }
 
 /// An account record together with its credits. Changing an account answers

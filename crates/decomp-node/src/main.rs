@@ -305,8 +305,13 @@ fn show_log(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
     println!("operator {operator}");
     for batch in log.batches() {
         let (start, end) = log.receipts_of(batch.number).unwrap_or_default();
+        let disputed = if log.is_disputed(batch.number) {
+            "  (found bad by another operator; the fingerprint is the one its dispute gave)"
+        } else {
+            ""
+        };
         println!(
-            "batch {}  {} receipts, {} balances changed, fingerprint {}",
+            "batch {}  {} receipts, {} balances changed, fingerprint {}{disputed}",
             batch.number,
             end - start,
             batch.changes.len(),

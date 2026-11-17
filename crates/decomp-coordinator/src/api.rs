@@ -25,7 +25,9 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 use crate::referee::referee;
-use crate::state::{Coordinator, InclusionError, OpenRelayError, StoreError, SubmitError};
+use crate::state::{
+    Coordinator, DisputeError, InclusionError, OpenRelayError, StoreError, SubmitError,
+};
 
 struct App {
     coordinator: Mutex<Coordinator>,
@@ -198,6 +200,12 @@ fn answer(
                     "stake cannot be taken back while one of the account's nodes is on a job";
                 return Err(ApiError::new(StatusCode::CONFLICT, "node_working", message));
             }
+            // And when a batch its operator posted turns out bad.
+            if coordinator.operator_account() == Some(account.id) && coordinator.has_open_batch(now)
+            {
+                let message = "stake cannot be taken back while a batch its operator posted can still be disputed";
+                return Err(ApiError::new(StatusCode::CONFLICT, "batch_open", message));
+            }
             coordinator.record(LedgerEntry::Unstake {
                 account: account.id,
                 amount,
@@ -263,6 +271,16 @@ fn answer(
         Call::GetLog { from } => Json(coordinator.log_page(from)?).into_response(),
         Call::GetInclusion { job_id } => Json(coordinator.inclusion(&job_id)?).into_response(),
         Call::GetDraws { from } => Json(coordinator.draws_page(from)?).into_response(),
+        Call::GetRecords { from } => Json(coordinator.records(&account.id, from)?).into_response(),
+        Call::DisputeBatch {
+            batch,
+            fingerprint,
+            changes,
+        } => {
+            let found = (fingerprint, changes.as_slice());
+            coordinator.dispute(&envelope, &account.id, batch, found, now)?;
+            Json(json!({})).into_response()
+        }
         Call::SubmitResult { result } => {
             if let Outcome::Completed {
                 output,
@@ -535,6 +553,23 @@ impl From<StoreError> for ApiError {
                 Self::new(StatusCode::NOT_FOUND, "unknown_device", message)
             }
         }
+    }
+}
+
+impl From<DisputeError> for ApiError {
+    fn from(error: DisputeError) -> Self {
+        let message = error.to_string();
+        let (status, code) = match error {
+            DisputeError::NotAnOperator => (StatusCode::FORBIDDEN, "not_an_operator"),
+            DisputeError::OwnBatch => (StatusCode::FORBIDDEN, "own_batch"),
+            DisputeError::NoSuchBatch => (StatusCode::NOT_FOUND, "unknown_batch"),
+            DisputeError::AlreadyDisputed => (StatusCode::CONFLICT, "already_disputed"),
+            DisputeError::WindowClosed => (StatusCode::CONFLICT, "window_closed"),
+            DisputeError::BatchHolds => (StatusCode::CONFLICT, "batch_holds"),
+            DisputeError::Differs => (StatusCode::CONFLICT, "dispute_differs"),
+            DisputeError::Storage(inner) => return inner.into(),
+        };
+        Self::new(status, code, message)
     }
 }
 

@@ -65,8 +65,9 @@ pub use request::{
 pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
 pub use seal::{SEAL_OVERHEAD_BYTES, SealingKeys};
 pub use settlement::{
-    BATCH_PERIOD_SECS, Batch, Change, Inclusion, LogEntry, LogError, LogPage, MAX_LOG_PAGE, Posted,
-    SettlementLog, Through,
+    AuditError, Auditor, BATCH_PERIOD_SECS, Batch, BatchRecords, Change, DISPUTE_WINDOW_SECS,
+    Finding, Inclusion, LogEntry, LogError, LogPage, MAX_LOG_PAGE, Posted, SettlementLog, Through,
+    UpheldDispute,
 };
 pub use shares::{SHARES, ShareError};
 pub use splits::{Merge, Splits};

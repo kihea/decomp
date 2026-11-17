@@ -320,7 +320,7 @@ between them.
   results read as `submit` does it: the higher of two private numbers, at 244
   units, and a private number times a plain one less a plain one, each right.
 
-**Settlement** (build step 13).
+**Settlement and operators** (build step 13).
 
 - **Batches.** "Every 10 minutes (starting value) the coordinator combines the
   new receipts into one fingerprint and posts it with the net balance change
@@ -369,6 +369,38 @@ between them.
   that the round was the newest when the draw was made, that the beacon itself
   gives that round the same randomness, and that the rule draws the nodes the
   record names.
+- **Operators.** "Several staked operators run coordinators and audit each
+  other's batches during a dispute window." An operator is the key a
+  coordinator signs its log and its draws with. The coordinator makes the key
+  the first time it starts and shows it. Approved as a device of an account,
+  it has that account's stake as its own.
+- **A second operator's coordinator.** Started with `DECOMP_FOLLOW` and the
+  address of another operator's coordinator, the coordinator takes no jobs and
+  audits that one instead. It follows the other's log entry by entry. For
+  each batch it fetches the records behind it (account changes, credit
+  movements, and receipts) and works the batch out again: the fingerprint
+  from the receipts, and the balance changes from the records. It checks that
+  each receipt holds signed reports that agree with it, and that every job
+  paid for in the period has its receipt in the batch and was paid as the
+  receipt says, to accounts of nodes that signed it. It also works out every
+  draw the other operator publishes. The records are handed only to an
+  operator with stake, because account records are not public.
+- **Disputes and forfeits.** When a batch does not hold, the auditing operator
+  disputes it: a signed request that gives the fingerprint and changes the
+  records give. The coordinator that keeps the log judges it as the ledger
+  would, by working the batch out again from the records. If the batch is bad
+  and the dispute is right, the signed dispute goes into the log, and "an
+  operator that posts a bad batch forfeits stake": all the stake of the
+  operator's account goes to the treasury. The batch after it puts the
+  balances right. A dispute is refused if its sender has no stake, if it
+  comes after the dispute window (an hour after the batch was posted), if the
+  batch holds, or if the batch was disputed before.
+- An operator's account cannot take stake back while its last batch can still
+  be disputed.
+- **What a second operator can and cannot do.** It can audit every batch and
+  every draw of the first, dispute a bad batch, and have the first operator's
+  stake forfeited. It cannot take jobs, hold accounts, or post batches of its
+  own: see "Known gaps".
 - Run on the check network of five proven nodes, with a batch every 15
   seconds. The first batch took in the 524 receipts and 47 balances the
   network already had. Three jobs then went into two batches, of two receipts
@@ -388,6 +420,32 @@ between them.
   operator's own key and added to the published file by a script, was
   refused by the same check. A draw with other randomness than the beacon's,
   and one from a round that was not the newest, were not tried.
+- Operators were run on a new network of three nodes on probation, each of
+  its own account, with two coordinators: the first on its own data, and a
+  second following it, each with its own operator key, approved into the
+  accounts of two different nodes, each account with 2 credits staked. Before
+  its account had stake, the second was refused the records. With stake, it
+  found the first six batches, of 15 receipts, to hold, and all 15 draws.
+- The first coordinator was then stopped, and a script signed a batch with
+  its operator's key that added 50 credits at the operator's own address, with
+  nothing in the records behind it, and appended it to the log. Started again,
+  the first coordinator took the log as valid, as any checker of signatures
+  would. The second found that the batch "does not hold: its balance changes
+  are not what the records give" and disputed it. The dispute was upheld: it
+  is in the log, the first operator's account went from 2 credits staked to
+  none, and the log's balance at its address came to what `account` showed.
+  The log still checked from its first entry, and its balances still came to
+  the starter grants.
+- Disputes that were refused, each seen: from an account with no stake; of a
+  batch that holds; by the operator of its own batch; of a batch that does
+  not exist; of the batch already disputed; and, with the window set to one
+  second, of a second forged batch three seconds old. The operator's account
+  was refused when it tried to take stake back. A second coordinator started
+  afresh found the bad batch again and did not dispute it twice.
+- Not seen: a batch with a wrong fingerprint, a receipt its nodes' reports do
+  not back, or a job paid for without a receipt, since the forged batches had
+  wrong amounts only; a node's proof against a disputed batch's corrected
+  fingerprint; and a dispute that names other figures than the records give.
 
 ## Layout
 
@@ -525,10 +583,23 @@ Whether every draw the operator has published is the one the rule gives:
 cargo run -p decomp-node -- draws
 ```
 
+A second operator's coordinator, which audits the one at the address given
+and takes no jobs. It shows its operator key when it starts. Approve that key
+as a device of an account that has stake, or it is refused the records:
+
+```bash
+DECOMP_FOLLOW=http://127.0.0.1:8787 DECOMP_DATA_DIR=operator2 cargo run -p decomp-coordinator
+```
+
+The first coordinator's operator key is shown when it starts, too. Approved
+into an account, it has that account's stake to lose.
+
 Coordinator settings are `DECOMP_ADDR`, `DECOMP_DATA_DIR`,
 `DECOMP_STORAGE_CHALLENGE_SECS` (how often each node is asked to show that it
-still holds a blob; an hour unless set), and `DECOMP_BATCH_SECS` (how often a
-batch is posted to the settlement log; ten minutes unless set). The node agent takes
+still holds a blob; an hour unless set), `DECOMP_BATCH_SECS` (how often a
+batch is posted to the settlement log; ten minutes unless set),
+`DECOMP_DISPUTE_WINDOW_SECS` (how long a batch can be disputed; an hour unless
+set), and `DECOMP_FOLLOW` (the coordinator to audit, as above). The node agent takes
 `--coordinator` and `--dir`, or `DECOMP_COORDINATOR_URL` and `DECOMP_NODE_DIR`.
 
 Checks, run before every commit, from this folder:
@@ -636,6 +707,45 @@ draws for assignment and spot checks". Which known-answer job a node is handed
 and when, which nodes hold a blob or carry a channel, and which chunk a
 storage challenge asks for still use the coordinator's own randomness. A
 known-answer job has to stay unpredictable to the node it tests.
+
+**An operator is a key, and its stake is its account's.** The spec asks for
+"staked operators" and names nothing more. Accounts already hold stake and
+lose it by forfeit, and a device key already joins an account by being
+approved. So an operator's key is one more device key, and no second kind of
+stake or of registration was built. The spec does not say how much an
+operator must stake, so no amount is required, and a bad batch costs the
+operator all it has staked.
+
+**A second operator's coordinator audits and does not take jobs.** That is
+the least in which a second operator is real with the log there is. A log
+kept in one coordinator's file has one writer. Two coordinators that both
+took jobs would both charge the same balances, and something would have to
+put their batches in one order and refuse the second spend of the same
+credits. That is the ledger's work. With it, the same code that audits can
+post.
+
+**An audit is a second run of the same rules.** The auditor rebuilds the
+other operator's account records and balances from its records, and makes
+each batch with the function the operator itself makes it with. The
+coordinator judges a dispute by auditing itself the same way. So there is one
+statement of what a batch should be, in `crates/decomp-core/src/settlement.rs`.
+
+**The keeper of the log judges a dispute.** On a public ledger the ledger
+would. Here the log is kept by the first operator's coordinator, so that
+coordinator is asked, and it answers by the records. A coordinator that runs
+this code upholds a true dispute against itself. An operator that has changed
+its coordinator can refuse one, and "Known gaps" says so.
+
+**An upheld dispute changes a fingerprint and no balance.** The next batch is
+always the difference between what the records hold and what the log holds,
+so it undoes whatever a bad batch got wrong, with or without a dispute. What
+it cannot undo is a wrong fingerprint, which would leave the period's
+receipts unprovable. So the dispute carries the right one, and whoever checks
+the log uses it for that batch from then on.
+
+**The dispute window is an hour, for now.** The spec names the window and gives
+it no length. An hour is six batch periods (`DISPUTE_WINDOW_SECS` in
+`crates/decomp-core/src/settlement.rs`). The owner has not confirmed it.
 
 **A receipt is hashed as the text it was written as.** As with signed
 requests, nothing is written out a second time to be hashed, so a proof hands
@@ -1018,6 +1128,16 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | --- | --- | --- |
 | Nothing is posted to a public ledger | The spec has "balances and batch fingerprints live on an existing public ledger, with ICP the first candidate". Posting to the Internet Computer needs a canister and its toolchain, `dfx`, to build and run one, and the machine this was built on has no `dfx`, no WSL distribution, and no Docker to run a local Internet Computer in. The local signed log the spec allows during development stands in. | A machine with `dfx` |
 | The settlement log is kept by the operator it is about | The coordinator that signs the log also holds the only copy and hands it out. It cannot change an entry unseen by someone who kept an earlier copy, but it can show different logs to different askers, or none. | A public ledger: see the row above |
+| A second operator's coordinator cannot take jobs | See "A second operator's coordinator audits and does not take jobs". Two coordinators that both take jobs need a ledger that both write to and that orders their batches. | A public ledger: see the first row |
+| The operator at fault judges the dispute and takes its own stake | The log and the balances are kept by the coordinator whose batch is disputed. One that runs this code upholds a true dispute. An operator that has changed its coordinator can refuse it, and the auditor is left with a signed bad batch to show and nowhere to take it. | A public ledger: see the first row |
+| An operator needs no stake, and its stake is its account's | Nothing refuses the batches of an operator with nothing staked, or of one whose key is in no account: a bad batch then costs it nothing. The stake an operator loses is the same stake that stands behind its account's nodes. The spec does not size an operator's stake. | The owner's decision on the size of an operator's stake |
+| A wrong dispute costs nothing | The spec sets a price on a bad batch and none on a dispute that fails. A staked account can make the coordinator work a batch out again as often as it likes. | The owner's decision |
+| An audit takes on the operator's word what no receipt stands behind | Credits set aside and returned, payments for storage and relaying, stake put up and taken back, forfeits, and the pay of spot checkers and known-answer jobs are followed by the ledger's rules, which stop an overdraft, and are not checked against a signed request. Nor can an audit tell that a job was refunded that should have been paid for. | Records that carry the signed requests behind these too |
+| Any account with stake is handed every account's record | An operator is told apart by stake alone, so staking any amount shows an account which devices belong to which account. | Operators that are admitted by the ledger, or by governance |
+| A following coordinator keeps nothing | It audits from the log's first entry every time it starts, and fetches every record again. | When a log is long enough for that to matter |
+| A draw that does not hold is reported and nothing more | The spec has steering "detectable". The second operator's coordinator prints the draw that failed; there is no dispute of a draw and no forfeit for one. | The owner's decision on what a bad draw costs |
+| The dispute window is not confirmed | An hour is this build's starting value; the spec gives none. | Owner's decision |
+| Receipts written before a change of format cannot be audited | An auditor reads each receipt as the current format. A batch over older receipts, with fewer fields, is found bad for "one of its receipts cannot be read". The spec makes a new receipt format a new major version. | Version 1 is the first format that is kept |
 | A node finds a missing receipt only for jobs it noted | The command-line node notes a job when it reports it. A job reported by an older build of the node, or from a directory that has since been lost, is not looked for. | If it proves a nuisance |
 | Reading the log, a proof, or the records behind a batch scans a file from its start | Every such answer is read out of a log file by line number, under the coordinator's one lock. | When load needs it |
 | No automated tests | Tests are added only once the code is built, to guard against regressions. The flows were checked by hand. | Owner's go-ahead |
@@ -1035,17 +1155,17 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | Splitting cuts by byte count only, and only when asked | The spec's split rules follow the job's data types, and the coordinator also splits large jobs on its own to steer the mix of tiers. | Typed split rules, with the first job that needs them; steering when there is real traffic |
 | No holdback | The spec holds a tenth of a spot-checked node's earnings for a day so a late check can be enforced. Checks here happen at the time of the job, so there is nothing to hold for. | If checks ever run after payment |
 | A job kept from too many accounts is accepted and then expires | The coordinator cannot tell, when a job is submitted, that enough other accounts will have idle nodes before its deadline. | If it proves a nuisance |
-| Which accounts ran an earlier job is forgotten with the job | Jobs are kept an hour after they close and not across a restart, so a job named in `apart_from` bars nobody after that. | Settlement, build step 13 |
+| Which accounts ran an earlier job is forgotten with the job | Jobs are kept an hour after they close and not across a restart, so a job named in `apart_from` bars nobody after that. Build step 13 was to close this and did not: receipts are kept, but not which accounts were handed a job. | Closed jobs kept across a restart |
 | A submitter can find out which nodes are of one account | It keeps jobs from a key and sees, in their receipts, which nodes never run them. The spec has the device list of an account not publicly readable. | Receipts that name nodes by one-time keys, or the owner's decision that this is acceptable |
 | Two of the four node scores | Bandwidth and hardware fit are not measured, and a node offers one slot. | Data-heavy jobs (step 7) and inference (step 12) |
 | No penalty for proven fraud | Removal from the network and loss of the whole stake apply to offenses such as running a swapped model, which need inference to exist. | Build step 12 |
 | Stake can be taken back between a wrong result and its verdict | Taking stake back is refused only while a node is on a job; refereeing takes seconds more. | A waiting period on taking stake back |
-| The treasury only fills up | Starter grants are created rather than drawn from the treasury, and nothing is paid out of it. | Settlement, build step 13 |
+| The treasury only fills up | Starter grants are created rather than drawn from the treasury, and nothing is paid out of it. A batch posts a grant as credits that come from nowhere, so the log's balances add up to the grants made. | The owner's decision on what funds grants before the treasury has income |
 | Starter credits can be turned into earned credits | An owner with several accounts can spend one account's grant on jobs run by nodes in the others, keeping 85% as credits that can be cashed out. Probation and stake raise the cost; nothing here prevents it. | Owner's call, before cash-out exists (step 14) |
-| The coordinator handles one request at a time | All state sits behind one lock, including blob reads and writes. | When load needs it; revisit at build step 13 |
+| The coordinator handles one request at a time | All state sits behind one lock, including blob reads and writes. | When load needs it. Build step 13 added the batch clock, the beacon, and dispute judging behind the same lock, and judging a dispute reads every record |
 | A job that overflows the call stack may not fail the same way everywhere | Stack depth is measured in native stack bytes, which differ by processor type. Two honest nodes on different processors could disagree about such a job. | Before nodes on mixed hardware verify each other (build step 5) |
 | Modules are compiled again on every run | The agent has no cache of compiled modules yet. Compiling is fast next to running a job. | When measurements show it matters |
-| A torn final line in `ops.jsonl` stops the coordinator from starting | Acceptable for a development stand-in; the error names the line. | Build step 13 |
+| A torn final line in a log file stops the coordinator from starting | Acceptable for a development stand-in; the error names the line. This holds for `ops.jsonl`, `settlement.jsonl`, and the others. | When the records move off local files |
 | A device behind a home router cannot be reached directly | The direct path needs the receiver to run a node that listens. Two devices that are both behind routers always go through a relay. | If relays turn out to cost too much |
 | A stored file stays listed until its paid time ends | The receiving device remembers what it has collected. The sender is not told, and cannot end the storage early to get the rest of the fee back. | Build step 8, with the Send screens |
 | A relay keeps frames in memory | A relay that restarts loses what it had not delivered and the pay it had not claimed. | When relays carry more than tests |
@@ -1061,9 +1181,9 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | A job does not pass through a relay node on its way to a node | The spec has jobs "reach nodes through relays under one-time IDs, so a node cannot tell whose job it is running". The one-time IDs are built, and a node cannot tell. But a job reaches a node from the coordinator, which holds every job's blobs, and no device ever connects to a node that runs its job, so there is no connection between the two for a relay to stand in. Sending the same bytes through a relay as well would hide nothing more from a node, would charge the submitter the relay's fee, and would stop jobs on a network where no node can be reached from outside. | Job blobs moving to node storage, which is when a device first sends a job's data to nodes itself |
 | The same blob cannot be stored twice | A second request for a root already stored is refused, even from another account. | When two accounts need the same data |
 | Stored blobs are readable by anyone with the root | `store` keeps a file as it is. Sealing exists now, but who a stored file is sealed to is for the app that stores it to say. | Build step 8, when Send stores what waits for a device |
-| Logs can fall out of step on a crash | A storage or relay change and the credits that go with it are written to two files, one after the other. | Settlement, build step 13 |
+| Logs can fall out of step on a crash | A storage or relay change and the credits that go with it are written to two files, one after the other, and so are a receipt and its payment. | One write for a change and its credits |
 | An app's manifest lists no permissions or schemas | The one permission so far follows from the list of modules: only the app's own modules may be handed its state. Each module describes its own types. | With the first permission that cannot be read off the modules |
-| What an app has set aside for an account today is kept in memory | A restart forgets it, so a daily cap can be passed once for each restart. It counts the highest possible fee of each job, not what the job cost. | Settlement, build step 13 |
+| What an app has set aside for an account today is kept in memory | A restart forgets it, so a daily cap can be passed once for each restart. It counts the highest possible fee of each job, not what the job cost. | A log of what apps have set aside |
 | A daily cap limits an account, not a person | Accounts are free to make, so someone can get around an app's cap with new ones. What the app's account holds is the real limit. | Sign-in, build step 14 |
 | A job seals to one device, not to a user | The spec's sealing "encrypts to a user's key". The sealing keys there are belong to devices, so what a job seals can be opened on one device, and a private job run by the local route opens only what was sealed to the device it runs on. | Keys that no single party holds, which are not built: see the row on them |
 | A follow-up job gets less than a submitted one | Its input is not checked against its module's types before it runs, so a wrong one fails when run. Nor is its module's privacy mode checked: it runs in the mode of the job that asked for it, and, if that job was a share, under the same name, so it stays off the accounts that hold the job's other shares. It cannot be split or handed state. | With the first app that needs any of these |
@@ -1082,7 +1202,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | The coordinator can read every share | Job blobs are still held by the coordinator, so the inputs of both shares, and both outputs, pass through one party that could add them. The spec's promise is about nodes, and it holds for nodes. An encrypted job's values it cannot read, like anyone else without the key. | Job blobs moving to node storage |
 | One owner with nodes on two accounts can be handed both shares | Shares go to different accounts, and accounts are free to make. The spec lists this as an open risk: "Secret sharing fails if one owner controls all the nodes holding a job's shares". | Stake and sign-in raise the cost; measuring how concentrated node ownership is |
 | A share that is not run leaves the other paid for | The shares are jobs of their own. If one expires, is disputed, or is refused when submitted, the other still runs and is charged, and the device has no result. | A job of several parts that is paid for only as a whole |
-| Which accounts hold a job's shares is forgotten with the shares' jobs | Jobs are kept an hour after they close and not across a restart. A share submitted later than that could go to an account that held another. The command-line node submits a job's shares together. | Settlement, build step 13 |
+| Which accounts hold a job's shares is forgotten with the shares' jobs | Jobs are kept an hour after they close and not across a restart. A share submitted later than that could go to an account that held another. The command-line node submits a job's shares together. | Closed jobs kept across a restart |
 | A private total is of one device's numbers | The spec's use of this route totals numbers from many users, each sending shares of its own. Here one device submits the whole input. | The feed app, build step 11 |
 | The number of shares is fixed at two | See "Two shares" above. | If the owner wants a job to choose |
 | `submit` takes a device to fit one-unit jobs only | Hardware fit is not measured, so one unit, which the spec says any device can run, stands in for what this device can do. The owner has not confirmed it. | The hardware-fit score, build step 12 |

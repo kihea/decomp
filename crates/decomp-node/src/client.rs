@@ -4,11 +4,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decomp_core::LogError;
 use decomp_core::{
-    AccountId, AccountOp, AccountStatus, AppManifest, Blob, BlobData, BlobRef, Call, Challenge,
-    CheckedIn, ContentHash, Credits, Envelope, Inclusion, IncomingChannels, JobId, JobResult,
-    JobStatus, Located, LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey,
-    PublishedKey, Refusal, Request, Route, SealingKey, SettlementLog, ShardNow, SigningKey,
-    Standing, Submitted, seal,
+    AccountId, AccountOp, AccountStatus, AppManifest, BatchRecords, Blob, BlobData, BlobRef, Call,
+    Challenge, Change, CheckedIn, ContentHash, Credits, Envelope, Inclusion, IncomingChannels,
+    JobId, JobResult, JobStatus, Located, LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES, Manifest,
+    Placement, PublicKey, PublishedKey, Refusal, Request, Route, SealingKey, SettlementLog,
+    ShardNow, SigningKey, Standing, Submitted, Through, seal,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -224,7 +224,7 @@ impl Client {
         let mut log = SettlementLog::default();
         let mut from = 0;
         loop {
-            let LogPage { entries } = self.call(Call::GetLog { from })?;
+            let LogPage { entries } = self.log_page(from)?;
             for entry in &entries {
                 log.apply(entry)
                     .map_err(|error| ClientError::BadLog(from, error))?;
@@ -234,6 +234,34 @@ impl Client {
                 return Ok(log);
             }
         }
+    }
+
+    /// A page of the coordinator's settlement log, from entry `from` on.
+    pub fn log_page(&self, from: u64) -> Result<LogPage, ClientError> {
+        self.call(Call::GetLog { from })
+    }
+
+    /// A page of the records behind the coordinator's batches, from the places
+    /// `from` gives. Only an operator is answered.
+    pub fn records(&self, from: Through) -> Result<BatchRecords, ClientError> {
+        self.call(Call::GetRecords { from })
+    }
+
+    /// Disputes batch number `batch`: `fingerprint` and `changes` are what the
+    /// records behind it give.
+    pub fn dispute(
+        &self,
+        batch: u64,
+        fingerprint: ContentHash,
+        changes: Vec<Change>,
+    ) -> Result<(), ClientError> {
+        let call = Call::DisputeBatch {
+            batch,
+            fingerprint,
+            changes,
+        };
+        self.call::<IgnoredAny>(call)?;
+        Ok(())
     }
 
     /// A page of the draws the operator has published, from number `from` on.

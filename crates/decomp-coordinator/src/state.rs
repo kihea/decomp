@@ -10,6 +10,7 @@
 //! | The settlement log: batches, signed by the operator | `settlement.jsonl`, checked from its first entry at startup | Yes |
 //! | The operator's key | `operator.key` | Yes |
 //! | The draws of closed jobs, signed by the operator | `draws.jsonl` | Yes |
+//! | Disputes of batches that were upheld | `settlement.jsonl`, with the batches | Yes |
 //! | Which nodes hold which blobs | `storage.jsonl`, replayed at startup | Yes |
 //! | Relay channels | `relays.jsonl`, replayed at startup | Yes |
 //! | The sealing key each device published | `sealing.jsonl`, replayed at startup | Yes |
@@ -26,15 +27,16 @@ use std::io;
 use std::path::Path;
 
 use decomp_core::{
-    Account, AccountId, AccountStatus, Accounts, Assignment, Beacon, Challenge, CheckedIn, Closure,
-    Conduct, ContentHash, Credits, Envelope, EnvelopeError, FollowUps, Hosts, Inclusion,
-    IncomingChannels, JobError, JobId, JobStatus, Jobs, Ledger, LedgerAddress, LedgerEntry,
-    LedgerError, Located, LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES,
-    MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, Merge, OpError, Opening, Outcome,
-    PROBATION_FORFEIT_PERCENT, Penalty, Placement, Posted, PrivacyError, PublicKey, Receipt,
-    RelayEntry, RelayError, Relays, Route, ScoreEvent, Scores, SealingKeys, SettlementLog,
-    ShardRef, SigningKey, Splits, SponsorError, Sponsored, Standing, StateEntry, States, Storage,
-    StorageEntry, StorageError, Storing, Through, channel_id, fee, merkle, privacy, settlement,
+    Account, AccountId, AccountStatus, Accounts, Assignment, Auditor, BatchRecords, Beacon,
+    Challenge, Change, CheckedIn, Closure, Conduct, ContentHash, Credits, Envelope, EnvelopeError,
+    Finding, FollowUps, Hosts, Inclusion, IncomingChannels, JobError, JobId, JobStatus, Jobs,
+    Ledger, LedgerAddress, LedgerEntry, LedgerError, Located, LogPage, MAX_APART_FROM,
+    MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES, MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, Merge,
+    OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT, Penalty, Placement, Posted, PrivacyError,
+    PublicKey, Receipt, RelayEntry, RelayError, Relays, Route, ScoreEvent, Scores, SealingKeys,
+    SettlementLog, ShardRef, SigningKey, Splits, SponsorError, Sponsored, Standing, StateEntry,
+    States, Storage, StorageEntry, StorageError, Storing, Through, UpheldDispute, channel_id, fee,
+    merkle, privacy, settlement,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
@@ -76,6 +78,28 @@ pub enum InclusionError {
     NoReceipt,
     #[error("the job's receipt is not in a batch yet")]
     NotBatched,
+    #[error(transparent)]
+    Storage(#[from] io::Error),
+}
+
+/// Why an operator was not handed records, or its dispute of a batch was not
+/// upheld.
+#[derive(Debug, thiserror::Error)]
+pub enum DisputeError {
+    #[error("only an operator is answered: a device of an account that has stake")]
+    NotAnOperator,
+    #[error("an operator cannot dispute its own batch")]
+    OwnBatch,
+    #[error("there is no batch with that number")]
+    NoSuchBatch,
+    #[error("the batch was already disputed")]
+    AlreadyDisputed,
+    #[error("the batch's dispute window has closed")]
+    WindowClosed,
+    #[error("the batch holds: the records give what was posted")]
+    BatchHolds,
+    #[error("the batch does not hold, and the records do not give what the dispute says either")]
+    Differs,
     #[error(transparent)]
     Storage(#[from] io::Error),
 }
@@ -155,10 +179,12 @@ pub struct Coordinator {
     sealing_log: Log,
     /// How long a stored blob goes between challenges, in seconds.
     challenge_interval: u64,
+    /// How long after a batch is posted it may be disputed, in seconds.
+    dispute_window: u64,
 }
 
 impl Coordinator {
-    pub fn open(data_dir: &Path, challenge_interval: u64) -> io::Result<Self> {
+    pub fn open(data_dir: &Path, challenge_interval: u64, dispute_window: u64) -> io::Result<Self> {
         fs::create_dir_all(data_dir)?;
 
         let mut accounts = Accounts::default();
@@ -269,6 +295,7 @@ impl Coordinator {
             sealing_keys,
             sealing_log,
             challenge_interval,
+            dispute_window,
         })
     }
 
@@ -292,12 +319,128 @@ impl Coordinator {
         let Some(batch) = self.settlement.next_batch(new, &holdings, through) else {
             return;
         };
-        let entry = self.settlement.entry(now, Posted::Batch(batch));
+        self.post(now, Posted::Batch(batch));
+    }
+
+    /// Signs an entry and adds it to the settlement log.
+    fn post(&mut self, now: u64, posted: Posted) {
+        let entry = self.settlement.entry(now, posted);
         let entry = Envelope::seal(&self.operator, &entry);
         self.settlement
             .apply(&entry)
-            .expect("the coordinator's own batch follows the log's rules");
+            .expect("the coordinator's own entry follows the log's rules");
         self.settlement_log.append(&entry);
+    }
+
+    /// The account the operator's key is a device of, if it has been approved
+    /// into one. That account's stake is the operator's stake.
+    pub fn operator_account(&self) -> Option<AccountId> {
+        let account = self.accounts.account_of(&self.operator.public_key());
+        account.map(|account| account.id)
+    }
+
+    /// Whether the last batch this operator posted can still be disputed.
+    pub fn has_open_batch(&self, now: u64) -> bool {
+        let last = self.settlement.batches().len().checked_sub(1);
+        let posted_at = last.and_then(|last| self.settlement.posted_at(last as u64));
+        posted_at.is_some_and(|at| now <= at + self.dispute_window)
+    }
+
+    /// Whether `account` is an operator's: one with stake (spec section 6:
+    /// "Several staked operators run coordinators").
+    fn is_operator(&self, account: &AccountId) -> bool {
+        self.ledger.balance(account).staked > Credits::ZERO
+    }
+
+    /// Hands another operator a page of the records behind this one's batches,
+    /// from the places `from` gives, so that it can audit them.
+    pub fn records(&self, asker: &AccountId, from: Through) -> Result<BatchRecords, DisputeError> {
+        if !self.is_operator(asker) {
+            return Err(DisputeError::NotAnOperator);
+        }
+        Ok(BatchRecords {
+            ops: read(self.ops.range(from.ops, MAX_LOG_PAGE)?)?,
+            entries: read(self.ledger_log.range(from.entries, MAX_LOG_PAGE)?)?,
+            receipts: self.receipts.range(from.receipts, MAX_LOG_PAGE)?,
+        })
+    }
+
+    /// Judges another operator's dispute of a batch, as the ledger would: the
+    /// batch is worked out again from the records behind it. If it does not
+    /// hold, and the records give what the dispute says, the dispute goes into
+    /// the log and this operator's whole stake is forfeited (spec section 6:
+    /// "An operator that posts a bad batch forfeits stake").
+    pub fn dispute(
+        &mut self,
+        request: &Envelope,
+        asker: &AccountId,
+        batch: u64,
+        found: (ContentHash, &[Change]),
+        now: u64,
+    ) -> Result<(), DisputeError> {
+        if !self.is_operator(asker) {
+            return Err(DisputeError::NotAnOperator);
+        }
+        if Some(*asker) == self.operator_account() {
+            return Err(DisputeError::OwnBatch);
+        }
+        let posted_at = self.settlement.posted_at(batch);
+        let posted_at = posted_at.ok_or(DisputeError::NoSuchBatch)?;
+        if self.settlement.is_disputed(batch) {
+            return Err(DisputeError::AlreadyDisputed);
+        }
+        if now > posted_at + self.dispute_window {
+            return Err(DisputeError::WindowClosed);
+        }
+        let finding = self.audit_own(batch)?.ok_or(DisputeError::BatchHolds)?;
+        if (finding.fingerprint, finding.changes.as_slice()) != found {
+            return Err(DisputeError::Differs);
+        }
+
+        let upheld = UpheldDispute {
+            request: request.clone(),
+        };
+        self.post(now, Posted::Dispute(upheld));
+        if let Some(account) = self.operator_account() {
+            let amount = self.ledger.balance(&account).staked;
+            self.record(LedgerEntry::Forfeit { account, amount })
+                .expect("a forfeit takes only what is staked");
+        }
+        // The next batch puts right what the bad one got wrong, and carries
+        // the forfeit. Post it now rather than at the end of the period.
+        self.post_batch(now);
+        Ok(())
+    }
+
+    /// Audits one of this coordinator's own batches from its own records, the
+    /// way another operator does, and answers with what it should have been
+    /// if it does not hold.
+    fn audit_own(&self, batch: u64) -> io::Result<Option<Finding>> {
+        let invalid = |error: String| io::Error::new(io::ErrorKind::InvalidData, error);
+        let ops: Vec<Envelope> = read(self.ops.range(0, usize::MAX)?)?;
+        let entries: Vec<LedgerEntry> = read(self.ledger_log.range(0, usize::MAX)?)?;
+        let receipts = self.receipts.range(0, usize::MAX)?;
+
+        let mut auditor = Auditor::default();
+        let log: Vec<Envelope> = read(self.settlement_log.range(0, usize::MAX)?)?;
+        for entry in &log {
+            let reach = Auditor::reach(entry).map_err(|error| invalid(error.to_string()))?;
+            let from = auditor.log().through();
+            let records = match reach {
+                Some(to) => BatchRecords {
+                    ops: span(&ops, from.ops, to.ops),
+                    entries: span(&entries, from.entries, to.entries),
+                    receipts: span(&receipts, from.receipts, to.receipts),
+                },
+                None => BatchRecords::default(),
+            };
+            let finding = auditor.audit(entry, &records);
+            let finding = finding.map_err(|error| invalid(error.to_string()))?;
+            if reach.is_some() && auditor.log().batches().len() as u64 == batch + 1 {
+                return Ok(finding);
+            }
+        }
+        Ok(None)
     }
 
     /// Takes in the newest round of public randomness. Nodes are drawn for
@@ -308,11 +451,8 @@ impl Coordinator {
 
     /// Up to `MAX_LOG_PAGE` of the draws published so far, from number `from` on.
     pub fn draws_page(&self, from: u64) -> io::Result<LogPage> {
-        let lines = self.draws_log.range(from, MAX_LOG_PAGE)?;
-        let entries = lines.iter().map(|line| serde_json::from_str(line));
-        Ok(LogPage {
-            entries: entries.collect::<Result<_, _>>()?,
-        })
+        let entries = read(self.draws_log.range(from, MAX_LOG_PAGE)?)?;
+        Ok(LogPage { entries })
     }
 
     /// What sits at every ledger address now.
@@ -322,11 +462,8 @@ impl Coordinator {
 
     /// Up to `MAX_LOG_PAGE` entries of the settlement log, from entry `from` on.
     pub fn log_page(&self, from: u64) -> io::Result<LogPage> {
-        let lines = self.settlement_log.range(from, MAX_LOG_PAGE)?;
-        let entries = lines.iter().map(|line| serde_json::from_str(line));
-        Ok(LogPage {
-            entries: entries.collect::<Result<_, _>>()?,
-        })
+        let entries = read(self.settlement_log.range(from, MAX_LOG_PAGE)?)?;
+        Ok(LogPage { entries })
     }
 
     /// Proof that a job's receipt is in a batch (spec section 6: "Any node can
@@ -960,6 +1097,19 @@ impl Coordinator {
         self.record(LedgerEntry::Forfeit { account, amount })
             .expect("a forfeit takes only what is staked");
     }
+}
+
+/// Reads the lines of a log as entries.
+fn read<T: DeserializeOwned>(lines: Vec<String>) -> io::Result<Vec<T>> {
+    let entries = lines.iter().map(|line| serde_json::from_str(line));
+    Ok(entries.collect::<Result<_, _>>()?)
+}
+
+/// The part of `all` from place `from` up to place `to`, as far as it goes.
+fn span<T: Clone>(all: &[T], from: u64, to: u64) -> Vec<T> {
+    let to = usize::try_from(to).unwrap_or(usize::MAX).min(all.len());
+    let from = usize::try_from(from).unwrap_or(usize::MAX).min(to);
+    all[from..to].to_vec()
 }
 
 /// What a line of `receipts.jsonl` is read for at startup: the job it is the
