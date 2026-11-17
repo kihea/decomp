@@ -14,13 +14,17 @@
 //! so every kind of device seals the same way.
 //!
 //! Sealing hides what is sent, not who sent it. A sender signs what it sends.
+//!
+//! A job seals too (spec section 7, the host function `seal`), but a job may not
+//! draw a key at random: every node that runs it must produce the same bytes.
+//! [`seal_fixed`] is sealing for that case.
 
 use std::collections::HashMap;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{OpeningKey, PublicKey, SealingKey, Signature, SigningKey};
@@ -86,7 +90,42 @@ const NONCE: [u8; 12] = [0; 12];
 /// Seals `message` so that only the holder of `to`'s opening key can read it.
 /// `None` if `to` is not a usable key.
 pub fn seal(to: &SealingKey, message: &[u8]) -> Option<Vec<u8>> {
-    let once = OpeningKey::generate();
+    seal_with(&OpeningKey::generate(), to, message)
+}
+
+/// Mixed into the one-time key `seal_fixed` works out, so it is no use for
+/// anything else.
+const FIXED_KEY_PURPOSE: &[u8] = b"decomp/v1 seal with a fixed key\n";
+
+/// Seals `message` to `to` as `seal` does, except that the one-time key is not
+/// drawn at random: it is worked out from `seed`, `to`, and the message itself.
+/// The same three always give the same bytes, which `open` opens like any
+/// other sealed message.
+///
+/// The message is part of what the key is worked out from because a one-time
+/// key must never seal two different messages; here a different message is a
+/// different key.
+///
+/// This is weaker than `seal` in one way. Someone who knows the seed and has a
+/// guess at the message can seal the guess and see whether the bytes match. So
+/// it hides a message from those who could not guess it, and from everyone who
+/// does not know the seed.
+pub fn seal_fixed(seed: &[u8; 32], to: &SealingKey, message: &[u8]) -> Option<Vec<u8>> {
+    let mut hasher = Sha256::new();
+    hasher.update(FIXED_KEY_PURPOSE);
+    hasher.update(seed);
+    hasher.update(to.as_bytes());
+    hasher.update(message);
+    seal_with(
+        &OpeningKey::from_seed(hasher.finalize().into()),
+        to,
+        message,
+    )
+}
+
+/// Seals `message` to `to` with the one-time key `once`, which must seal
+/// nothing else.
+fn seal_with(once: &OpeningKey, to: &SealingKey, message: &[u8]) -> Option<Vec<u8>> {
     let cipher = cipher(&once.shared_with(to)?, &once.sealing_key(), to);
     let encrypted = cipher
         .encrypt(&Nonce::from(NONCE), message)

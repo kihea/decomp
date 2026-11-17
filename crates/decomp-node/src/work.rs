@@ -43,6 +43,8 @@ pub fn work(
         seed: *assignment.seed.as_bytes(),
         blobs: &blobs,
         state: shard.as_deref(),
+        // A node opens nothing: it holds no key of the user whose job this is.
+        opening_key: None,
     });
 
     let result = JobResult {

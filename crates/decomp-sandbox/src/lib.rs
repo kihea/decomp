@@ -28,15 +28,24 @@
 //! | `output.write` | `(src, len)` | Appends `len` bytes at `src` to the job output |
 //! | `hash` | `(src, len, dest)` | Writes the SHA-256 hash of `len` bytes at `src` to the 32 bytes at `dest` |
 //! | `sig.verify` | `(key, message, len, signature) -> valid` | 1 if the 64 bytes at `signature` are the Ed25519 signature, by the 32-byte public key at `key`, of the `len` bytes at `message`; otherwise 0 |
+//! | `seal` | `(key, src, len, dest) -> sealed` | Seals the `len` bytes at `src` to the 32-byte sealing key at `key`, writes the `len` + 48 sealed bytes at `dest`, and returns 1. Returns 0, and writes nothing, if `key` is not a usable key |
+//! | `open` | `(src, len) -> len` | Opens the `len` sealed bytes at `src` with the key of the device the job runs on, and returns the message's length as a 64-bit integer, or -1 if that key does not open them. `result.read` then copies the message |
 //! | `rand.seeded` | `(dest, len)` | Fills `len` bytes at `dest` from a stream fixed by the job's seed, so every node draws the same bytes |
 //! | `blob.get` | `(hash) -> len` | Looks up the blob whose SHA-256 hash is the 32 bytes at `hash` among those the job was given to read, and returns its length as a 64-bit integer, or -1 if it is not one of them. `result.read` then copies it |
 //! | `blob.put` | `(src, len, dest)` | Stores the `len` bytes at `src` as a blob and writes its hash to the 32 bytes at `dest`. The blob is kept only if the job completes |
 //! | `kv.get` | `(key, len) -> len` | Looks up the record whose key is the `len` bytes at `key`, in the shard of state the job was handed, and returns its value's length as a 64-bit integer, or -1 if there is no such record. `result.read` then copies the value |
 //! | `kv.put` | `(key, key_len, value, value_len)` | Sets the record with that key to that value. The change is kept only if the job completes |
 //! | `kv.scan` | `(prefix, len) -> len` | Gathers the records whose keys start with the `len` bytes at `prefix`, in the byte form `decomp_schema::records` defines, and returns its length as a 64-bit integer. `result.read` then copies it |
-//! | `result.read` | `(dest)` | Copies what the last `blob.get`, `kv.get`, or `kv.scan` found into memory at `dest` |
+//! | `result.read` | `(dest)` | Copies what the last `open`, `blob.get`, `kv.get`, or `kv.scan` found into memory at `dest` |
 //!
 //! The three `kv` functions end a job that was handed no shard.
+//!
+//! `seal` must give every node the same bytes, so it draws nothing at random:
+//! what it does is fixed by the job's seed, the key, and the message (see
+//! `decomp_core::seal::seal_fixed`, which also says what that costs). `open`
+//! opens only on a device that was given a key to open with, which is a device
+//! running its own user's private job. A node has no such key, so on a node
+//! `open` returns -1 whatever it is given, and every node agrees.
 //!
 //! | Function | Signature | Effect |
 //! | --- | --- | --- |
@@ -46,7 +55,10 @@ mod meter;
 
 use std::collections::HashMap;
 
-use decomp_core::{ContentHash, MAX_SPAWNED, PublicKey, Signature};
+use decomp_core::{
+    ContentHash, MAX_SPAWNED, OpeningKey, PublicKey, SEAL_OVERHEAD_BYTES, SealingKey, Signature,
+    seal,
+};
 use decomp_schema::records::{self, Records, record_bytes};
 use sha2::{Digest, Sha256};
 use wasmtime::{
@@ -78,6 +90,11 @@ const HOST_INSTRUCTIONS_PER_BYTE: u64 = 1;
 /// Instructions charged for checking one signature, on top of the bytes read.
 /// Checking takes the host roughly as long as this many instructions take a module.
 const SIGNATURE_CHECK_INSTRUCTIONS: u64 = 500_000;
+
+/// Instructions charged for sealing or opening one message, on top of the bytes
+/// read. Each is one or two operations on a curve, as checking a signature is, so
+/// it is charged the same; it has not been measured on its own.
+const SEAL_INSTRUCTIONS: u64 = SIGNATURE_CHECK_INSTRUCTIONS;
 
 /// The most a job may hand back in all: its output and the blobs it stores. A
 /// job holds no more than a slot's memory, so it has no use for more, and without
@@ -118,6 +135,10 @@ pub struct Job<'a> {
     /// The records of the shard of state the job is handed, in their byte form.
     /// `None` if it is handed no shard.
     pub state: Option<&'a [u8]>,
+    /// The key the job's `open` opens with. A device gives its own when it runs
+    /// a private job of its own user. A node is given no user's key, and neither
+    /// is anyone who re-runs a job to check one, so they give `None`.
+    pub opening_key: Option<&'a OpeningKey>,
 }
 
 /// Blobs by the hash of their contents.
@@ -244,13 +265,15 @@ struct State {
     seed: [u8; 32],
     /// How many blocks of the job's random stream have been drawn.
     random_blocks_drawn: u64,
+    /// The key `open` opens with, if the job was given one.
+    opening_key: Option<OpeningKey>,
 }
 
 /// What `result.read` copies next.
 enum Found {
     /// One of the blobs the job may read.
     Blob(ContentHash),
-    /// A record's value, or the byte form of several records.
+    /// A record's value, the byte form of several records, or an opened message.
     Bytes(Vec<u8>),
 }
 
@@ -289,6 +312,8 @@ impl Sandbox {
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "output.write", output_write))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "hash", hash))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "sig.verify", sig_verify))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "seal", seal_message))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "open", open_message))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "rand.seeded", rand_seeded))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "blob.get", blob_get))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "blob.put", blob_put))
@@ -346,6 +371,7 @@ impl Sandbox {
             seed: [0; 32],
             blobs: &Blobs::new(),
             state: None,
+            opening_key: None,
         };
         match self.execute(&job, SIGNATURE_EXPORT, None) {
             Ok(run) => Ok(run.result.ok().map(|produced| produced.output)),
@@ -410,6 +436,7 @@ impl Sandbox {
             stop_after,
             seed: job.seed,
             random_blocks_drawn: 0,
+            opening_key: job.opening_key.map(|key| OpeningKey::from_seed(key.seed())),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -719,6 +746,43 @@ fn sig_verify(
     let signature =
         Signature::from_bytes(range(memory, signature, 64)?.try_into().expect("64 bytes"));
     Ok(key.verifies(range(memory, message, len as usize)?, &signature) as u32)
+}
+
+/// Seals a message to a key. The job's seed stands in for the randomness
+/// sealing would otherwise draw, so every node writes the same bytes.
+fn seal_message(
+    mut caller: Caller<'_, State>,
+    key: u32,
+    src: u32,
+    len: u32,
+    dest: u32,
+) -> wasmtime::Result<u32> {
+    let (memory, state) = memory_and_state(&mut caller);
+    charge(state, SEAL_INSTRUCTIONS)?;
+    charge_for_bytes(state, len as usize)?;
+    let key = SealingKey::from_bytes(range(memory, key, 32)?.try_into().expect("32 bytes"));
+    let message = range(memory, src, len as usize)?;
+    let Some(sealed) = seal::seal_fixed(&state.seed, &key, message) else {
+        return Ok(0);
+    };
+    range_mut(memory, dest, len as usize + SEAL_OVERHEAD_BYTES)?.copy_from_slice(&sealed);
+    Ok(1)
+}
+
+/// Opens a sealed message with the key the job was given to open with, if it
+/// was given one, for `result.read` to copy.
+fn open_message(mut caller: Caller<'_, State>, src: u32, len: u32) -> wasmtime::Result<i64> {
+    let (memory, state) = memory_and_state(&mut caller);
+    charge(state, SEAL_INSTRUCTIONS)?;
+    charge_for_bytes(state, len as usize)?;
+    let sealed = range(memory, src, len as usize)?;
+    let opened = state
+        .opening_key
+        .as_ref()
+        .and_then(|key| seal::open(key, sealed));
+    let found = opened.as_ref().map_or(-1, |message| message.len() as i64);
+    state.found = opened.map(Found::Bytes);
+    Ok(found)
 }
 
 /// Fills the module's buffer from the job's random stream: block `n` of the

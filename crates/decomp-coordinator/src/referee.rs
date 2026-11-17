@@ -53,6 +53,8 @@ pub fn referee(sandbox: &Sandbox, case: &Case) -> Verdict {
         seed: *case.job_id.as_bytes(),
         blobs: &case.blobs,
         state: case.shard.as_deref(),
+        // The referee re-runs a job as a node ran it, and a node has no key.
+        opening_key: None,
     };
     let mut standing: Vec<usize> = (0..case.reports.len()).collect();
     let mut units = 0;

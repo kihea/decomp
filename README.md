@@ -90,8 +90,8 @@ disputes**.
   its account a tenth of its stake.
 
 Also built, from build step 7: host functions a job can call (SHA-256 hashing,
-Ed25519 signature checks, randomness fixed by the job, so every node draws the
-same bytes, and reading and storing blobs), and a check of a job's input against
+Ed25519 signature checks, sealing and opening, randomness fixed by the job, so
+every node draws the same bytes, and reading and storing blobs), and a check of a job's input against
 the types its module declares, made when the job is submitted and before any
 node runs it. A job reads the blobs its manifest names, and the blobs it stores
 are part of its result, so nodes are held to them like the output.
@@ -198,6 +198,15 @@ between them.
   `NoPrivateRoute` before anything is sent. The coordinator applies the same
   rule to what it is sent, so no node is handed a private job that came by no
   route.
+- **Sealing inside a job.** A job can seal a message to a key with `seal`, so
+  that only the device holding the opening key that goes with it can read the
+  result. Every node that runs the job seals to the same bytes.
+- A job can ask to `open` a sealed message. A private job run by the local
+  route opens what was sealed to the device it runs on. A node holds no user's
+  key, so on a node `open` answers that it cannot, whatever it is given.
+- Run with the command-line node: a message sealed by a job on two nodes, which
+  agreed on the bytes, was opened by a private job on the device it was sealed
+  to, and by no other device. The TypeScript client was not used to open one.
 
 ## Layout
 
@@ -472,6 +481,41 @@ compute price implies. They are `CREDITS_PER_GIB_DAY` in
 `crates/decomp-core/src/storage.rs` and `CREDITS_PER_GIB_RELAYED` in
 `crates/decomp-core/src/relay.rs`, and the owner has not yet confirmed them.
 
+**What `seal` and `open` do inside a job, and why.** The spec lists both among
+the host functions and says "Sealing encrypts to a user's key". Two things
+about a job decide what they can be.
+
+Every node must produce the same bytes, and a job has no randomness but what
+its seed fixes. Ordinary sealing draws a new key pair for each message. Inside
+a job that one-time key is worked out instead: it is the SHA-256 hash of a
+label, the job's seed, the receiving key, and the message. Everything after
+that is ordinary sealing, so a device opens the result as it opens anything
+else sealed to it. The message is part of the hash for a reason. The cipher
+uses a fixed nonce, which is safe only while each one-time key seals one
+message. A key made from the seed and a counter would seal two different
+messages under one key whenever two runs had the same seed, and every run on a
+device alone has the same seed.
+
+Bytes that are fixed can be worked out again, and that is what sealing in a job
+gives up. Someone who knows the job's ID and the receiving key, and can guess
+the message, can seal the guess and compare. The nodes that ran the job had
+the message to begin with, and anyone holding an open job's module and input
+can run it again. So `seal` protects a message after the job, where it is
+stored and carried, from those who never had the job's input. It does not hide
+anything from the nodes that run the job. Hiding data from them is what the
+private routes are for.
+
+A node holds no user's opening key, and must not. So `open` is given no key by
+the job: it opens with a key the device running the job was given for it. The
+command-line node gives its own opening key to a private job it runs by the
+local route, and to nothing else. Nodes, the referee, and an open job run on a
+device alone are given none. There `open` answers "cannot be opened" for any
+input, and charges the same, so every node agrees and results still compare.
+
+Each costs a job what checking a signature does, and one instruction more for
+each byte (`SEAL_INSTRUCTIONS` in `crates/decomp-sandbox/src/lib.rs`). That
+figure was not measured for sealing itself.
+
 **A module declares its own privacy.** The mode is part of the description a
 module gives of itself, next to its types, because it is a property of the code:
 a private job is one written with private types. The manifest repeats it, as the
@@ -538,7 +582,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | An app's manifest lists no permissions or schemas | The one permission so far follows from the list of modules: only the app's own modules may be handed its state. Each module describes its own types. | With the first permission that cannot be read off the modules |
 | What an app has set aside for an account today is kept in memory | A restart forgets it, so a daily cap can be passed once for each restart. It counts the highest possible fee of each job, not what the job cost. | Settlement, build step 13 |
 | A daily cap limits an account, not a person | Accounts are free to make, so someone can get around an app's cap with new ones. What the app's account holds is the real limit. | Sign-in, build step 14 |
-| One host function is missing | Sealing data to a key. | Private mode, build step 9 |
+| A job seals to one device, not to a user | The spec's sealing "encrypts to a user's key". The sealing keys there are belong to devices, so what a job seals can be opened on one device, and a private job run by the local route opens only what was sealed to the device it runs on. | Keys that no single party holds, later in build step 9 |
 | A follow-up job gets less than a submitted one | Its input is not checked against its module's types before it runs, so a wrong one fails when run. It cannot be split or handed state. | With the first app that needs any of these |
 | A job reads and writes its whole shard | Every job on a shard fetches all its records and stores all of them again, which is why a shard is capped at 8 MiB. | A hash tree over the records, if apps need larger shards |
 | Every past version of a shard is kept | Each is a blob on the coordinator, and nothing removes old ones. | With job blobs moving to node storage |

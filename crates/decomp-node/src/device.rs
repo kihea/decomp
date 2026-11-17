@@ -14,11 +14,16 @@ pub fn load(dir: &Path) -> io::Result<Option<SigningKey>> {
     Ok(read_seed(&dir.join(KEY_FILE))?.map(SigningKey::from_seed))
 }
 
+/// The key this device opens sealed data with, if it has made one.
+pub fn opening_key_if_made(dir: &Path) -> io::Result<Option<OpeningKey>> {
+    Ok(read_seed(&dir.join(OPENING_KEY_FILE))?.map(OpeningKey::from_seed))
+}
+
 /// The key this device opens sealed data with. One is made the first time it is
 /// asked for.
 pub fn opening_key(dir: &Path) -> io::Result<OpeningKey> {
-    if let Some(seed) = read_seed(&dir.join(OPENING_KEY_FILE))? {
-        return Ok(OpeningKey::from_seed(seed));
+    if let Some(key) = opening_key_if_made(dir)? {
+        return Ok(key);
     }
     let key = OpeningKey::generate();
     save_seed(dir, OPENING_KEY_FILE, &key.seed())?;

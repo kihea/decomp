@@ -256,11 +256,11 @@ fn main() -> ExitCode {
                 state,
                 follow_up_credits,
             };
-            submit(&client, job, limits)
+            submit(&client, &cli.dir, job, limits)
         }),
         Command::State { shard } => connect().and_then(|client| show_state(&client, shard)),
         Command::Run { job } => {
-            read_job(&job).and_then(|files| run_here(&Sandbox::new(), &job, &files))
+            read_job(&job).and_then(|files| run_here(&Sandbox::new(), &cli.dir, &job, &files))
         }
     };
     outcome.unwrap_or_else(|error| {
@@ -440,7 +440,12 @@ fn show_state(client: &Client, shard: ShardRef) -> Result<ExitCode, Box<dyn Erro
     Ok(ExitCode::SUCCESS)
 }
 
-fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box<dyn Error>> {
+fn submit(
+    client: &Client,
+    dir: &Path,
+    job: JobArgs,
+    limits: Limits,
+) -> Result<ExitCode, Box<dyn Error>> {
     let Limits {
         deadline_secs,
         redundancy,
@@ -459,7 +464,7 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
         // "The SDK takes the first route that fits and reports which one it used."
         let fits_device = job.compute_cap <= LOCAL_ROUTE_MAX_UNITS;
         return match privacy::route(fits_device)? {
-            PrivateRoute::Local => run_here(&sandbox, &job, &files),
+            PrivateRoute::Local => run_here(&sandbox, dir, &job, &files),
         };
     }
     let JobFiles {
@@ -638,6 +643,7 @@ fn receive(
 /// verification" (spec section 7), and nothing of the job reaches a node.
 fn run_here(
     sandbox: &Sandbox,
+    dir: &Path,
     job: &JobArgs,
     files: &JobFiles,
 ) -> Result<ExitCode, Box<dyn Error>> {
@@ -657,6 +663,14 @@ fn run_here(
             .check_input(input)
             .map_err(|mismatch| mismatch.to_string())?;
     }
+    // A private job run here is this device's own user's, so what was sealed to
+    // this device is the job's to open. An open job gets no key here, as it
+    // gets none on a node.
+    let opening_key = if private {
+        device::opening_key_if_made(dir)?
+    } else {
+        None
+    };
     // Off the network a job has no ID to draw its randomness from, so the seed is
     // fixed: every local run of a job draws the same bytes.
     let run = sandbox.run(&Job {
@@ -667,6 +681,7 @@ fn run_here(
         blobs,
         // Nor is there any state to hand it.
         state: None,
+        opening_key: opening_key.as_ref(),
     })?;
 
     println!("module  {}", ContentHash::of(module));
