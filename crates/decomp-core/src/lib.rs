@@ -5,6 +5,7 @@
 
 mod account;
 mod app;
+pub mod encrypted;
 mod envelope;
 mod hosts;
 mod job;
@@ -26,6 +27,7 @@ pub use account::{Account, AccountOp, Accounts, Device, OpError};
 pub use app::{
     AppManifest, MAX_APP_MODULES, MAX_APP_NAME_BYTES, SponsorError, Sponsored, Sponsorship,
 };
+pub use encrypted::{EncryptError, Encrypted, EncryptionKey};
 pub use envelope::{Envelope, EnvelopeError};
 pub use hosts::{Host, Hosts};
 pub use job::{
@@ -41,7 +43,9 @@ pub use ledger::{
     BASE_PRICE, Balance, Credits, FeeSplit, Ledger, LedgerEntry, LedgerError,
     PROBATION_FORFEIT_PERCENT, STARTER_GRANT, fee,
 };
-pub use privacy::{NoPrivateRoute, Privacy, PrivacyError, PrivateRoute};
+pub use privacy::{
+    ENCRYPTED_COMPUTE_MAX_UNITS, NoPrivateRoute, Privacy, PrivacyError, PrivateRoute,
+};
 pub use relay::{
     CHANNEL_SECS, CREDITS_PER_GIB_RELAYED, Checked, FRAME_BYTES, Frame, FrameError, FrameHeader,
     Incoming, LISTEN_WINDOW_SECS, MAX_CHANNEL_BYTES, Opening, REDEEM_GRACE_SECS, RelayEntry,

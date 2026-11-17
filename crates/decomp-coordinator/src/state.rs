@@ -381,8 +381,9 @@ impl Coordinator {
     /// Refuses a job that is not what its module says of itself: one in another
     /// privacy mode than the module declares, or a private one that no route
     /// lets nodes run (see `privacy`), or one whose input does not fit the types
-    /// the module says its job takes (spec section 7, "Typing"). A module that
-    /// does not describe itself is open and takes any input.
+    /// the module says its job takes (spec section 7, "Typing"), in the form
+    /// its route hands them to nodes. A module that does not describe itself is
+    /// open and takes any input.
     fn check_against_module(
         &mut self,
         manifest: &Manifest,
@@ -403,9 +404,7 @@ impl Coordinator {
             return Err(SubmitError::TypedJobSplitByBytes);
         }
         let input = self.blobs.get(&manifest.input)?.unwrap_or_default();
-        signature
-            .check_input(&input)
-            .map_err(SubmitError::TypeMismatch)
+        privacy::check_input(manifest, signature, &input).map_err(SubmitError::TypeMismatch)
     }
 
     /// Where a job stands, for the account that submitted it.

@@ -183,7 +183,7 @@ between them.
   cover are not started. They keep the asking job's deadline, node count, and
   payer, and belong to the same submitter.
 
-**Private jobs** (the first half of build step 9).
+**Private jobs** (build step 9).
 
 - A job is open or private. The nodes that run an open job can read its data;
   of a private job the spec promises that "no node ever sees the data
@@ -191,7 +191,7 @@ between them.
   description it gives of itself, and a job's manifest must say the same. The
   coordinator refuses a job whose manifest and module disagree.
 - A device runs a private job by "the first route that fits", and says which
-  it used. There are two routes so far.
+  it used. There are three routes.
 - **Local** is taken when "the job fits the user's device": the module runs
   there, with no verification, and nothing of the job reaches a node or the
   coordinator.
@@ -207,10 +207,28 @@ between them.
   agree, and a referee settles it if they do not.
 - Nodes do see every value that is not marked private, and how many private
   numbers there are.
-- A private job that no route fits is not run. `submit` stops with the spec's
-  `NoPrivateRoute` before anything is sent. The coordinator applies the same
-  rule to what it is sent, so no node is handed a private job that came by no
-  route.
+- **Encrypted compute** is taken last, for "any other job, up to a size cap".
+  "Encrypted compute uses homomorphic encryption, so a node computes on values
+  it cannot read." The device makes a key for the one job and encrypts every
+  private number and true-or-false value in the input. It submits the job on
+  that input, with the part of the key that lets nodes compute, and reads the
+  result with the part of the key that never left it.
+- A job on encrypted values is assigned, run, checked, and paid for like any
+  job. Two honest nodes return the same bytes, so the spec's "duplicate runs on
+  the encrypted values" check it, as they check an open job.
+- A job fits this route if its private values are all of the two kinds that
+  can be computed on while encrypted, and it is allowed no more than 256
+  compute units, which is the size cap. Nodes do see every value that is not
+  private, how many private values there are, and which are numbers.
+- It costs what the spec says it will, "100 to 100,000x". A node spends about 5
+  compute units getting the key ready and 1.25 on every gate between two
+  encrypted bits, where an open job would spend a few instructions. The cap
+  admits about 200 gates. "Design decisions" has the measurements.
+- A private job that no route fits is not run: one over the size cap, or one
+  with a private value that can be neither cut into shares nor computed on
+  encrypted. `submit` stops with the spec's `NoPrivateRoute` before anything is
+  sent. The coordinator applies the same rule to what it is sent, so no node is
+  handed a private job that came by no route.
 - **What every result reports.** "Each result carries a receipt with five
   fields: the privacy route used, how the result was verified, what it cost,
   how long it took, and whether an enclave was involved." A receipt already
@@ -234,12 +252,28 @@ between them.
   and expired. A fifth node that reported a wrong result for a share was found
   out by the referee. That a share is never reissued as a known-answer job was
   not seen in a run: such jobs come up one time in fifty.
+- Encrypted compute was run on the same four nodes, from release builds. A job
+  of one gate, on two private true-or-false values, ran on two nodes of two
+  accounts. Their signed reports name the same output, 7 units, and the same
+  checkpoints, and the device read the right answer from it. A rule of three
+  gates ran twice on two nodes, at 9 units, and was right both times. Asked
+  for one node, one ran the job, and the receipt says `unchecked`. Each receipt
+  names the route. What the nodes were handed held no
+  private value as it is.
+- A job over the cap, and one with another kind of private value, stopped with
+  `NoPrivateRoute` on the device, and the coordinator refused the same jobs
+  sent to it directly, and a job on the encrypted route whose private values
+  were sent as they are.
+- Arithmetic on encrypted numbers was not run on the network: see "Known
+  gaps". It was run in the sandbox on one machine, on input encrypted and
+  results read as `submit` does it: the higher of two private numbers, at 244
+  units, and a private number times a plain one less a plain one, each right.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage and relay rules, sealing, app state, private jobs and their routes, and every message shape. No I/O. |
+| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage and relay rules, sealing, app state, private jobs and their routes, cutting a private job's numbers into shares, encrypting its values for nodes that compute on them, and every message shape. No I/O. |
 | `crates/decomp-schema` | How a job's input and output types and its privacy mode are described and checked, and the byte form of a set of records. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
 | `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, and what it stores (logs, blobs). |
@@ -338,8 +372,16 @@ cargo run -p decomp-node -- run path/to/module.wasm --input path/to/input --comp
 A private job is sent with the same two commands, and each shows the route it
 took. `run` is the local route. `submit` takes the first route that fits: the
 local route for a job of one compute unit, which is then never sent anywhere,
-and private totals for a larger job that only adds up private numbers. Any
-other private job is refused with `NoPrivateRoute`.
+private totals for a larger job that only adds up private numbers, and
+encrypted compute for a larger job, of up to 256 units, whose private values
+can all be computed on while encrypted. Any other private job is refused with
+`NoPrivateRoute`.
+
+A job on encrypted values takes minutes where an open job takes milliseconds,
+so give it time with `--deadline-secs`, and run the nodes that are to take such
+jobs from a release build (`cargo run --release -p decomp-node -- start`). A
+debug build of the node took eleven minutes over seven units of such a job,
+and a release build 23 seconds.
 
 Coordinator settings are `DECOMP_ADDR`, `DECOMP_DATA_DIR`, and
 `DECOMP_STORAGE_CHALLENGE_SECS` (how often each node is asked to show that it
@@ -599,7 +641,8 @@ a module does anything else with a share.
 **A result by private totals is the same values, not the same bytes.** The
 device reads the shares' outputs as JSON, adds, and writes the result out
 again, and that writes a struct's fields in the order of their names. The
-local route gives the module's own bytes.
+local route gives the module's own bytes. A result by encrypted compute is
+written out the same way, once its private values have been read.
 
 **A share is checked as any job is, and the receipt says how.** The spec's
 table has this route "verified by duplicate runs on each share", and also says
@@ -635,6 +678,96 @@ to fit what the spec's tier table says any node can run: tier 0, a job of one
 compute unit (`LOCAL_ROUTE_MAX_UNITS` in `crates/decomp-node/src/main.rs`).
 `run` sets no limit, because there the user has said to use this device. The
 owner has not yet confirmed this value.
+
+The cap `submit` is given is what the job may use on nodes. A job on encrypted
+values needs hundreds of units there and a fraction of one on its user's
+device, where the values are plain, so a cap of one unit sends it nowhere and a
+larger one sends it to nodes.
+
+**Encrypted values are bits, encrypted with TFHE-rs.** The spec says only that
+"encrypted compute uses homomorphic encryption". DeComp uses TFHE-rs, the `tfhe`
+crate, at version 1.8.2 exactly, on the device and inside the job module. It is
+the homomorphic encryption library that is maintained in Rust and compiles to
+WebAssembly, and its kind of encryption cleans a value up at every gate, so a
+calculation can be as long as it likes: "Encrypted compute handles any
+calculation in principle." DeComp writes no cryptography of its own. It calls
+the library to make a key, to encrypt a bit, and to read one, with the
+library's default parameters for bits, which the library documents as 132 bits
+of security and a chance below 2^-64 that a gate gives the wrong bit.
+
+A private number is encrypted as its 32 bits, and a true-or-false value as one.
+What a module does with the bits is its own business. DeComp fixes how a value
+travels and nothing else (`crates/decomp-core/src/encrypted.rs`).
+
+The library's licence is BSD-3-Clause-Clear, which grants no patent rights, and
+its maker asks companies to buy a patent licence before using it commercially.
+That is the owner's to settle before this route is offered for money.
+
+**The sandbox was not changed for encrypted compute.** "Shares and encrypted
+values are ordinary bytes to a job." The library is compiled into the module,
+so computing on encrypted values is metered in compute units like everything
+else a module does, and a job gets its key as one of the blobs it is given to
+read. No host function was added.
+
+The sandbox already gives every node the same result for the same module and
+input. What had to be checked was that the library, inside it, has nothing left
+to vary. It does, unless a module settles it: it picks a Fourier transform by
+timing several, and a module has no clock, so a module must name the transform
+when it is built. With that done, two nodes' signed reports of a job named the
+same output and the same checkpoints, and two runs of a job in one sandbox
+gave the same bytes.
+
+**A key for each job.** The device makes a new key every time and keeps the
+part that reads values in memory until it has read the result. Nothing is
+stored, so there is no key to lose or to guard, and no two jobs can be seen to
+be one user's by the key they came with. It also bounds a known weakness of
+this kind of encryption: a node that returned values of its own making, and
+learned what the user did with the result, could learn something about the key.
+With a key for each job, that is at most a key that reads one job. The price is
+13 MB sent with every job, and about 5 compute units on every node to get the
+key ready.
+
+**An encrypted value names its key.** A module reads a blob by its hash, so it
+has to be told which blob holds its key. Every encrypted value starts with that
+hash. A module needs nothing but the job's own input to find the key, and a
+value under a key the job was not given fails the same way on every node.
+
+**The coordinator checks the form of an encrypted value, not the encryption.**
+On this route it refuses an input in which a private value is a plain number
+or `true` or `false`, which is what a device that forgot to encrypt would
+send. It cannot tell whether base64 text in a private value's place was
+encrypted well, and does not try: it holds no key.
+
+**The size cap is 256 units, for now.** The spec has the cap set from
+measurements: "Benchmark standard encrypted operations and set the size cap
+from the results." These were made on one computer, an AMD Ryzen 5 5500U,
+with a release build:
+
+| What | Compute units | Seconds |
+| --- | --- | --- |
+| Getting the key ready, once a job | 5.1 | 8 |
+| One gate between two encrypted bits | 1.25 | 2.6 |
+| The smallest job: two private true-or-false values, one gate | 6.3 | 11 |
+| The higher of two private 32-bit numbers: 191 gates | 243.6 | 540 |
+
+A gate is 12.5 billion WebAssembly instructions, where the same gate on plain
+bits is a handful. That is far past the spec's "100 to 100,000x", which is a
+figure for hardware built for the purpose: here the library runs in
+WebAssembly, on one thread, with no vector instructions. Counted in what a job
+is charged, the smallest job costs 7 units where an open job costs 1, and one
+comparison of two numbers, by its count of gates, about 165.
+
+So `ENCRYPTED_COMPUTE_MAX_UNITS` in `crates/decomp-core/src/privacy.rs` is 256:
+a job of about 200 gates, which is one addition, or one comparison and a
+choice, of two 32-bit numbers worked out bit by bit, and about nine minutes on
+each node. That is the far end of the spec's "network jobs finish in seconds to
+minutes". A job of 8 units or more is also of a tier that only staked nodes may
+take, so most jobs on this route are. The owner has not confirmed the cap.
+
+The same gates took 0.8 seconds each in the same WebAssembly engine without
+the sandbox's instruction counting and checkpoints. So about two thirds of an
+encrypted job's time is the sandbox's, which hashes the job's memory, key and
+all, at every checkpoint.
 
 ## Known gaps
 
@@ -686,8 +819,15 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | Every past version of a shard is kept | Each is a blob on the coordinator, and nothing removes old ones. | With job blobs moving to node storage |
 | Records have no declared types and cannot be removed | The SDK reads and writes them as JSON of whatever type the module asks for, and the spec lists no call to delete one. | With the first app that needs either |
 | A job run on this device alone is handed no state | `run` has no way to name a shard. | When someone needs to try a stateful module off the network |
-| A private job of more than one unit has no route unless it only adds up private numbers | Encrypted compute and the enclave route are not built. Such a job stops with `NoPrivateRoute`, or is run with `run`. | The other routes, later in build step 9 |
-| The coordinator can read every share | Job blobs are still held by the coordinator, so the inputs of both shares, and both outputs, pass through one party that could add them. The spec's promise is about nodes, and it holds for nodes; the spec also has jobs reach nodes "through relays under one-time IDs" and private values stored "with keys that no single party holds". | Those two, later in build step 9, and job blobs moving to node storage |
+| A private job over the size cap has no route | The spec lets such a job set `allow_enclave` and run in an attested enclave. That route needs attested nodes: see the last row. Such a job stops with `NoPrivateRoute`, or is run with `run`. | The enclave route, with attested nodes (build step 12) |
+| Arithmetic on encrypted numbers has not been run on the network | One comparison of two numbers is about 165 units. A job of 8 units or more goes only to nodes whose accounts have staked its cap, and has the most it can cost set aside up front, and no account on the check network holds that much. It was run in the sandbox on one machine instead, and only true-or-false jobs of up to 9 units were run on nodes. | A check network with more credits in it, or a lower price for a unit |
+| Two nodes agreeing on an encrypted job was seen on one machine only | The check network's nodes all run on one computer. WebAssembly fixes the result of every instruction the library uses, so other processors should agree, and it has not been seen. | Nodes on different hardware |
+| A dispute over an encrypted job has not been provoked | The referee runs a disputed job from the blobs the coordinator holds, the same for every job. The check that lies about a result is a new node, which is handed jobs of one unit only, and the smallest encrypted job is seven. | A lying node that is proven, or tests |
+| A job's key is made, sent, and got ready for every job | 13 MB up to the coordinator and down to each node, and about 5 compute units on each node, even for a job of one gate. A key kept for several jobs would save that, and would let a node tell that those jobs are one user's. | The owner's decision on that trade |
+| Only the command-line node encrypts | The TypeScript client knows the route's name and cannot encrypt for it or read a result. The library has a JavaScript build; nothing here uses it. | With the first app that runs a private job on encrypted values |
+| Nodes must be release builds to take encrypted jobs in time | A debug build of the node ran seven units of such a job in eleven minutes, and a release build in 23 seconds. Nothing tells the coordinator which a node is. | The hardware-fit score, build step 12 |
+| The homomorphic encryption library is free for research and prototypes only | TFHE-rs is under BSD-3-Clause-Clear, and its maker asks for a paid patent licence for commercial use. | The owner's decision, before this route is offered for money |
+| The coordinator can read every share | Job blobs are still held by the coordinator, so the inputs of both shares, and both outputs, pass through one party that could add them. The spec's promise is about nodes, and it holds for nodes. An encrypted job's values it cannot read, like anyone else without the key. | Job blobs moving to node storage |
 | One owner with nodes on two accounts can be handed both shares | Shares go to different accounts, and accounts are free to make. The spec lists this as an open risk: "Secret sharing fails if one owner controls all the nodes holding a job's shares". | Stake and sign-in raise the cost; measuring how concentrated node ownership is |
 | A share that is not run leaves the other paid for | The shares are jobs of their own. If one expires, is disputed, or is refused when submitted, the other still runs and is charged, and the device has no result. | A job of several parts that is paid for only as a whole |
 | Which accounts hold a job's shares is forgotten with the shares' jobs | Jobs are kept an hour after they close and not across a restart. A share submitted later than that could go to an account that held another. The command-line node submits a job's shares together. | Settlement, build step 13 |

@@ -11,6 +11,9 @@
 //!
 //! A description also says which of the two privacy modes the job was written
 //! for, and which of its values are private (spec section 7, "Privacy modes").
+//! The kinds of private value a job takes and returns decide which routes can
+//! run it away from its user's device: see `Signature::is_totals` and
+//! `Signature::is_encrypted`.
 
 pub mod records;
 
@@ -48,6 +51,17 @@ pub enum Schema {
     /// shares: numbers that each say nothing about it and that add up to it. A
     /// node may be handed one share.
     PrivateNumber,
+    /// A private whole number, from 0 up to but not including 2 to the power
+    /// `ENCRYPTED_NUMBER_BITS`, that a job can compute on while it is encrypted
+    /// (spec section 7: "Encrypted compute uses homomorphic encryption, so a
+    /// node computes on values it cannot read"). It is carried as a number
+    /// where its user's device holds it, and as base64 text where it is
+    /// encrypted, which is the only form a node may be handed.
+    EncryptedNumber,
+    /// A private true-or-false value that a job can compute on while it is
+    /// encrypted. It is carried as `true` or `false` where its user's device
+    /// holds it, and as base64 text where it is encrypted.
+    EncryptedBool,
 }
 
 /// One more than the largest private number. Sums of private numbers wrap around
@@ -55,6 +69,18 @@ pub enum Schema {
 /// every whole number below 2^53 comes through any JSON reader unchanged, also
 /// one that keeps all numbers as 64-bit floating point.
 pub const PRIVATE_NUMBER_MODULUS: u64 = 1 << 53;
+
+/// How many bits an encrypted private number has. Arithmetic on one wraps
+/// around at 2 to this power. What an operation on an encrypted number costs
+/// grows with its bits, so this also bounds what a job run on encrypted values
+/// costs for each operation.
+pub const ENCRYPTED_NUMBER_BITS: u32 = 32;
+
+/// How many bytes name the key an encrypted value is under. Each encrypted
+/// value starts with them, so that the job computing on it can find the key
+/// among the blobs it was given to read: the name is the hash of the blob that
+/// holds the key.
+pub const ENCRYPTION_KEY_NAME_BYTES: usize = 32;
 
 /// The mode a job runs in (spec section 2, the manifest's `privacy` field: "open
 /// or private"). An open job's data can be read by the nodes that run it. Of a
@@ -109,10 +135,23 @@ impl std::fmt::Display for Mismatch {
 }
 
 impl Signature {
-    /// Checks a job's input against the types the job takes.
+    /// Checks a job's input against the types the job takes, as the input is
+    /// on its user's device, and as nodes are handed it unless the job is run
+    /// by encrypted compute.
     pub fn check_input(&self, input: &[u8]) -> Result<(), Mismatch> {
+        self.check(input, Form::Clear)
+    }
+
+    /// Checks a job's input as nodes are handed it by encrypted compute: it
+    /// must fit the types the job takes, with every private value in it in its
+    /// encrypted form.
+    pub fn check_encrypted_input(&self, input: &[u8]) -> Result<(), Mismatch> {
+        self.check(input, Form::Encrypted)
+    }
+
+    fn check(&self, input: &[u8], form: Form) -> Result<(), Mismatch> {
         let value: Value = serde_json::from_slice(input).map_err(|_| Mismatch::NotJson)?;
-        Schema::Tuple(self.input.clone()).check(&value, &mut String::new())
+        Schema::Tuple(self.input.clone()).check(&value, form, &mut String::new())
     }
 
     /// Whether the job takes or returns private numbers and no private value of
@@ -121,13 +160,41 @@ impl Signature {
     /// job "only adds, counts, averages, or applies fixed weights" (spec section
     /// 7), and run on shares of its input it gives shares of its output.
     pub fn is_totals(&self) -> bool {
-        let values = || self.input.iter().chain([&self.output]);
-        values().any(|value| value.holds(&|part| *part == Schema::PrivateNumber))
-            && !values().any(|value| value.holds(&|part| matches!(part, Schema::Private(_))))
+        self.holds(&|part| *part == Schema::PrivateNumber)
+            && !self.holds(&|part| matches!(part, Schema::Private(_)) || part.is_encrypted())
+    }
+
+    /// Whether the job takes or returns private values that can be computed on
+    /// while encrypted, and no private value of any other kind. Such a job can
+    /// be run on encrypted values: "The code must use the SDK's private number
+    /// and true-or-false types" (spec section 7, "Limits of 'general'").
+    pub fn is_encrypted(&self) -> bool {
+        self.holds(&Schema::is_encrypted)
+            && !self.holds(&|part| matches!(part, Schema::Private(_) | Schema::PrivateNumber))
+    }
+
+    /// Whether anything the job takes or returns passes `test`.
+    fn holds(&self, test: &dyn Fn(&Schema) -> bool) -> bool {
+        let mut values = self.input.iter().chain([&self.output]);
+        values.any(|value| value.holds(test))
     }
 }
 
+/// The form a job's private values are in when its input is checked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// As the values are, which is how their user's device holds them.
+    Clear,
+    /// Encrypted, which is how nodes are handed a job run by encrypted compute.
+    Encrypted,
+}
+
 impl Schema {
+    /// Whether this is a private value that can be computed on while encrypted.
+    fn is_encrypted(&self) -> bool {
+        matches!(self, Self::EncryptedNumber | Self::EncryptedBool)
+    }
+
     /// Whether this schema, or any schema it is built from, passes `test`.
     fn holds(&self, test: &dyn Fn(&Schema) -> bool) -> bool {
         test(self)
@@ -141,9 +208,18 @@ impl Schema {
 
     /// Checks `value` against this schema. `path` is where `value` sits in the
     /// input; on a mismatch it is extended to name the part that is wrong.
-    fn check(&self, value: &Value, path: &mut String) -> Result<(), Mismatch> {
+    fn check(&self, value: &Value, form: Form, path: &mut String) -> Result<(), Mismatch> {
         let fits = match (self, value) {
-            (Self::Bool, Value::Bool(_)) => true,
+            // An encrypted value is base64 text, and must be nothing else where
+            // the input is on its way to nodes.
+            (Self::EncryptedNumber | Self::EncryptedBool, Value::String(text)) => {
+                form == Form::Encrypted && is_base64(text)
+            }
+            (Self::EncryptedNumber | Self::EncryptedBool, _) if form == Form::Encrypted => false,
+            (Self::EncryptedNumber, Value::Number(number)) => number
+                .as_u64()
+                .is_some_and(|number| number >> ENCRYPTED_NUMBER_BITS == 0),
+            (Self::Bool | Self::EncryptedBool, Value::Bool(_)) => true,
             (Self::Integer, Value::Number(number)) => number.is_i64() || number.is_u64(),
             (Self::PrivateNumber, Value::Number(number)) => number
                 .as_u64()
@@ -154,13 +230,14 @@ impl Schema {
             (Self::Enum(names), Value::String(name)) => names.contains(name),
             (Self::Option(_), Value::Null) => true,
             (Self::Option(inner) | Self::Private(inner), value) => {
-                return inner.check(value, path);
+                return inner.check(value, form, path);
             }
             (Self::List(item), Value::Array(values)) => {
-                return each(values.iter().map(|value| (item.as_ref(), value)), path);
+                let pairs = values.iter().map(|value| (item.as_ref(), value));
+                return each(pairs, form, path);
             }
             (Self::Tuple(items), Value::Array(values)) if items.len() == values.len() => {
-                return each(items.iter().zip(values), path);
+                return each(items.iter().zip(values), form, path);
             }
             (Self::Struct(fields), Value::Object(object)) if fields.len() == object.len() => {
                 for (name, field) in fields {
@@ -170,7 +247,7 @@ impl Schema {
                     let length = path.len();
                     path.push('.');
                     path.push_str(name);
-                    field.check(value, path)?;
+                    field.check(value, form, path)?;
                     path.truncate(length);
                 }
                 fields.keys().all(|name| object.contains_key(name))
@@ -188,12 +265,13 @@ impl Schema {
 /// Checks each value of an array against its schema.
 fn each<'a>(
     pairs: impl Iterator<Item = (&'a Schema, &'a Value)>,
+    form: Form,
     path: &mut String,
 ) -> Result<(), Mismatch> {
     for (index, (schema, value)) in pairs.enumerate() {
         let length = path.len();
         path.push_str(&format!("[{index}]"));
-        schema.check(value, path)?;
+        schema.check(value, form, path)?;
         path.truncate(length);
     }
     Ok(())

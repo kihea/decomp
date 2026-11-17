@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
-    AccountId, AccountStatus, AppManifest, ContentHash, Credits, JobId, JobStatus, Manifest,
-    OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey, Receipt, SHARES, ShardRef, Share,
-    ShareSet, Split, Sponsorship, Verification, merkle, privacy, shares,
+    AccountId, AccountStatus, AppManifest, ContentHash, Credits, Encrypted, JobId, JobStatus,
+    Manifest, OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey, Receipt, SHARES, ShardRef,
+    Share, ShareSet, Split, Sponsorship, Verification, encrypted, merkle, privacy, shares,
 };
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::deliver::{self, Delivered};
@@ -491,9 +491,12 @@ fn submit(
         }
         // A private job takes "the first route that fits" (spec section 7).
         let fits_device = job.compute_cap <= LOCAL_ROUTE_MAX_UNITS;
-        return match privacy::route(&signature, fits_device)? {
+        return match privacy::route(&signature, job.compute_cap, fits_device)? {
             PrivateRoute::Local => run_here(&sandbox, dir, &job, &files),
             PrivateRoute::PrivateTotals => submit_shares(client, &job, files, &signature, limits),
+            PrivateRoute::EncryptedCompute => {
+                submit_encrypted(client, &job, files, &signature, limits)
+            }
         };
     }
     let Limits {
@@ -664,6 +667,75 @@ fn submit_shares(
     }
     report_output(&shares::join(signature, &outputs)?, job.output.as_deref())?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Runs a private job by the encrypted compute route (spec section 7:
+/// "Encrypted compute uses homomorphic encryption, so a node computes on values
+/// it cannot read"). A key is made here for this one job, the private values in
+/// the input are encrypted under it, and the job is submitted on that input
+/// with the part of the key that nodes compute with. The result is read here
+/// with the part of the key that never left.
+fn submit_encrypted(
+    client: &Client,
+    job: &JobArgs,
+    files: JobFiles,
+    signature: &Signature,
+    limits: Limits,
+) -> Result<ExitCode, Box<dyn Error>> {
+    let Encrypted {
+        key,
+        computing_key,
+        input,
+    } = encrypted::encrypt(signature, &files.input)?;
+    let mut reads = vec![client.put_blob(computing_key)?];
+    for blob in files.blobs.into_values() {
+        reads.push(client.put_blob(blob)?);
+    }
+    let mut manifest = Manifest {
+        module: client.put_blob(files.module)?,
+        input: client.put_blob(input)?,
+        compute_cap: job.compute_cap,
+        deadline: unix_now() + limits.deadline_secs,
+        redundancy: limits.redundancy,
+        split: None,
+        max_fee: Credits::ZERO,
+        sponsor: limits.sponsor,
+        reads,
+        state: None,
+        privacy: Privacy::Private,
+        share: None,
+    };
+    manifest.max_fee = manifest.highest_fee();
+    println!("module  {}", manifest.module);
+    let job_id = client.submit_job(manifest)?;
+    println!("job     {job_id}");
+
+    let receipt = match wait_for(client, job_id)? {
+        Ok(receipt) => receipt,
+        Err(reason) => return fail(reason),
+    };
+    println!(
+        "units   {} on each of {} nodes",
+        receipt.units,
+        receipt.results.len()
+    );
+    Report {
+        route: "encrypted compute: nodes ran it on values only this device can read".into(),
+        checked: how_checked(receipt.verified),
+        fee: receipt.fee.total,
+        time: Duration::from_secs(receipt.seconds),
+        enclave: receipt.enclave,
+    }
+    .show();
+    match receipt.outcome {
+        Outcome::Completed { output, .. } => {
+            let returned = client.get_blob(output)?;
+            let output = encrypted::decrypt(signature, &key, &returned)?;
+            report_output(&output, job.output.as_deref())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Outcome::Failed { failure } => fail(&failure.to_string()),
+    }
 }
 
 /// Pays for a file to be held by nodes and sends it to each of them.

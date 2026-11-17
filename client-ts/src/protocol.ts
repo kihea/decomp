@@ -222,8 +222,13 @@ export type Outcome =
   | { status: 'completed'; output: string }
   | { status: 'failed'; failure: Failure };
 
-/** The private route a job was run by (`PrivateRoute`). */
-export type PrivateRoute = 'local' | 'private_totals';
+/**
+ * The private route a job was run by (`PrivateRoute`). A private job sent to
+ * nodes without a `share` is on the encrypted compute route: its private values
+ * must be encrypted as `decomp-core`'s `encrypted` module does, which this
+ * client does not do yet.
+ */
+export type PrivateRoute = 'local' | 'private_totals' | 'encrypted_compute';
 
 /**
  * How a job's result came to stand (`Verification`): two or more nodes agreed,

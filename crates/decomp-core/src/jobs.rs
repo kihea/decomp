@@ -21,7 +21,7 @@ use crate::job::{
 };
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, ShareSet};
 use crate::ledger::{Credits, FeeSplit, fee};
-use crate::privacy::PrivateRoute;
+use crate::privacy;
 use crate::scores::{Conduct, FIRST_STAKED_TIER, ScoreEvent, Standing};
 use crate::state::ShardRef;
 
@@ -488,8 +488,7 @@ impl Jobs {
                 .map(|report| report.envelope.clone())
                 .collect(),
             pieces: Vec::new(),
-            // Nodes are handed a private job only as a share.
-            route: job.manifest.share.map(|_| PrivateRoute::PrivateTotals),
+            route: privacy::route_to_nodes(&job.manifest),
             verified,
             seconds: now.saturating_sub(job.submitted_at),
             enclave: false,
