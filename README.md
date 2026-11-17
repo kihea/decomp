@@ -229,7 +229,7 @@ between them.
   agreed on the bytes, was opened by a private job on the device it was sealed
   to, and by no other device. The TypeScript client was not used to open one.
 - Private totals was run on four proven nodes of four accounts. With two nodes
-  to a share, no account was in both shares in eight runs, and the sums were
+  to a share, no account was in both shares in ten runs, and the sums were
   right. With three nodes online the second share waited for a fourth account
   and expired. A fifth node that reported a wrong result for a share was found
   out by the referee. That a share is never reissued as a known-answer job was
