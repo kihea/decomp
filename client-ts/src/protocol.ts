@@ -92,7 +92,11 @@ export type Call =
   | { type: 'open_relay'; to: string; bytes: number }
   | { type: 'list_incoming' }
   | { type: 'store_blob'; root: string; size: number; days: number; to?: string }
-  | { type: 'locate_blob'; root: string };
+  | { type: 'locate_blob'; root: string }
+  | { type: 'put_blob'; data: string }
+  | { type: 'get_blob'; hash: string }
+  | { type: 'submit_job'; manifest: Manifest }
+  | { type: 'get_job'; job_id: string };
 
 /** A signed request for anything other than changing an account. */
 export type Request = { issued_at: number; call: Call };
@@ -156,6 +160,57 @@ export const FRAME_BYTES = 256 * 1024;
 
 /** The size of every chunk of a stored blob except, usually, its last (`CHUNK_BYTES`). */
 export const CHUNK_BYTES = 64 * 1024;
+
+/**
+ * A job as its submitter describes it (`Manifest`). Of its fields, these are
+ * the ones this client sets; the rest are left to their defaults.
+ */
+export type Manifest = {
+  module: string;
+  input: string;
+  /** Compute units the job may use before it is stopped. */
+  compute_cap: number;
+  /** Latest acceptable finish time, in seconds since 1970. */
+  deadline: number;
+  /** Credits set aside for the job, in millionths. */
+  max_fee: number;
+};
+
+/** The price of one compute unit on one node, in millionths of a credit (`BASE_PRICE`). */
+export const BASE_PRICE_MICROS = MICROS_PER_CREDIT;
+
+/** How many nodes run a job when its first node is on probation (`UNPROVEN_REDUNDANCY`). */
+export const UNPROVEN_REDUNDANCY = 2;
+
+/** The most a job with this compute cap can cost (`Manifest::highest_fee`). */
+export function highestFee(computeCap: number): number {
+  return computeCap * BASE_PRICE_MICROS * UNPROVEN_REDUNDANCY;
+}
+
+/** The answer to `put_blob`. */
+export type BlobRef = { hash: string };
+
+/** The answer to `get_blob`: the bytes, as base64. */
+export type BlobData = { data: string };
+
+/** The answer to `submit_job`. */
+export type Submitted = { job_id: string };
+
+/** Why a job produced no output (`Failure`). */
+export type Failure = 'compute_cap_exceeded' | 'trapped' | 'invalid_job';
+
+/** How a job ended (`Outcome`), as far as this client reads it. */
+export type Outcome =
+  | { status: 'completed'; output: string }
+  | { status: 'failed'; failure: Failure };
+
+/** The parts of a job's receipt this client reads (`Receipt`). */
+export type Receipt = { units: number; fee: { total: number }; outcome: Outcome };
+
+/** Where a job stands, as its submitter sees it (`JobStatus`). */
+export type JobStatus =
+  | { state: 'waiting' | 'running' | 'disputed' | 'expired' }
+  | { state: 'verified'; receipt: Receipt };
 
 /** Whether `text` has the form of a public key: 64 lowercase hex characters. */
 export function isPublicKey(text: string): boolean {
