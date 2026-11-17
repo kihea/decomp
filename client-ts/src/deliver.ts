@@ -215,12 +215,19 @@ export type Collected = {
  * already collected, which stay listed until their paid time runs out. A channel
  * or blob that goes wrong here is added to it before the error is thrown, so
  * calling again moves on to the next.
+ *
+ * `accepts` says which senders to take from. What any other device sent is
+ * left where it is: nothing of it is fetched, and a relay holding it is not paid.
  */
-export async function collect(transfers: Transfers, skip: Set<string>): Promise<Collected | null> {
+export async function collect(
+  transfers: Transfers,
+  skip: Set<string>,
+  accepts: (from: string) => boolean = () => true,
+): Promise<Collected | null> {
   const { coordinator, primitives, signer, opener } = transfers;
   const waiting = await coordinator.request<IncomingChannels>(signer, { type: 'list_incoming' });
   for (const incoming of waiting.channels) {
-    if (skip.has(incoming.channel)) continue;
+    if (skip.has(incoming.channel) || !accepts(incoming.from)) continue;
     try {
       const data = await receiveFromChannel(transfers, incoming);
       if (data) return { from: incoming.from, data };
@@ -230,7 +237,7 @@ export async function collect(transfers: Transfers, skip: Set<string>): Promise<
     }
   }
   for (const stored of waiting.stored) {
-    if (skip.has(stored.root)) continue;
+    if (skip.has(stored.root) || !accepts(stored.from)) continue;
     skip.add(stored.root);
     const located = await coordinator.request<Located>(signer, { type: 'locate_blob', root: stored.root });
     const sealed = await fetchStored(primitives, stored.root, located);
@@ -241,6 +248,8 @@ export async function collect(transfers: Transfers, skip: Set<string>): Promise<
     if (!(await primitives.verify(toHex(from), signed, signature))) {
       throw new TransferError('What was stored does not say who it is from.');
     }
+    // Whoever stored it may not be who signed it, so the signer is asked about too.
+    if (!accepts(toHex(from))) continue;
     return { from: toHex(from), data, storedAs: stored.root };
   }
   return null;
