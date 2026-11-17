@@ -386,7 +386,7 @@ fn how_checked(verified: Verification) -> &'static str {
         Verification::Refereed => {
             "yes: nodes disagreed, and a referee ran it to find which were right"
         }
-        Verification::Unchecked => "no: one proven node ran it, and no other was asked to",
+        Verification::Unchecked => "no: one node ran it, and no other was asked to",
     }
 }
 
@@ -808,6 +808,7 @@ fn run_here(
         state: None,
         opening_key: opening_key.as_ref(),
     })?;
+    let took = started.elapsed();
 
     println!("module  {}", ContentHash::of(module));
     if let Some(signature) = sandbox.signature(module)? {
@@ -820,7 +821,7 @@ fn run_here(
             // The spec's table: "Not needed; the device belongs to the user".
             checked: "not needed: this device is its user's own",
             fee: Credits::ZERO,
-            time: started.elapsed(),
+            time: took,
             enclave: false,
         }
         .show();

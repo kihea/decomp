@@ -215,8 +215,8 @@ between them.
   fields: the privacy route used, how the result was verified, what it cost,
   how long it took, and whether an enclave was involved." A receipt already
   had the cost. It now also has the private route, if the job took one; whether
-  nodes agreed, a referee settled a disagreement, or one proven node ran the
-  job and nothing was compared; the seconds from submission to result; and
+  nodes agreed, a referee settled a disagreement, or one node ran the job and
+  nothing was compared; the seconds from submission to result; and
   `enclave`, which is false. `submit` shows the five as `route`, `checked`,
   `fee`, `time`, and `enclave`, and so does `run` for a private job.
 - **Sealing inside a job.** A job can seal a message to a key with `seal`, so
@@ -612,8 +612,9 @@ holds either way, since an open job is checked by the same rule.
 **A result nothing was compared with says so.** "A result that is unverified or
 under dispute is flagged as such." A proven node runs most jobs alone, and the
 protocol counts its result as standing. The receipt's `verified` field then
-reads `unchecked`, and `submit` prints "no: one proven node ran it, and no
-other was asked to". A job whose pieces were checked in different ways reports
+reads `unchecked`, and `submit` prints "no: one node ran it, and no other was
+asked to". The same is said of a job its submitter asked one node to run. A
+job whose pieces were checked in different ways reports
 the weakest of them.
 
 **A job on the local route has no receipt.** Receipts are written by the

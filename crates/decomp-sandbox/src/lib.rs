@@ -42,7 +42,7 @@
 //!
 //! `seal` must give every node the same bytes, so it draws nothing at random:
 //! what it does is fixed by the job's seed, the key, and the message (see
-//! `decomp_core::seal::seal_fixed`, which also says what that costs). `open`
+//! `decomp_core::seal::seal_fixed`, which also says what that gives up). `open`
 //! opens only on a device that was given a key to open with, which is a device
 //! running its own user's private job. A node has no such key, so on a node
 //! `open` returns -1 whatever it is given, and every node agrees.

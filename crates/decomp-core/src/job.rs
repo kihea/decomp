@@ -216,9 +216,11 @@ pub struct Assignment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verification {
-    /// One proven node ran the job and no other was asked to (spec section 4,
-    /// "Earning spot checks"). Nothing was compared: the result rests on that
-    /// node's record, and on its not knowing which of its jobs are checked.
+    /// One node ran the job and no other was asked to. Nothing was compared.
+    /// This is how a proven node runs most jobs (spec section 4, "Earning spot
+    /// checks"): the result rests on the node's record, and on its not knowing
+    /// which of its jobs are checked. It is also what a submitter gets who asks
+    /// for one node.
     Unchecked,
     /// The nodes that ran the job disagreed, and the referee ran it to find
     /// which of them were right.

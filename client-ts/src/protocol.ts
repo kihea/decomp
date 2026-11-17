@@ -227,7 +227,7 @@ export type PrivateRoute = 'local' | 'private_totals';
 
 /**
  * How a job's result came to stand (`Verification`): two or more nodes agreed,
- * a referee settled a disagreement, or one proven node ran it and nothing was
+ * a referee settled a disagreement, or one node ran it and nothing was
  * compared.
  */
 export type Verification = 'agreed' | 'refereed' | 'unchecked';
