@@ -171,7 +171,8 @@ between them.
 - Jobs on the same shard run one at a time, each starting from what the last
   one left, so no change is lost. Jobs on different shards run side by side.
 - A job that fails changes nothing.
-- Anyone can ask what a shard holds now and read its records.
+- Anyone can ask what a shard holds now and read its records. The
+  command-line node and the TypeScript client both do.
 
 **Follow-up jobs** (also build step 7).
 
@@ -328,7 +329,7 @@ between them.
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
 | `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, and what it stores (logs, blobs). |
 | `crates/decomp-node` | The node agent, as a library and as the `decomp-node` command: joins an account, works as a node, holds and relays data, submits jobs, stores files, and sends files to other devices. |
-| `client-ts` | The TypeScript client: message shapes, signing, calls, and sending to and collecting from other devices, from all senders or only those the device accepts, and submitting a job and waiting for its result. It has no dependencies: a device supplies its keys and its cryptography, and a ready-made one for platforms with WebCrypto is included. |
+| `client-ts` | The TypeScript client: message shapes, signing, calls, and sending to and collecting from other devices, from all senders or only those the device accepts, submitting a job and waiting for its result, and reading a shard of an app's state. It has no dependencies: a device supplies its keys and its cryptography, and a ready-made one for platforms with WebCrypto is included. |
 
 ## Run it
 

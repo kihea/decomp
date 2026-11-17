@@ -96,7 +96,8 @@ export type Call =
   | { type: 'put_blob'; data: string }
   | { type: 'get_blob'; hash: string }
   | { type: 'submit_job'; manifest: Manifest }
-  | { type: 'get_job'; job_id: string };
+  | { type: 'get_job'; job_id: string }
+  | { type: 'get_state'; app: string; shard: string };
 
 /** A signed request for anything other than changing an account. */
 export type Request = { issued_at: number; call: Call };
@@ -220,6 +221,9 @@ export type BlobRef = { hash: string };
 
 /** The answer to `get_blob`: the bytes, as base64. */
 export type BlobData = { data: string };
+
+/** The answer to `get_state`: the hash of the shard's contents, or null if it is empty. */
+export type ShardNow = { contents: string | null };
 
 /** The answer to `submit_job`. */
 export type Submitted = { job_id: string };
