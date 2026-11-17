@@ -766,6 +766,10 @@ to sign and a device that is in no account cannot read the account's record.
 It can still be used only once: a device key belongs to one account for good,
 whether its recovery takes effect or is cancelled. The request that carries
 the approvals is signed by the device itself, so nobody else can spend them.
+An approval by a passkey or a wallet does not name its key, because a device
+that is in no account cannot read the account's record to learn it: each is
+tried against the account's passkeys or wallets. A request carries at most 24
+approvals.
 
 **Everything a controller approves waits.** The spec says "a passkey or any
 other controller can approve a device the same way" as an approved device

@@ -36,11 +36,10 @@ export type PasskeyAssertion = {
   signature: ArrayBuffer;
 };
 
-/** An approval by the passkey whose public key is `key` (hex), from its answer to `passkeyChallenge`. */
-export function passkeyApproval(key: string, assertion: PasskeyAssertion): Approval {
+/** An approval by a passkey, from its answer to `passkeyChallenge`. */
+export function passkeyApproval(assertion: PasskeyAssertion): Approval {
   return {
     type: 'passkey',
-    key,
     authenticator_data: toBase64(new Uint8Array(assertion.authenticatorData)),
     client_data: new TextDecoder().decode(assertion.clientDataJSON),
     signature: toBase64(new Uint8Array(assertion.signature)),

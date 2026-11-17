@@ -72,7 +72,6 @@ export type Approval =
   | { type: 'key'; signer: string; signature: string }
   | {
       type: 'passkey';
-      key: string;
       /** Base64. */
       authenticator_data: string;
       /** The client data exactly as the browser made it. */
@@ -80,7 +79,8 @@ export type Approval =
       /** Base64. */
       signature: string;
     }
-  | { type: 'wallet'; key: string; signature: string };
+  /** Hex: the 65 bytes an Ethereum wallet's `personal_sign` gives. */
+  | { type: 'wallet'; signature: string };
 
 /** A device the account's controllers approved, which has not joined yet. */
 export type Recovery = {

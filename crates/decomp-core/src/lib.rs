@@ -31,7 +31,7 @@ pub use app::{
     AppManifest, MAX_APP_MODULES, MAX_APP_NAME_BYTES, SponsorError, Sponsored, Sponsorship,
 };
 pub use controller::{
-    Approval, Controller, MAX_CONTROLLERS, MAX_GUARDIANS, MAX_WAITING_RECOVERIES,
+    Approval, Controller, MAX_APPROVALS, MAX_CONTROLLERS, MAX_GUARDIANS, MAX_WAITING_RECOVERIES,
     MOST_METHODS_REQUIRED, RECOVERY_WAIT_SECS,
 };
 pub use draw::{

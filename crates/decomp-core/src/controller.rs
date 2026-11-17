@@ -46,6 +46,11 @@ pub const MOST_METHODS_REQUIRED: u32 = 2;
 /// device can cancel it in that time").
 pub const RECOVERY_WAIT_SECS: u64 = 48 * 60 * 60;
 
+/// The most approvals one request to start a recovery may carry: one for each
+/// controller, and one for each guardian of one of them. It bounds the
+/// signatures checked for one request.
+pub const MAX_APPROVALS: usize = MAX_CONTROLLERS + MAX_GUARDIANS;
+
 /// The most recoveries an account may have waiting at once. It bounds the
 /// size of an account record.
 pub const MAX_WAITING_RECOVERIES: usize = 4;
@@ -136,7 +141,10 @@ pub fn problem(
     }
 }
 
-/// One signature over the statement that approves a device.
+/// One signature over the statement that approves a device. A passkey's and
+/// a wallet's do not name their key: a device that is in no account cannot
+/// read the account's record to learn it, so each is tried against the
+/// account's passkeys or wallets.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Approval {
@@ -151,7 +159,6 @@ pub enum Approval {
     /// `client_data` holds the challenge, which is the SHA-256 hash of the
     /// statement.
     Passkey {
-        key: PasskeyKey,
         authenticator_data: Blob,
         /// The client data exactly as the browser made it, a JSON text.
         client_data: String,
@@ -159,10 +166,7 @@ pub enum Approval {
         signature: Blob,
     },
     /// By a wallet, as Ethereum's `personal_sign` of the statement.
-    Wallet {
-        key: WalletKey,
-        signature: WalletSignature,
-    },
+    Wallet { signature: WalletSignature },
 }
 
 /// The part of a passkey's client data that is checked. A browser adds other
@@ -176,51 +180,66 @@ struct ClientData {
 }
 
 impl Approval {
-    /// Whether this is a true signature over `statement` by the key it names.
-    fn holds(&self, statement: &str) -> bool {
+    /// The key whose true signature over `statement` this is, if it is one
+    /// made as account and device keys sign.
+    fn key_signer(&self, statement: &str) -> Option<PublicKey> {
         match self {
-            Self::Key { signer, signature } => signer.verifies(statement.as_bytes(), signature),
-            Self::Passkey {
-                key,
-                authenticator_data: Blob(authenticator_data),
-                client_data,
-                signature: Blob(signature),
-            } => {
-                let Ok(ClientData { kind, challenge }) = serde_json::from_str(client_data) else {
-                    return false;
-                };
-                let asked = BASE64_URL.encode(Sha256::digest(statement));
-                let present = authenticator_data.len() >= PASSKEY_DATA_MIN_BYTES
-                    && authenticator_data[PASSKEY_FLAGS_AT] & PASSKEY_USER_PRESENT != 0;
-                if kind != PASSKEY_ASSERTION || challenge != asked || !present {
-                    return false;
-                }
-                let Ok(key) = p256::ecdsa::VerifyingKey::from_sec1_bytes(key.as_bytes()) else {
-                    return false;
-                };
-                let Ok(signature) = p256::ecdsa::DerSignature::from_bytes(signature) else {
-                    return false;
-                };
-                let signed = [authenticator_data.as_slice(), &Sha256::digest(client_data)].concat();
-                key.verify(&signed, &signature).is_ok()
-            }
-            Self::Wallet { key, signature } => {
-                let Ok(key) = k256::ecdsa::VerifyingKey::from_sec1_bytes(key.as_bytes()) else {
-                    return false;
-                };
-                // The last byte only says which key made the signature, and
-                // the key is already known.
-                let (r_and_s, _) = signature.as_bytes().split_at(64);
-                let Ok(signature) = k256::ecdsa::Signature::from_slice(r_and_s) else {
-                    return false;
-                };
-                let mut hasher = Keccak256::new();
-                hasher.update(WALLET_PREFIX);
-                hasher.update(statement.len().to_string());
-                hasher.update(statement);
-                key.verify_prehash(&hasher.finalize(), &signature).is_ok()
-            }
+            Self::Key { signer, signature } => signer
+                .verifies(statement.as_bytes(), signature)
+                .then_some(*signer),
+            _ => None,
         }
+    }
+
+    /// Whether this is a true assertion over `statement` by the passkey `key`.
+    fn is_by_passkey(&self, key: &PasskeyKey, statement: &str) -> bool {
+        let Self::Passkey {
+            authenticator_data: Blob(authenticator_data),
+            client_data,
+            signature: Blob(signature),
+        } = self
+        else {
+            return false;
+        };
+        let Ok(ClientData { kind, challenge }) = serde_json::from_str(client_data) else {
+            return false;
+        };
+        let asked = BASE64_URL.encode(Sha256::digest(statement));
+        let present = authenticator_data.len() >= PASSKEY_DATA_MIN_BYTES
+            && authenticator_data[PASSKEY_FLAGS_AT] & PASSKEY_USER_PRESENT != 0;
+        if kind != PASSKEY_ASSERTION || challenge != asked || !present {
+            return false;
+        }
+        let Ok(key) = p256::ecdsa::VerifyingKey::from_sec1_bytes(key.as_bytes()) else {
+            return false;
+        };
+        let Ok(signature) = p256::ecdsa::DerSignature::from_bytes(signature) else {
+            return false;
+        };
+        let signed = [authenticator_data.as_slice(), &Sha256::digest(client_data)].concat();
+        key.verify(&signed, &signature).is_ok()
+    }
+
+    /// Whether this is a true `personal_sign` of `statement` by the wallet
+    /// `key`.
+    fn is_by_wallet(&self, key: &WalletKey, statement: &str) -> bool {
+        let Self::Wallet { signature } = self else {
+            return false;
+        };
+        let Ok(key) = k256::ecdsa::VerifyingKey::from_sec1_bytes(key.as_bytes()) else {
+            return false;
+        };
+        // The last byte only says which key made the signature, and the key
+        // it is checked against is already known.
+        let (r_and_s, _) = signature.as_bytes().split_at(64);
+        let Ok(signature) = k256::ecdsa::Signature::from_slice(r_and_s) else {
+            return false;
+        };
+        let mut hasher = Keccak256::new();
+        hasher.update(WALLET_PREFIX);
+        hasher.update(statement.len().to_string());
+        hasher.update(statement);
+        key.verify_prehash(&hasher.finalize(), &signature).is_ok()
     }
 }
 
@@ -235,34 +254,33 @@ pub fn statement(account: &AccountId, device: &PublicKey) -> String {
 
 /// How many of `controllers` have approved, given `approvals` of `statement`.
 /// `acts_for` gives the account a key may act for now, as its account key or
-/// as an approved device: that is how a guardian account signs.
+/// as an approved device: that is how a guardian account signs. More than
+/// `MAX_APPROVALS` approvals count for nothing.
 pub fn agreeing(
     controllers: &[Controller],
     approvals: &[Approval],
     statement: &str,
     acts_for: impl Fn(&PublicKey) -> Option<AccountId>,
 ) -> usize {
-    let approvals: Vec<&Approval> = approvals
+    if approvals.len() > MAX_APPROVALS {
+        return 0;
+    }
+    let signers: Vec<PublicKey> = approvals
         .iter()
-        .filter(|approval| approval.holds(statement))
+        .filter_map(|approval| approval.key_signer(statement))
         .collect();
     let agrees = |controller: &&Controller| match controller {
-        Controller::Key { key } => approvals
-            .iter()
-            .any(|approval| matches!(approval, Approval::Key { signer, .. } if signer == key)),
+        Controller::Key { key } => signers.contains(key),
         Controller::Passkey { key } => approvals
             .iter()
-            .any(|approval| matches!(approval, Approval::Passkey { key: by, .. } if by == key)),
+            .any(|approval| approval.is_by_passkey(key, statement)),
         Controller::Wallet { key } => approvals
             .iter()
-            .any(|approval| matches!(approval, Approval::Wallet { key: by, .. } if by == key)),
+            .any(|approval| approval.is_by_wallet(key, statement)),
         Controller::Guardians { accounts, required } => {
-            let guardians: HashSet<AccountId> = approvals
+            let guardians: HashSet<AccountId> = signers
                 .iter()
-                .filter_map(|approval| match approval {
-                    Approval::Key { signer, .. } => acts_for(signer),
-                    _ => None,
-                })
+                .filter_map(&acts_for)
                 .filter(|account| accounts.contains(account))
                 .collect();
             guardians.len() >= *required as usize
