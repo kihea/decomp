@@ -9,7 +9,7 @@ use crate::account::Account;
 use crate::envelope::Envelope;
 use crate::job::{Assignment, JobResult, Manifest};
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, SealingKey};
-use crate::ledger::{Balance, Credits};
+use crate::ledger::{Balance, CashOut, Credits};
 use crate::relay::{Incoming, RelayOrder};
 use crate::settlement::{Change, Through};
 use crate::storage::{Challenge, StoreOrder, Waiting};
@@ -105,6 +105,28 @@ pub enum Call {
     RedeemRelay { header: Envelope, receipt: Envelope },
     /// A node reporting what a job produced. Answer: an empty object.
     SubmitResult { result: JobResult },
+    /// The coordinator's operator recording that `account` bought `amount`
+    /// credits with the payment named `payment` (spec section 5: "Credits can
+    /// be bought and cashed out for money"). Only the operator's own key is
+    /// answered. Answer: an empty object.
+    CreditPurchase {
+        account: AccountId,
+        amount: Credits,
+        payment: String,
+    },
+    /// Asks for earned credits to be cashed out, and sets them aside. Signed
+    /// by the account key itself, not a device (spec section 1: the account
+    /// key signs "cash-outs"). Answer: `CashOutAsked`.
+    CashOut { amount: Credits },
+    /// The cash-outs that wait to be paid or refused. Only the operator's own
+    /// key is answered. Answer: `CashOuts`.
+    GetCashOuts,
+    /// The operator recording that a cash-out was paid, by the payment named
+    /// `payout`: its credits are gone for good. Answer: an empty object.
+    PayCashOut { id: ContentHash, payout: String },
+    /// The operator refusing a cash-out: its credits go back to the account.
+    /// Answer: an empty object.
+    RefuseCashOut { id: ContentHash },
     /// The settlement log from entry number `from` on, counting from zero, at
     /// most `MAX_LOG_PAGE` entries of it (see `settlement`). Answer: `LogPage`.
     GetLog { from: u64 },
@@ -139,6 +161,17 @@ pub struct AccountStatus {
     #[serde(flatten)]
     pub account: Account,
     pub balance: Balance,
+}
+
+/// The name a cash-out was given, to pay or refuse it by.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CashOutAsked {
+    pub id: ContentHash,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CashOuts {
+    pub waiting: Vec<CashOut>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

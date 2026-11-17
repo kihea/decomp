@@ -16,10 +16,10 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
-    AccountId, AccountStatus, AppManifest, Call, ContentHash, Credits, Encrypted, Inclusion, JobId,
-    JobStatus, MAX_LOG_PAGE, Manifest, OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey,
-    Receipt, Request, SHARES, ShardRef, Share, ShareSet, Split, Sponsorship, Verification,
-    encrypted, merkle, privacy, shares,
+    AccountId, AccountStatus, AppManifest, Approval, Call, ContentHash, Controller, Credits,
+    Encrypted, Inclusion, JobId, JobStatus, MAX_LOG_PAGE, Manifest, OpeningKey, Outcome, Privacy,
+    PrivateRoute, PublicKey, Receipt, Request, SHARES, ShardRef, Share, ShareSet, Split,
+    Sponsorship, Verification, controller, encrypted, merkle, privacy, shares,
 };
 use decomp_node::beacon::Rounds;
 use decomp_node::client::{Client, ClientError, unix_now};
@@ -35,6 +35,10 @@ const NO_KEY: &str = "this device has no key yet; run `decomp-node link` first";
 /// The file, in this device's directory, listing the stored files it has
 /// already collected, one root to a line.
 const COLLECTED_FILE: &str = "collected";
+
+/// The file, in this device's directory, that says which account this device
+/// is recovering and when the recovery takes effect, in seconds since 1970.
+const RECOVERY_FILE: &str = "recovery";
 
 /// How often `submit` asks whether its job has finished.
 const JOB_POLL: Duration = Duration::from_secs(1);
@@ -70,6 +74,77 @@ enum Command {
     Link,
     /// Show this device's account, its credits, and how far this node is trusted.
     Account,
+    /// Make a recovery key, save it in a file to be kept offline, and show its
+    /// public key, which the account adds as a controller. If the file is
+    /// there already, show the public key of the key in it.
+    RecoveryKey { file: PathBuf },
+    /// Recover an account onto this device. Name the account and give what
+    /// its controllers signed: the recovery starts and then waits. Run it
+    /// again with nothing once the wait is over, and this device joins the
+    /// account. With an account and no approvals, show what the controllers
+    /// must sign.
+    Recover {
+        /// The ID of the account to recover.
+        account: Option<AccountId>,
+        /// A recovery key file, as `recovery-key` made it, to approve with.
+        /// Repeat for each one.
+        #[arg(long = "key")]
+        keys: Vec<PathBuf>,
+        /// A file holding an approval made elsewhere: by a guardian with
+        /// `approve-recovery`, by a passkey, or by a wallet. Repeat for each.
+        #[arg(long = "approval")]
+        approvals: Vec<PathBuf>,
+    },
+    /// As a guardian of an account: approve a device for it, and show the
+    /// approval for the device to hand in with `recover`.
+    ApproveRecovery {
+        /// The ID of the account being recovered.
+        account: AccountId,
+        /// The code of the device to approve, as its `recover` shows it.
+        device: PublicKey,
+    },
+    /// Cancel a recovery that is waiting on this device's account.
+    CancelRecovery {
+        /// The code of the device whose recovery to cancel.
+        device: PublicKey,
+    },
+    /// As a coordinator's operator: record that an account bought credits.
+    /// Nothing here takes or checks a payment.
+    Bought {
+        /// The ID of the account that bought them.
+        account: AccountId,
+        /// Credits bought, such as 20 or 12.5.
+        amount: Credits,
+        /// A name for the payment. A payment is credited once.
+        #[arg(long)]
+        payment: String,
+        #[command(flatten)]
+        operator: OperatorArgs,
+    },
+    /// As a coordinator's operator: show the cash-outs that wait.
+    CashOuts {
+        #[command(flatten)]
+        operator: OperatorArgs,
+    },
+    /// As a coordinator's operator: record that a cash-out was paid, which
+    /// removes its credits for good. Nothing here pays anyone.
+    PayCashOut {
+        /// The cash-out's name, as `cash-outs` shows it.
+        id: ContentHash,
+        /// A name for the payment the account was paid by.
+        #[arg(long)]
+        payout: String,
+        #[command(flatten)]
+        operator: OperatorArgs,
+    },
+    /// As a coordinator's operator: refuse a cash-out, which returns its
+    /// credits to the account.
+    RefuseCashOut {
+        /// The cash-out's name, as `cash-outs` shows it.
+        id: ContentHash,
+        #[command(flatten)]
+        operator: OperatorArgs,
+    },
     /// Put earned credits up as stake, which jobs of tier 3 and above require.
     Stake {
         /// Credits to stake, such as 20 or 12.5.
@@ -198,6 +273,14 @@ enum Command {
 }
 
 #[derive(Args)]
+struct OperatorArgs {
+    /// The operator's key file: `operator.key` in the coordinator's data
+    /// directory. The key must be a device of an account.
+    #[arg(long)]
+    operator_key: PathBuf,
+}
+
+#[derive(Args)]
 struct JobArgs {
     /// The job module, a WebAssembly file.
     module: PathBuf,
@@ -250,6 +333,64 @@ fn main() -> ExitCode {
             receive(&client, &cli.dir, &opening_key, &output)
         }),
         Command::Account => connect().and_then(|client| show_account(&client)),
+        Command::RecoveryKey { file } => recovery_key(&file),
+        Command::Recover {
+            account,
+            keys,
+            approvals,
+        } => recover(&cli.dir, &cli.coordinator, account, &keys, &approvals),
+        Command::ApproveRecovery { account, device } => connect().and_then(|client| {
+            let statement = controller::statement(&account, &device);
+            let approval = Approval::Key {
+                signer: client.device_key(),
+                signature: client.key().sign(statement.as_bytes()),
+            };
+            println!("{}", serde_json::to_string(&approval)?);
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::CancelRecovery { device } => connect().and_then(|client| {
+            client.cancel_recovery(device)?;
+            println!("cancelled; device {device} can never join the account");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::Bought {
+            account,
+            amount,
+            payment,
+            operator,
+        } => as_operator(&cli.coordinator, &operator).and_then(|client| {
+            client.credit_purchase(account, amount, payment)?;
+            println!("credited {amount} bought credits to account {account}");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::CashOuts { operator } => {
+            as_operator(&cli.coordinator, &operator).and_then(|client| {
+                let waiting = client.cash_outs()?;
+                for cash_out in &waiting {
+                    let (id, account) = (cash_out.id, cash_out.account);
+                    println!("{id}  {} credits  account {account}", cash_out.amount);
+                }
+                if waiting.is_empty() {
+                    println!("no cash-out is waiting");
+                }
+                Ok(ExitCode::SUCCESS)
+            })
+        }
+        Command::PayCashOut {
+            id,
+            payout,
+            operator,
+        } => as_operator(&cli.coordinator, &operator).and_then(|client| {
+            client.pay_cash_out(id, payout)?;
+            println!("recorded as paid; the credits of cash-out {id} are gone");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::RefuseCashOut { id, operator } => as_operator(&cli.coordinator, &operator)
+            .and_then(|client| {
+                client.refuse_cash_out(id)?;
+                println!("refused; the credits of cash-out {id} are back with the account");
+                Ok(ExitCode::SUCCESS)
+            }),
         Command::Stake { amount } => connect().and_then(|client| {
             show_credits(&client.stake(amount)?);
             Ok(ExitCode::SUCCESS)
@@ -293,6 +434,107 @@ fn main() -> ExitCode {
         eprintln!("error: {error}");
         ExitCode::FAILURE
     })
+}
+
+/// A client that signs as a coordinator's operator.
+fn as_operator(coordinator: &str, operator: &OperatorArgs) -> Result<Client, Box<dyn Error>> {
+    let path = &operator.operator_key;
+    let missing = || format!("{} is not there", path.display());
+    let key = device::key_file(path)?.ok_or_else(missing)?;
+    Ok(Client::new(coordinator, key))
+}
+
+/// Makes a recovery key in `file`, or reads the one there, and shows its
+/// public key (spec section 1: "Recovery key or phrase: A public key ... With
+/// the user, offline").
+fn recovery_key(file: &Path) -> Result<ExitCode, Box<dyn Error>> {
+    let key = match device::key_file(file)? {
+        Some(key) => key,
+        None => device::create_key_file(file)?,
+    };
+    println!("recovery key: {}", key.public_key());
+    println!(
+        "Add it to the account as a controller, and keep {} offline.",
+        file.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Starts, or finishes, the recovery of an account onto this device (spec
+/// section 1: "a passkey or any other controller can approve a device the same
+/// way", and "A recovery takes effect after 48 hours (starting value), and
+/// any approved device can cancel it in that time").
+fn recover(
+    dir: &Path,
+    coordinator: &str,
+    account: Option<AccountId>,
+    keys: &[PathBuf],
+    approval_files: &[PathBuf],
+) -> Result<ExitCode, Box<dyn Error>> {
+    let key = match device::load(dir)? {
+        Some(key) => key,
+        None => device::create(dir)?,
+    };
+    let client = Client::new(coordinator, key);
+    let device = client.device_key();
+    let note = dir.join(RECOVERY_FILE);
+
+    let Some(account) = account else {
+        let Ok(started) = fs::read_to_string(&note) else {
+            return Err("name the account to recover".into());
+        };
+        let (account, effective_at) = started.trim().split_once(' ').ok_or("bad recovery file")?;
+        let (account, effective_at): (AccountId, u64) = (account.parse()?, effective_at.parse()?);
+        let now = unix_now();
+        if now < effective_at {
+            println!(
+                "The recovery of account {account} takes effect in {} seconds. Until then a device of the account can cancel it.",
+                effective_at - now
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        client.complete_recovery(account)?;
+        fs::remove_file(&note)?;
+        // So that other devices can send to this one from now on.
+        client.publish_sealing_key(device::opening_key(dir)?.sealing_key())?;
+        println!("recovered: this device is now in account {account}");
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    let statement = controller::statement(&account, &device);
+    let mut approvals = Vec::new();
+    for file in keys {
+        let missing = || format!("{} is not there", file.display());
+        let key = device::key_file(file)?.ok_or_else(missing)?;
+        approvals.push(Approval::Key {
+            signer: key.public_key(),
+            signature: key.sign(statement.as_bytes()),
+        });
+    }
+    for file in approval_files {
+        approvals.push(serde_json::from_str(fs::read_to_string(file)?.trim())?);
+    }
+    if approvals.is_empty() {
+        println!("device code: {device}");
+        println!("The account's controllers approve this device by signing these two lines:");
+        println!("{statement}");
+        println!(
+            "A guardian runs `decomp-node approve-recovery {account} {device}`. Hand what they give to `recover` with --approval."
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let status = client.recover(account, approvals)?;
+    let mut waiting = status.account.recoveries.iter();
+    let recovery = waiting
+        .find(|recovery| recovery.device_key == device)
+        .ok_or("the coordinator did not start the recovery")?;
+    fs::write(&note, format!("{account} {}\n", recovery.effective_at))?;
+    println!(
+        "The recovery has started and takes effect in {} seconds. Until then a device of the account can cancel it. Run `decomp-node recover` again after that.",
+        recovery.effective_at.saturating_sub(unix_now())
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Checks the coordinator's settlement log and shows what it holds.
@@ -433,6 +675,30 @@ fn show_account(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
     {
         println!("device   {}", device.key);
     }
+    for controller in &status.account.controllers {
+        match controller {
+            Controller::Key { key } => println!("controller  key {key}"),
+            Controller::Passkey { key } => println!("controller  passkey {key}"),
+            Controller::Wallet { key } => println!("controller  wallet {key}"),
+            Controller::Guardians { accounts, required } => {
+                println!("controller  {required} of these guardian accounts:");
+                for guardian in accounts {
+                    println!("            {guardian}");
+                }
+            }
+        }
+    }
+    if status.account.methods_required > 1 {
+        let required = status.account.methods_required;
+        println!("            {required} controllers must agree to a recovery");
+    }
+    for recovery in &status.account.recoveries {
+        println!(
+            "recovery waiting  device {}, takes effect in {} seconds",
+            recovery.device_key,
+            recovery.effective_at.saturating_sub(unix_now())
+        );
+    }
     show_credits(&status);
     if let Some(app) = &status.account.app {
         show_app(app);
@@ -462,6 +728,12 @@ fn show_credits(status: &AccountStatus) {
         balance.spendable(),
         balance.staked
     );
+    if balance.cashing_out > Credits::ZERO {
+        println!(
+            "         {} set aside to be cashed out",
+            balance.cashing_out
+        );
+    }
     println!(
         "         {} are starter credits, which cannot be staked or cashed out",
         balance.granted

@@ -47,10 +47,50 @@ export const MICROS_PER_CREDIT = 1_000_000;
 export type Balance = {
   /** Starter credits: they can be spent but never cashed out. */
   granted: number;
+  /** Credits the account earned or bought. */
   earned: number;
   /** Earned credits put up as a guarantee for the account's nodes. Not spendable. */
   staked: number;
+  /** Earned credits set aside for cash-outs that are neither paid nor refused. */
+  cashing_out: number;
 };
+
+/**
+ * One way to prove control of an account, as the account record holds it
+ * (`Controller`). `key` is hex: 32 bytes for a recovery key or a recovery
+ * service's key, and the 65 bytes of a curve point for a passkey (P-256) or a
+ * wallet (secp256k1).
+ */
+export type Controller =
+  | { type: 'key'; key: string }
+  | { type: 'passkey'; key: string }
+  | { type: 'wallet'; key: string }
+  | { type: 'guardians'; accounts: string[]; required: number };
+
+/** One signature over the statement that approves a device (`Approval`). */
+export type Approval =
+  | { type: 'key'; signer: string; signature: string }
+  | {
+      type: 'passkey';
+      key: string;
+      /** Base64. */
+      authenticator_data: string;
+      /** The client data exactly as the browser made it. */
+      client_data: string;
+      /** Base64. */
+      signature: string;
+    }
+  | { type: 'wallet'; key: string; signature: string };
+
+/** A device the account's controllers approved, which has not joined yet. */
+export type Recovery = {
+  device_key: string;
+  /** When the device may join, in seconds since 1970. */
+  effective_at: number;
+};
+
+/** The most controllers an account can require to agree (`MOST_METHODS_REQUIRED`). */
+export const MOST_METHODS_REQUIRED = 2;
 
 /** What an account's app is made of. The account's ID is the app's ID. */
 export type AppManifest = {
@@ -75,6 +115,12 @@ export type Account = {
   /** Number of changes so far. The next change must carry this value. */
   seq: number;
   devices: Device[];
+  /** The ways the user added to sign in and to recover the account. */
+  controllers: Controller[];
+  /** How many of `controllers` must approve a device for its recovery to start. */
+  methods_required: number;
+  /** Recoveries that are waiting to take effect. */
+  recoveries: Recovery[];
   /** The app this account has published, if any. */
   app?: AppManifest;
   balance: Balance;
@@ -84,7 +130,20 @@ export type AccountOp =
   | { type: 'create_account'; device_key: string }
   | { type: 'approve_device'; account_id: string; seq: number; device_key: string }
   | { type: 'revoke_device'; account_id: string; seq: number; device_key: string }
-  | { type: 'publish_app'; account_id: string; seq: number; app: AppManifest };
+  | { type: 'publish_app'; account_id: string; seq: number; app: AppManifest }
+  /** Signed by the account key itself. */
+  | {
+      type: 'set_controllers';
+      account_id: string;
+      seq: number;
+      controllers: Controller[];
+      methods_required: number;
+    }
+  /** Signed by the device to recover. `at` is the time now, in seconds since 1970. */
+  | { type: 'recover_device'; account_id: string; at: number; approvals: Approval[] }
+  /** Signed by the device being recovered, once its wait is over. */
+  | { type: 'complete_recovery'; account_id: string; at: number }
+  | { type: 'cancel_recovery'; account_id: string; seq: number; device_key: string };
 
 /**
  * What a request asks for. Of the calls `decomp-core` defines, these are the ones

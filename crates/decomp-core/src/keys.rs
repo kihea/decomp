@@ -276,3 +276,26 @@ impl OpeningKey {
         shared.was_contributory().then(|| shared.to_bytes())
     }
 }
+
+hex_newtype!(
+    /// A passkey's public key (spec section 1, "Passkey: The passkey's public
+    /// key"): a point on the P-256 curve, as the 65 bytes that start with 04.
+    /// That is the form a browser gives a new passkey's key in.
+    PasskeyKey,
+    65
+);
+
+hex_newtype!(
+    /// A crypto wallet's public key (spec section 1, "Crypto wallet: The
+    /// wallet's public key"): a point on the secp256k1 curve, which Ethereum
+    /// wallets sign with, as the 65 bytes that start with 04.
+    WalletKey,
+    65
+);
+
+hex_newtype!(
+    /// A wallet's signature as an Ethereum wallet hands it over: `r`, `s`, and
+    /// one more byte that says which of two keys made it.
+    WalletSignature,
+    65
+);

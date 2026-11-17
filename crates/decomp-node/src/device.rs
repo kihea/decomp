@@ -26,7 +26,21 @@ pub fn opening_key(dir: &Path) -> io::Result<OpeningKey> {
         return Ok(key);
     }
     let key = OpeningKey::generate();
-    save_seed(dir, OPENING_KEY_FILE, &key.seed())?;
+    save_seed(&dir.join(OPENING_KEY_FILE), &key.seed())?;
+    Ok(key)
+}
+
+/// A key kept in a file of its own, outside this device's directory: a
+/// recovery key, or the key of a coordinator's operator. `None` if there is no
+/// such file.
+pub fn key_file(path: &Path) -> io::Result<Option<SigningKey>> {
+    Ok(read_seed(path)?.map(SigningKey::from_seed))
+}
+
+/// Makes a key and saves it as a new file at `path`.
+pub fn create_key_file(path: &Path) -> io::Result<SigningKey> {
+    let key = SigningKey::generate();
+    save_seed(path, &key.seed())?;
     Ok(key)
 }
 
@@ -47,13 +61,15 @@ fn read_seed(path: &Path) -> io::Result<Option<[u8; 32]>> {
 /// Makes a new key and saves it. Never replaces an existing key file.
 pub fn create(dir: &Path) -> io::Result<SigningKey> {
     let key = SigningKey::generate();
-    save_seed(dir, KEY_FILE, &key.seed())?;
+    save_seed(&dir.join(KEY_FILE), &key.seed())?;
     Ok(key)
 }
 
 /// Saves a key's secret bytes as a new file. Never replaces an existing file.
-fn save_seed(dir: &Path, file: &str, seed: &[u8; 32]) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
+fn save_seed(path: &Path, seed: &[u8; 32]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -61,5 +77,5 @@ fn save_seed(dir: &Path, file: &str, seed: &[u8; 32]) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600); // readable by the owner only
     }
-    options.open(dir.join(file))?.write_all(seed)
+    options.open(path)?.write_all(seed)
 }

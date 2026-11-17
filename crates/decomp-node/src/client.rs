@@ -4,11 +4,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decomp_core::LogError;
 use decomp_core::{
-    AccountId, AccountOp, AccountStatus, AppManifest, BatchRecords, Blob, BlobData, BlobRef, Call,
-    Challenge, Change, CheckedIn, ContentHash, Credits, Envelope, Inclusion, IncomingChannels,
-    JobId, JobResult, JobStatus, Located, LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES, Manifest,
-    Placement, PublicKey, PublishedKey, Refusal, Request, Route, SealingKey, SettlementLog,
-    ShardNow, SigningKey, Standing, Submitted, Through, seal,
+    AccountId, AccountOp, AccountStatus, AppManifest, Approval, BatchRecords, Blob, BlobData,
+    BlobRef, Call, CashOut, CashOuts, Challenge, Change, CheckedIn, ContentHash, Credits, Envelope,
+    Inclusion, IncomingChannels, JobId, JobResult, JobStatus, Located, LogPage, MAX_LOG_PAGE,
+    MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey, PublishedKey, Refusal, Request, Route,
+    SealingKey, SettlementLog, ShardNow, SigningKey, Standing, Submitted, Through, seal,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -84,6 +84,77 @@ impl Client {
             app,
         };
         self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
+    }
+
+    /// Starts the recovery of this device into the account `account_id`, with
+    /// what the account's controllers signed to approve it.
+    pub fn recover(
+        &self,
+        account_id: AccountId,
+        approvals: Vec<Approval>,
+    ) -> Result<AccountStatus, ClientError> {
+        let op = AccountOp::RecoverDevice {
+            account_id,
+            at: unix_now(),
+            approvals,
+        };
+        self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
+    }
+
+    /// Finishes this device's recovery, once its waiting period is over.
+    pub fn complete_recovery(&self, account_id: AccountId) -> Result<AccountStatus, ClientError> {
+        let op = AccountOp::CompleteRecovery {
+            account_id,
+            at: unix_now(),
+        };
+        self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
+    }
+
+    /// Cancels the recovery of `device_key` that waits on this device's account.
+    pub fn cancel_recovery(&self, device_key: PublicKey) -> Result<AccountStatus, ClientError> {
+        let account = self.account()?.account;
+        let op = AccountOp::CancelRecovery {
+            account_id: account.id,
+            seq: account.seq,
+            device_key,
+        };
+        self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
+    }
+
+    /// As the coordinator's operator: records that `account` bought `amount`
+    /// credits with the payment named `payment`.
+    pub fn credit_purchase(
+        &self,
+        account: AccountId,
+        amount: Credits,
+        payment: String,
+    ) -> Result<(), ClientError> {
+        let call = Call::CreditPurchase {
+            account,
+            amount,
+            payment,
+        };
+        self.call::<IgnoredAny>(call)?;
+        Ok(())
+    }
+
+    /// As the coordinator's operator: the cash-outs that wait.
+    pub fn cash_outs(&self) -> Result<Vec<CashOut>, ClientError> {
+        let CashOuts { waiting } = self.call(Call::GetCashOuts)?;
+        Ok(waiting)
+    }
+
+    /// As the coordinator's operator: records that a cash-out was paid by the
+    /// payment named `payout`.
+    pub fn pay_cash_out(&self, id: ContentHash, payout: String) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::PayCashOut { id, payout })?;
+        Ok(())
+    }
+
+    /// As the coordinator's operator: refuses a cash-out.
+    pub fn refuse_cash_out(&self, id: ContentHash) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::RefuseCashOut { id })?;
+        Ok(())
     }
 
     pub fn stake(&self, amount: Credits) -> Result<AccountStatus, ClientError> {

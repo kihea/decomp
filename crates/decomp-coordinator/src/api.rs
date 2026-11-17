@@ -15,9 +15,10 @@ use axum::routing::post;
 use axum::{Json, Router};
 use decomp_core::{
     Account, AccountStatus, Accounts, Addressed, BEACON_PERIOD_SECS, Blob, BlobData, BlobRef, Call,
-    ContentHash, Envelope, EnvelopeError, JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS,
-    MAX_MESSAGE_BYTES, OpError, Outcome, PrivacyError, PublicKey, PublishedKey, Refusal,
-    RelayError, Request, ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted,
+    CashOutAsked, CashOuts, ContentHash, Envelope, EnvelopeError, JobError, LedgerEntry,
+    LedgerError, MAX_CLOCK_SKEW_SECS, MAX_MESSAGE_BYTES, OpError, Outcome, PrivacyError, PublicKey,
+    PublishedKey, Refusal, RelayError, Request, ShardNow, ShardRef, SponsorError, StorageError,
+    Storing, Submitted,
 };
 use decomp_node::beacon::Rounds;
 use decomp_sandbox::Sandbox;
@@ -106,7 +107,7 @@ async fn submit_op(
         .coordinator
         .lock()
         .expect("coordinator lock")
-        .apply_op(&envelope)?;
+        .apply_op(&envelope, unix_now())?;
     Ok(Json(status))
 }
 
@@ -281,6 +282,53 @@ fn answer(
             coordinator.dispute(&envelope, &account.id, batch, found, now)?;
             Json(json!({})).into_response()
         }
+        Call::CreditPurchase {
+            account: buyer,
+            amount,
+            payment,
+        } => {
+            operator_only(coordinator, &signer)?;
+            coordinator.record(LedgerEntry::Buy {
+                account: buyer,
+                amount,
+                payment,
+            })?;
+            Json(json!({})).into_response()
+        }
+        Call::CashOut { amount } => {
+            if signer != account.account_key {
+                let message = "a cash-out must be signed by the account key itself";
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "not_account_key",
+                    message,
+                ));
+            }
+            // The request's signature names the cash-out, so the same request
+            // sent twice asks for one cash-out.
+            let id = ContentHash::of(envelope.signature.as_bytes());
+            coordinator.record(LedgerEntry::CashOut {
+                id,
+                account: account.id,
+                amount,
+            })?;
+            Json(CashOutAsked { id }).into_response()
+        }
+        Call::GetCashOuts => {
+            operator_only(coordinator, &signer)?;
+            let waiting = coordinator.cash_outs();
+            Json(CashOuts { waiting }).into_response()
+        }
+        Call::PayCashOut { id, payout } => {
+            operator_only(coordinator, &signer)?;
+            coordinator.record(LedgerEntry::CashOutPaid { id, payout })?;
+            Json(json!({})).into_response()
+        }
+        Call::RefuseCashOut { id } => {
+            operator_only(coordinator, &signer)?;
+            coordinator.record(LedgerEntry::CashOutRefused { id })?;
+            Json(json!({})).into_response()
+        }
         Call::SubmitResult { result } => {
             if let Outcome::Completed {
                 output,
@@ -312,8 +360,16 @@ fn member<'a>(accounts: &'a Accounts, signer: &PublicKey) -> Result<&'a Account,
         let message = "this key does not belong to an account";
         ApiError::new(StatusCode::NOT_FOUND, "not_linked", message)
     })?;
+    if account.is_recovering(signer) {
+        let message = "this device's recovery of the account has not taken effect yet";
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "recovery_waiting",
+            message,
+        ));
+    }
     if !account.authorizes(signer) {
-        let message = "this device has been revoked";
+        let message = "this device has been revoked, or its recovery was cancelled";
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "device_revoked",
@@ -321,6 +377,22 @@ fn member<'a>(accounts: &'a Accounts, signer: &PublicKey) -> Result<&'a Account,
         ));
     }
     Ok(account)
+}
+
+/// Refuses a request that only this coordinator's operator may make: saying
+/// that credits were paid for, and paying or refusing a cash-out. The operator
+/// is the one party the coordinator can take that from, until payments are
+/// checked some other way.
+fn operator_only(coordinator: &Coordinator, signer: &PublicKey) -> Result<(), ApiError> {
+    if *signer == coordinator.operator() {
+        return Ok(());
+    }
+    let message = "only the coordinator's operator may do this";
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "not_operator",
+        message,
+    ))
 }
 
 /// The longest address a node may declare.
@@ -402,6 +474,13 @@ impl From<OpError> for ApiError {
             OpError::UnknownDevice => (StatusCode::NOT_FOUND, "unknown_device"),
             OpError::AlreadyRevoked => (StatusCode::CONFLICT, "already_revoked"),
             OpError::BadApp(_) => (StatusCode::BAD_REQUEST, "bad_app"),
+            OpError::NotAccountKey => (StatusCode::FORBIDDEN, "not_account_key"),
+            OpError::BadControllers(_) => (StatusCode::BAD_REQUEST, "bad_controllers"),
+            OpError::NotApproved => (StatusCode::FORBIDDEN, "not_approved"),
+            OpError::TooManyRecoveries => (StatusCode::CONFLICT, "too_many_recoveries"),
+            OpError::NoSuchRecovery => (StatusCode::NOT_FOUND, "unknown_recovery"),
+            OpError::RecoveryWaiting { .. } => (StatusCode::CONFLICT, "recovery_waiting"),
+            OpError::WrongTime => (StatusCode::BAD_REQUEST, "stale_request"),
         };
         Self::new(status, code, error.to_string())
     }
@@ -436,6 +515,14 @@ impl From<LedgerError> for ApiError {
             LedgerError::InsufficientStake => (StatusCode::CONFLICT, "insufficient_stake"),
             LedgerError::UnknownAccount => (StatusCode::NOT_FOUND, "unknown_account"),
             LedgerError::AlreadyEscrowed => (StatusCode::CONFLICT, "job_exists"),
+            LedgerError::TooFewToCashOut => {
+                (StatusCode::PAYMENT_REQUIRED, "insufficient_earned_credits")
+            }
+            LedgerError::NoAmount => (StatusCode::BAD_REQUEST, "no_amount"),
+            LedgerError::PaymentCredited => (StatusCode::CONFLICT, "payment_credited"),
+            LedgerError::BadPaymentName => (StatusCode::BAD_REQUEST, "bad_payment_name"),
+            LedgerError::CashOutExists => (StatusCode::CONFLICT, "cash_out_exists"),
+            LedgerError::UnknownCashOut => (StatusCode::NOT_FOUND, "unknown_cash_out"),
             LedgerError::NothingEscrowed | LedgerError::FeeExceedsEscrow => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "ledger_failed")
             }

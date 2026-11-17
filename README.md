@@ -20,7 +20,9 @@ Build step 1 of 14: **accounts, device keys, and device linking**.
 
 - An account is an Ed25519 key. Creating one stores no personal data anywhere.
 - Each device has its own key. A device joins an account when a device already in
-  it approves the new device's code, and any device can remove another.
+  it approves the new device's code, and any device can remove another. Build
+  step 14 added the other ways in: see "Sign-in, recovery, and credits for
+  money" below.
 - The coordinator keeps the account records in an append-only log of the signed
   requests that produced them.
 
@@ -447,11 +449,97 @@ between them.
   wrong amounts only; a node's proof against a disputed batch's corrected
   fingerprint; and a dispute that names other figures than the records give.
 
+**Sign-in, recovery, and credits for money** (build step 14).
+
+- **Controllers.** The spec's account record has "`controllers`: Public keys
+  allowed to approve or revoke devices, and how many must agree", and
+  "DeComp knows only controller keys. How a person proves they should control
+  one is handled ... outside the account record." An account now holds a list
+  of controllers beside its account key, each one of four kinds, which cover
+  the five rows of the spec's table of methods:
+
+  | Method in the spec | What the record holds | How it approves a device |
+  | --- | --- | --- |
+  | Recovery key or phrase: "A public key" | An Ed25519 key | Signs the statement |
+  | Email reset: "The public key of a recovery service" | An Ed25519 key, the same kind | Signs the statement |
+  | Guardian accounts: "The guardians' account IDs and how many must agree" | The account IDs and the number | That many of the accounts each sign the statement, with their account key or one of their devices |
+  | Passkey: "The passkey's public key" | A P-256 key | A WebAuthn assertion whose challenge is the hash of the statement |
+  | Crypto wallet: "The wallet's public key" | A secp256k1 key | Ethereum's `personal_sign` of the statement |
+
+  The statement is two lines of text that name the account and the device.
+- **Changing controllers.** The account key signs "changing controllers", and
+  nothing else may: one request replaces the list and says how many of the
+  controllers must agree, one or two ("an account can require two methods to
+  agree").
+- **Recovery.** "A passkey or any other controller can approve a device the
+  same way." A device that is in no account signs a request that carries the
+  controllers' approvals of it. If enough controllers approved, a recovery
+  starts. "A recovery takes effect after 48 hours (starting value), and any
+  approved device can cancel it in that time": the device joins the account
+  when it asks again after the wait, and until then any device of the account,
+  or the account key, can cancel. A device whose recovery was cancelled can
+  never join.
+- **The command.** `decomp-node recovery-key` makes a recovery key in a file.
+  `recover` starts a recovery with recovery keys or with approvals made
+  elsewhere, and finishes it after the wait. `approve-recovery` is a guardian
+  approving a device. `cancel-recovery` cancels one. `account` shows the
+  controllers and the recoveries that wait. The TypeScript client has the new
+  message shapes, the statement, and how a key and a passkey approve.
+- **Credits bought.** "Credits can be bought and cashed out for money." The
+  coordinator's operator records that an account bought credits with a named
+  payment, and the account is credited. A payment is credited once.
+- **Cash-outs.** The account key asks ("cash-outs" are among what the account
+  key signs). Earned credits are set aside, and never granted ones: "Granted
+  credits can be spent but not transferred or cashed out." The operator then
+  records the cash-out as paid, and the credits are gone for good, or refuses
+  it, and they go back. Bought credits come from nowhere and paid-out credits
+  go nowhere, as a starter grant does, and a batch posts both as changes at
+  the account's ledger address.
+- **No money moves.** Nothing here takes a payment, checks one, or pays anyone.
+  See "Known gaps".
+- Seen, with a coordinator alone, a recovery wait of 8 seconds, and batches
+  every 5 seconds: a request to set controllers refused from a device, and
+  with three of two guardians, two methods required of one controller, an
+  account as its own guardian, a controller listed twice, and a passkey key
+  of the wrong length; five controllers set by the account key. With a
+  recovery key made by `recovery-key`: a key that is not a controller
+  refused; a recovery started by `recover`; the waiting device refused the
+  account, and refused when it asked to join early or with a time far from
+  the clock; after the wait, `recover` put the device in the account. A
+  second recovery cancelled by the first recovered device: joining refused
+  after the wait, and starting again refused. A recovery started by a second
+  Ed25519 key standing for a recovery service's. With guardians, two of three:
+  one guardian, the same guardian twice, a guardian and an account that is not
+  one, and two guardians who signed for another device were each refused; two
+  guardians, each by `approve-recovery`, started a recovery. With a passkey:
+  an assertion made by a script from a P-256 key and signed by OpenSSL was
+  taken, and one over another device, one of the kind that makes a passkey,
+  one with no person present, and one with a changed signature were each
+  refused. With a wallet: a `personal_sign` signature made by a script from a
+  secp256k1 key was taken, and one over another device and one by another
+  wallet were refused. A fifth recovery waiting at once was refused. With two
+  methods required: a wallet alone and a wallet twice were refused, and a
+  wallet and a passkey together started a recovery. After the account key
+  removed every controller, the recovery key was refused.
+- Seen, of credits: a purchase recorded by a device refused; 40 credits
+  recorded by the operator against a payment, and the same payment refused a
+  second time; a cash-out asked by a device refused; one of 50 refused with 40
+  earned and 25 granted; one of 30 set aside, a further 20 refused, and the 30
+  listed for the operator; a device refused when it tried to pay it; refused
+  by the operator, the 30 back; asked again and recorded as paid, 10 earned
+  left and paying it twice refused. The batch after showed a change of +10 at
+  the account's ledger address, the 40 bought less the 30 paid out. After a
+  restart the account, its waiting recoveries, and its balance were as
+  before. A second operator's coordinator found every batch to hold.
+- Not seen: an assertion from a real passkey, or a signature from a real
+  wallet. Both were made by scripts with software keys, in the forms a browser
+  and a wallet give. A wait of 48 hours.
+
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment, which nodes a job is kept from, and verification), the storage and relay rules, sealing, app state, batches and the settlement log, private jobs and their routes, cutting a private job's numbers into shares, encrypting its values for nodes that compute on them, and every message shape. No I/O. |
+| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, controllers and recoveries, credits, node scores, the job rules (assignment, which nodes a job is kept from, and verification), the storage and relay rules, sealing, app state, batches and the settlement log, private jobs and their routes, cutting a private job's numbers into shares, encrypting its values for nodes that compute on them, and every message shape. No I/O. |
 | `crates/decomp-schema` | How a job's input and output types and its privacy mode are described and checked, and the byte form of a set of records. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
 | `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, the batches it posts, and what it stores (logs, blobs, its operator's key). |
@@ -594,11 +682,72 @@ DECOMP_FOLLOW=http://127.0.0.1:8787 DECOMP_DATA_DIR=operator2 cargo run -p decom
 The first coordinator's operator key is shown when it starts, too. Approved
 into an account, it has that account's stake to lose.
 
+A recovery key, made in a file to keep offline. It shows the public key, which
+the account adds as a controller (the account key signs that, and the
+command-line node holds no account key: see "Known gaps"):
+
+```bash
+cargo run -p decomp-node -- recovery-key path/to/recovery.key
+```
+
+An account recovered onto a new device with that key. The first command starts
+the recovery and says when it takes effect. The second, run after that, puts
+the device in the account:
+
+```bash
+cargo run -p decomp-node -- --dir new-device recover <account id> --key path/to/recovery.key
+```
+
+```bash
+cargo run -p decomp-node -- --dir new-device recover
+```
+
+With guardians, the new device runs `recover <account id>` with nothing else,
+which shows its code. Each guardian approves it and saves what is shown, and
+the new device hands the files in. An approval by a passkey or a wallet,
+made elsewhere, is handed in the same way:
+
+```bash
+cargo run -p decomp-node -- approve-recovery <account id> <device code> > guardian1.json
+```
+
+```bash
+cargo run -p decomp-node -- --dir new-device recover <account id> --approval guardian1.json --approval guardian2.json
+```
+
+A recovery that is waiting, cancelled from a device of the account. `account`
+shows the ones that wait:
+
+```bash
+cargo run -p decomp-node -- cancel-recovery <device code>
+```
+
+Credits bought and cashed out, as the coordinator's operator. The operator's
+key must be a device of an account. These record what the operator says
+happened; no money is taken or paid by them:
+
+```bash
+cargo run -p decomp-node -- bought <account id> 40 --payment <a name for the payment> --operator-key data/operator.key
+```
+
+```bash
+cargo run -p decomp-node -- cash-outs --operator-key data/operator.key
+```
+
+```bash
+cargo run -p decomp-node -- pay-cash-out <cash-out> --payout <a name for the payment> --operator-key data/operator.key
+```
+
+```bash
+cargo run -p decomp-node -- refuse-cash-out <cash-out> --operator-key data/operator.key
+```
+
 Coordinator settings are `DECOMP_ADDR`, `DECOMP_DATA_DIR`,
 `DECOMP_STORAGE_CHALLENGE_SECS` (how often each node is asked to show that it
 still holds a blob; an hour unless set), `DECOMP_BATCH_SECS` (how often a
 batch is posted to the settlement log; ten minutes unless set),
 `DECOMP_DISPUTE_WINDOW_SECS` (how long a batch can be disputed; an hour unless
+set), `DECOMP_RECOVERY_WAIT_SECS` (how long a recovery waits; 48 hours unless
 set), and `DECOMP_FOLLOW` (the coordinator to audit, as above). The node agent takes
 `--coordinator` and `--dir`, or `DECOMP_COORDINATOR_URL` and `DECOMP_NODE_DIR`.
 
@@ -609,6 +758,85 @@ cargo fmt --all -- --check && cargo clippy --all-targets
 ```
 
 ## Design decisions
+
+**A controller approves a device by signing two lines of text.** The text is
+`decomp/v1/approve-device`, the account's ID, and the device's key. It names
+no time and no place in the account's history, because guardians may take days
+to sign and a device that is in no account cannot read the account's record.
+It can still be used only once: a device key belongs to one account for good,
+whether its recovery takes effect or is cancelled. The request that carries
+the approvals is signed by the device itself, so nobody else can spend them.
+
+**Everything a controller approves waits.** The spec says "a passkey or any
+other controller can approve a device the same way" as an approved device
+does, and also "A recovery takes effect after 48 hours". It lists passkeys
+among the recovery methods the waiting period applies to: "Every recovery
+method is also a way in for an attacker, so three rules apply". So only the
+account key and approved devices add a device at once, and a device approved
+by a passkey waits like any other. That makes signing in to a new device with
+a passkey take two days. It is the reading that lets nobody in early; the
+owner may want passkeys to be quicker.
+
+**Only the account key changes controllers.** The spec's table of keys has the
+account key sign "changing controllers", and names no other key for it. A
+device that could add a controller could keep a way in after it was removed.
+
+**A recovery key and a recovery service's key are one kind of controller.**
+The spec stores "a public key" for one and "the public key of a recovery
+service" for the other, and "DeComp knows only controller keys". Who holds the
+key is not DeComp's to know.
+
+**A passkey is checked as a WebAuthn assertion, and its site is not.** The
+signature (ECDSA on P-256, in the form passkeys give it) must be over the
+authenticator data and the hash of the client data; the client data must be
+of the kind made when signing in, and its challenge must be the hash of the
+statement; and the authenticator must say a person was present. The client
+data also names the site the passkey was used on, and the authenticator data
+the hash of the site's name. DeComp stores only "the passkey's public key",
+so it has no site to compare with: which sites may use a passkey is the
+browser's rule.
+
+**A wallet is a secp256k1 key that signs as Ethereum wallets do.** The spec
+says "a crypto wallet" and "the wallet's public key" and names no chain. One
+scheme is the least: the key Ethereum wallets hold, and the signature their
+`personal_sign` gives, which is over the statement as a person can read it.
+The record holds the public key, not the shorter address made from it.
+
+**A guardian account signs with its account key or any of its devices.** The
+spec stores "the guardians' account IDs", and whoever may act for an account
+elsewhere may approve as that guardian. Two devices of one guardian count
+once.
+
+**A recovery's time is in the request, not read from a clock.** Account
+records are rebuilt by replaying requests, which must give the same records
+every time. So the request that starts a recovery carries the time, and the
+request that finishes it carries the time; the second is refused if it is
+before the first plus the wait. A coordinator refuses either when it first
+arrives if its time is more than five minutes from its own clock, so a
+recovery can finish early by that much and no more. The wait is a setting,
+`DECOMP_RECOVERY_WAIT_SECS`, and an operator that audits another must run
+with the same one.
+
+**Up to four recoveries of an account wait at once.** One at a time would let
+whoever started first keep the account's owner out.
+
+**Bought credits are counted with earned ones.** The spec sets granted credits
+apart ("Granted credits can be spent but not transferred or cashed out") and
+no others, so a bought credit can be spent, staked, and cashed out, as an
+earned one can.
+
+**The operator says that money moved.** Something outside DeComp must say that
+a payment arrived or a payout was made. The one key a coordinator can take
+that from is its own operator's, which already signs its batches. The name of
+the payment goes into the credit record, and that is all that ties a credit
+to money.
+
+**A cash-out's credits are set aside, then removed or returned.** A request
+names an amount and nothing about where money should go: there is no route
+for it to go by. The request's signature names the cash-out, so the same
+request sent twice asks once. Credits set aside for a cash-out still count
+as the account's on the settlement log, as credits set aside for a job do,
+until the operator records it as paid.
 
 **One signed-message format.** Every request is an envelope: a JSON payload as a
 string, the signer's public key, and a signature over `"decomp/v1\n"` plus that
@@ -1142,7 +1370,16 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | Reading the log, a proof, or the records behind a batch scans a file from its start | Every such answer is read out of a log file by line number, under the coordinator's one lock. | When load needs it |
 | No automated tests | Tests are added only once the code is built, to guard against regressions. The flows were checked by hand. | Owner's go-ahead |
 | No test vectors shared by Rust and TypeScript | Same reason. Until then, a change to the envelope format must be checked end to end by hand. | First test pass |
-| The account key is the only controller | Passkeys, recovery keys, guardians, and email reset are build step 14. A device that loses its account key cannot be recovered. | Build step 14 |
+| Nothing takes or pays out money | "Credits can be bought and cashed out for money, with stablecoins as the first route. The legal questions this raises must be settled before launch", and version 1 needs "cash-out and the token decision ... cleared with legal advice". There is no stablecoin route and no check that a payment was made: a purchase and a payout are records the operator writes. Nothing here may be used to sell or redeem credits. | Legal advice, then a payment route |
+| A purchase or a payout is the operator's word | Nothing ties the name of a payment to a payment. An operator can credit an account for nothing, or record a cash-out as paid and pay nobody. Another operator's audit follows these records and cannot check them. | A payment route that the ledger, or the other operators, can check |
+| A cash-out says nothing of where the money goes | See "A cash-out's credits are set aside, then removed or returned". | A payment route |
+| A controller cannot revoke a device | The spec's controllers are "allowed to approve or revoke devices". The account key can revoke. A recovery key that could revoke at once could remove every device that might cancel its own recovery, and the spec does not say whether a revocation waits. A recovered device can revoke the others once it is in. | The owner's decision |
+| Controllers are frozen if the account key is lost | Only the account key changes controllers. The controllers there are still recover the account, but none can be added or removed after. | The owner's decision on what else may change them |
+| Signing in to a new device with a passkey waits two days | See "Everything a controller approves waits". | The owner's decision |
+| The waiting period and the number of methods are not confirmed | 48 hours is the spec's starting value, and "two methods" its only number. The spec asks to "set defaults for the waiting period and the two-method rule; test with real users before launch". An account requires one method unless its owner says two. | Testing with users |
+| A device that starts a recovery is shown the account's record | The answer to every change to an account is the account, with its devices and its balance. A thief with a recovery key sees them two days before it could act. | An answer that holds only the recovery |
+| No passkey or wallet has signed | The checks were run on an assertion and a `personal_sign` signature made by scripts with software keys. | A run with a real authenticator and a real wallet |
+| The command-line node cannot set controllers or ask for a cash-out | Both are signed by the account key, and the command never holds one: it joins accounts that something else made. | An account made from the command line, if that is wanted |
 | The command-line node keeps its keys in plain files | It has no access to the system keychain. On Unix the files are readable by their owner only. | When the command needs it |
 | A job is not handed to another node if one goes silent | It waits for its deadline and expires; the silent node loses availability. A working node now checks in, but the coordinator does not yet use that to tell a node that has gone from one that is busy. | Re-assignment of jobs |
 | A beacon round is taken on the word of the server it is fetched from | Each drand round carries a BLS signature that proves it against the network's public key. Neither the coordinator nor a checker verifies it: both fetch the round from `api.drand.sh` over HTTPS and compare. | A BLS12-381 signature check, when a draw must hold against someone who controls that server |
@@ -1161,7 +1398,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | No penalty for proven fraud | Removal from the network and loss of the whole stake apply to offenses such as running a swapped model, which need inference to exist. | Build step 12 |
 | Stake can be taken back between a wrong result and its verdict | Taking stake back is refused only while a node is on a job; refereeing takes seconds more. | A waiting period on taking stake back |
 | The treasury only fills up | Starter grants are created rather than drawn from the treasury, and nothing is paid out of it. A batch posts a grant as credits that come from nowhere, so the log's balances add up to the grants made. | The owner's decision on what funds grants before the treasury has income |
-| Starter credits can be turned into earned credits | An owner with several accounts can spend one account's grant on jobs run by nodes in the others, keeping 85% as credits that can be cashed out. Probation and stake raise the cost; nothing here prevents it. | Owner's call, before cash-out exists (step 14) |
+| Starter credits can be turned into earned credits (and a cash-out can now be recorded) | An owner with several accounts can spend one account's grant on jobs run by nodes in the others, keeping 85% as credits that can be cashed out. Probation and stake raise the cost; nothing here prevents it. | Owner's call, before cash-out exists (step 14) |
 | The coordinator handles one request at a time | All state sits behind one lock, including blob reads and writes. | When load needs it. Build step 13 added the batch clock, the beacon, and dispute judging behind the same lock, and judging a dispute reads every record |
 | A job that overflows the call stack may not fail the same way everywhere | Stack depth is measured in native stack bytes, which differ by processor type. Two honest nodes on different processors could disagree about such a job. | Before nodes on mixed hardware verify each other (build step 5) |
 | Modules are compiled again on every run | The agent has no cache of compiled modules yet. Compiling is fast next to running a job. | When measurements show it matters |

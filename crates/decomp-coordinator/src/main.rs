@@ -13,9 +13,12 @@
 //!   (default ten minutes)
 //! - `DECOMP_DISPUTE_WINDOW_SECS`: how long after a batch is posted another
 //!   operator may dispute it (default one hour)
+//! - `DECOMP_RECOVERY_WAIT_SECS`: how long a recovery of an account waits
+//!   before it takes effect (default 48 hours)
 //! - `DECOMP_FOLLOW`: the address of another operator's coordinator to audit.
-//!   With it, of the settings above only `DECOMP_DATA_DIR` is read, for the
-//!   operator's key.
+//!   With it, of the settings above only `DECOMP_DATA_DIR`, for the
+//!   operator's key, and `DECOMP_RECOVERY_WAIT_SECS`, which must be what the
+//!   audited coordinator runs with, are read.
 
 mod api;
 mod blobs;
@@ -30,10 +33,10 @@ use std::error::Error;
 use std::path::Path;
 use std::time::Duration;
 
-use decomp_core::{BATCH_PERIOD_SECS, DISPUTE_WINDOW_SECS};
+use decomp_core::{BATCH_PERIOD_SECS, DISPUTE_WINDOW_SECS, RECOVERY_WAIT_SECS};
 use tokio::net::TcpListener;
 
-use crate::state::Coordinator;
+use crate::state::{Coordinator, Waits};
 
 /// How long a stored blob goes between challenges unless set otherwise. Shorter
 /// catches a node that dropped a blob sooner; longer costs nodes less traffic.
@@ -41,14 +44,18 @@ const DEFAULT_CHALLENGE_INTERVAL_SECS: u64 = 3600;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let data_dir = env::var("DECOMP_DATA_DIR").unwrap_or_else(|_| "data".into());
+    let recovery_wait = match env::var("DECOMP_RECOVERY_WAIT_SECS") {
+        Ok(seconds) => seconds.parse()?,
+        Err(_) => RECOVERY_WAIT_SECS,
+    };
     match env::var("DECOMP_FOLLOW") {
-        Ok(url) => follow::run(&url, Path::new(&data_dir)),
-        Err(_) => serve(data_dir),
+        Ok(url) => follow::run(&url, Path::new(&data_dir), recovery_wait),
+        Err(_) => serve(data_dir, recovery_wait),
     }
 }
 
 #[tokio::main]
-async fn serve(data_dir: String) -> Result<(), Box<dyn Error>> {
+async fn serve(data_dir: String, recovery_wait: u64) -> Result<(), Box<dyn Error>> {
     let addr = env::var("DECOMP_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".into());
 
     let challenge_interval = match env::var("DECOMP_STORAGE_CHALLENGE_SECS") {
@@ -66,7 +73,12 @@ async fn serve(data_dir: String) -> Result<(), Box<dyn Error>> {
         Err(_) => DISPUTE_WINDOW_SECS,
     };
 
-    let coordinator = Coordinator::open(Path::new(&data_dir), challenge_interval, dispute_window)?;
+    let waits = Waits {
+        challenge_interval,
+        dispute_window,
+        recovery_wait,
+    };
+    let coordinator = Coordinator::open(Path::new(&data_dir), waits)?;
     let listener = TcpListener::bind(&addr).await?;
     println!("coordinator listening on http://{addr}, data in {data_dir}/");
     println!("operator key: {}", coordinator.operator());

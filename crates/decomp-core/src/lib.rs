@@ -5,6 +5,7 @@
 
 mod account;
 mod app;
+pub mod controller;
 mod draw;
 pub mod encrypted;
 mod envelope;
@@ -25,9 +26,13 @@ mod splits;
 mod state;
 mod storage;
 
-pub use account::{Account, AccountOp, Accounts, Device, OpError};
+pub use account::{Account, AccountOp, Accounts, Device, OpError, Recovery};
 pub use app::{
     AppManifest, MAX_APP_MODULES, MAX_APP_NAME_BYTES, SponsorError, Sponsored, Sponsorship,
+};
+pub use controller::{
+    Approval, Controller, MAX_CONTROLLERS, MAX_GUARDIANS, MAX_WAITING_RECOVERIES,
+    MOST_METHODS_REQUIRED, RECOVERY_WAIT_SECS,
 };
 pub use draw::{
     BEACON_CHAIN, BEACON_MAX_LAG_ROUNDS, BEACON_PERIOD_SECS, Beacon, Draw, DrawError, Eligible,
@@ -43,12 +48,12 @@ pub use job::{
 };
 pub use jobs::{ClosedJob, Closure, Dispute, FollowUps, JobError, Jobs};
 pub use keys::{
-    AccountId, ContentHash, JobId, LedgerAddress, OpeningKey, PublicKey, SealingKey, ShareSet,
-    Signature, SigningKey,
+    AccountId, ContentHash, JobId, LedgerAddress, OpeningKey, PasskeyKey, PublicKey, SealingKey,
+    ShareSet, Signature, SigningKey, WalletKey, WalletSignature,
 };
 pub use ledger::{
-    BASE_PRICE, Balance, Credits, FeeSplit, Holder, Ledger, LedgerEntry, LedgerError,
-    PROBATION_FORFEIT_PERCENT, STARTER_GRANT, fee,
+    BASE_PRICE, Balance, CashOut, Credits, FeeSplit, Holder, Ledger, LedgerEntry, LedgerError,
+    MAX_PAYMENT_NAME_BYTES, PROBATION_FORFEIT_PERCENT, STARTER_GRANT, fee,
 };
 pub use privacy::{
     ENCRYPTED_COMPUTE_MAX_UNITS, NoPrivateRoute, Privacy, PrivacyError, PrivateRoute,
@@ -59,8 +64,9 @@ pub use relay::{
     RelayError, RelayOrder, Relays, Route, Take, Taken, channel_id, relay_fee,
 };
 pub use request::{
-    AccountStatus, Blob, BlobData, BlobRef, Call, CheckedIn, IncomingChannels, MAX_CLOCK_SKEW_SECS,
-    MAX_MESSAGE_BYTES, Placement, PublishedKey, Refusal, Request, ShardNow, Submitted,
+    AccountStatus, Blob, BlobData, BlobRef, Call, CashOutAsked, CashOuts, CheckedIn,
+    IncomingChannels, MAX_CLOCK_SKEW_SECS, MAX_MESSAGE_BYTES, Placement, PublishedKey, Refusal,
+    Request, ShardNow, Submitted,
 };
 pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
 pub use seal::{SEAL_OVERHEAD_BYTES, SealingKeys};

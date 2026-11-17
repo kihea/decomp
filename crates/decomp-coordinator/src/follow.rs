@@ -36,13 +36,16 @@ struct Followed {
 
 /// Audits the coordinator at `url` until stopped. Returns only if the log or
 /// the records behind it cannot be followed at all.
-pub fn run(url: &str, data_dir: &Path) -> Result<(), Box<dyn Error>> {
+pub fn run(url: &str, data_dir: &Path, recovery_wait: u64) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(data_dir)?;
     let client = Client::new(url, operator::key(data_dir)?);
     println!("auditing the coordinator at {url}; this coordinator takes no jobs");
     println!("operator key: {}", client.device_key());
 
-    let mut followed = Followed::default();
+    let mut followed = Followed {
+        auditor: Auditor::waiting(recovery_wait),
+        ..Followed::default()
+    };
     loop {
         match follow(&client, &mut followed) {
             Ok(()) => {}

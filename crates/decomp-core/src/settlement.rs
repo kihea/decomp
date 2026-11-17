@@ -463,9 +463,9 @@ pub enum AuditError {
 /// it; that each job paid for in the period has its receipt in the batch and
 /// was paid as the receipt says, to accounts of nodes that signed it; and that
 /// the balance changes are what the records give. Credit movements that no
-/// receipt stands behind (data services, stake, forfeits, and the pay of
-/// checkers) are followed by the ledger's own rules and otherwise taken on
-/// the operator's word.
+/// receipt stands behind (data services, stake, forfeits, the pay of
+/// checkers, credits bought, and cash-outs) are followed by the ledger's own
+/// rules and otherwise taken on the operator's word.
 #[derive(Default)]
 pub struct Auditor {
     log: SettlementLog,
@@ -474,6 +474,15 @@ pub struct Auditor {
 }
 
 impl Auditor {
+    /// An audit of an operator in whose records a recovery waits
+    /// `recovery_wait` seconds (see `Accounts::waiting`).
+    pub fn waiting(recovery_wait: u64) -> Self {
+        Self {
+            accounts: Accounts::waiting(recovery_wait),
+            ..Self::default()
+        }
+    }
+
     /// The audited operator's log, as far as it has been followed.
     pub fn log(&self) -> &SettlementLog {
         &self.log

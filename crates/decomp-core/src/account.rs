@@ -11,8 +11,10 @@ use std::collections::hash_map::Entry;
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppManifest;
+use crate::controller::{self, Approval, Controller, MAX_WAITING_RECOVERIES, RECOVERY_WAIT_SECS};
 use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{AccountId, LedgerAddress, PublicKey};
+use crate::request::MAX_CLOCK_SKEW_SECS;
 
 /// A signed request to create or change an account.
 #[derive(Debug, Serialize, Deserialize)]
@@ -39,6 +41,39 @@ pub enum AccountOp {
         seq: u64,
         app: AppManifest,
     },
+    /// Replaces the account's controllers and how many of them must agree to
+    /// a recovery (see `controller`). Signed by the account key and by nothing
+    /// else: the spec has the account key sign "changing controllers".
+    SetControllers {
+        account_id: AccountId,
+        seq: u64,
+        controllers: Vec<Controller>,
+        methods_required: u32,
+    },
+    /// Starts a recovery: the account's controllers approve the device whose
+    /// key signed this. `approvals` are their signatures over
+    /// `controller::statement`. The device joins the account when it sends
+    /// `CompleteRecovery` after the waiting period, unless a device of the
+    /// account cancels first. `at` is the time now, in seconds since 1970; a
+    /// coordinator refuses one far from its clock when it first takes the
+    /// request in.
+    RecoverDevice {
+        account_id: AccountId,
+        at: u64,
+        approvals: Vec<Approval>,
+    },
+    /// Finishes the recovery of the device whose key signed this, once its
+    /// waiting period is over. `at` is the time now, checked as in
+    /// `RecoverDevice`, so it can run ahead of the waiting period by no more
+    /// than a clock may be off.
+    CompleteRecovery { account_id: AccountId, at: u64 },
+    /// Cancels a recovery that is waiting. Signed by the account key or by an
+    /// approved device. The device's key is never approved after this.
+    CancelRecovery {
+        account_id: AccountId,
+        seq: u64,
+        device_key: PublicKey,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,6 +87,15 @@ pub struct Account {
     /// which orders changes and stops a captured one from being replayed.
     pub seq: u64,
     pub devices: Vec<Device>,
+    /// The ways the user added to sign in and to recover the account, besides
+    /// the account key (spec section 1, `controllers`: "Public keys allowed
+    /// to approve or revoke devices, and how many must agree").
+    pub controllers: Vec<Controller>,
+    /// How many of `controllers` must approve a device for its recovery to
+    /// start: one, or two ("an account can require two methods to agree").
+    pub methods_required: u32,
+    /// Recoveries that are waiting to take effect.
+    pub recoveries: Vec<Recovery>,
     /// The app this account has published, if any. The account's ID is the app's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<AppManifest>,
@@ -63,7 +107,21 @@ pub struct Device {
     pub revoked: bool,
 }
 
+/// A device that the account's controllers approved and that has not joined
+/// the account yet.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Recovery {
+    pub device_key: PublicKey,
+    /// When the device may join, in seconds since 1970.
+    pub effective_at: u64,
+}
+
 impl Account {
+    /// Whether `key` is a device waiting for its recovery to take effect.
+    pub fn is_recovering(&self, key: &PublicKey) -> bool {
+        self.recoveries.iter().any(|r| r.device_key == *key)
+    }
+
     /// Whether `key` may act for this account: the account key or an approved device.
     pub fn authorizes(&self, key: &PublicKey) -> bool {
         self.account_key == *key || self.devices.iter().any(|d| d.key == *key && !d.revoked)
@@ -90,20 +148,66 @@ pub enum OpError {
     AlreadyRevoked,
     #[error("{0}")]
     BadApp(&'static str),
+    #[error("only the account key may change the account's controllers")]
+    NotAccountKey,
+    #[error("{0}")]
+    BadControllers(&'static str),
+    #[error("too few of the account's controllers approved this device")]
+    NotApproved,
+    #[error("the account already has as many recoveries waiting as it may")]
+    TooManyRecoveries,
+    #[error("no recovery of this device is waiting")]
+    NoSuchRecovery,
+    #[error("the recovery takes effect at {effective_at}, in seconds since 1970, and not before")]
+    RecoveryWaiting { effective_at: u64 },
+    #[error("the request's time is too far from the coordinator's clock")]
+    WrongTime,
 }
 
 /// Every account record, changed only through [`Accounts::apply`].
-#[derive(Default)]
 pub struct Accounts {
     by_id: HashMap<AccountId, Account>,
-    /// A device key belongs to one account for good, revoked or not.
+    /// A device key belongs to one account for good: approved, revoked, or
+    /// waiting on a recovery, even one that was cancelled.
     by_device: HashMap<PublicKey, AccountId>,
+    /// How long a recovery waits before it can be completed, in seconds.
+    recovery_wait: u64,
+}
+
+impl Default for Accounts {
+    fn default() -> Self {
+        Self::waiting(RECOVERY_WAIT_SECS)
+    }
 }
 
 impl Accounts {
-    /// Verifies and applies one operation, returning the changed account.
-    /// On any error the records are left as they were.
+    /// Records in which a recovery waits `recovery_wait` seconds. Everyone
+    /// who replays the same operations must use the same wait.
+    pub fn waiting(recovery_wait: u64) -> Self {
+        Self {
+            by_id: HashMap::new(),
+            by_device: HashMap::new(),
+            recovery_wait,
+        }
+    }
+
+    /// Verifies and applies one operation that was accepted before, returning
+    /// the changed account. On any error the records are left as they were.
     pub fn apply(&mut self, envelope: &Envelope) -> Result<&Account, OpError> {
+        self.apply_checked(envelope, None)
+    }
+
+    /// Verifies and applies an operation that has just arrived, at time
+    /// `now`. Unlike `apply`, it refuses one whose own time is far from `now`.
+    pub fn apply_at(&mut self, envelope: &Envelope, now: u64) -> Result<&Account, OpError> {
+        self.apply_checked(envelope, Some(now))
+    }
+
+    fn apply_checked(
+        &mut self,
+        envelope: &Envelope,
+        now: Option<u64>,
+    ) -> Result<&Account, OpError> {
         let signer = envelope.signer;
         match envelope.open()? {
             AccountOp::CreateAccount { device_key } => {
@@ -121,6 +225,9 @@ impl Accounts {
                         key: device_key,
                         revoked: false,
                     }],
+                    controllers: Vec::new(),
+                    methods_required: 1,
+                    recoveries: Vec::new(),
                     app: None,
                 }))
             }
@@ -169,6 +276,92 @@ impl Accounts {
                 account.seq += 1;
                 Ok(account)
             }
+            AccountOp::SetControllers {
+                account_id,
+                seq,
+                controllers,
+                methods_required,
+            } => {
+                let account = authorized(&mut self.by_id, account_id, seq, &signer)?;
+                if signer != account.account_key {
+                    return Err(OpError::NotAccountKey);
+                }
+                let problem = controller::problem(&controllers, methods_required, &account_id);
+                if let Some(problem) = problem {
+                    return Err(OpError::BadControllers(problem));
+                }
+                account.controllers = controllers;
+                account.methods_required = methods_required;
+                account.seq += 1;
+                Ok(account)
+            }
+            AccountOp::RecoverDevice {
+                account_id,
+                at,
+                approvals,
+            } => {
+                on_time(at, now)?;
+                let account = self.by_id.get(&account_id).ok_or(OpError::UnknownAccount)?;
+                let statement = controller::statement(&account_id, &signer);
+                let acts_for = |key: &PublicKey| {
+                    let account = self.account_of(key)?;
+                    account.authorizes(key).then_some(account.id)
+                };
+                let agreed =
+                    controller::agreeing(&account.controllers, &approvals, &statement, acts_for);
+                if agreed < account.methods_required as usize {
+                    return Err(OpError::NotApproved);
+                }
+                if account.recoveries.len() >= MAX_WAITING_RECOVERIES {
+                    return Err(OpError::TooManyRecoveries);
+                }
+                claim_device(&mut self.by_device, signer, account_id)?;
+                let account = self.by_id.get_mut(&account_id).expect("found above");
+                account.recoveries.push(Recovery {
+                    device_key: signer,
+                    effective_at: at.saturating_add(self.recovery_wait),
+                });
+                account.seq += 1;
+                Ok(account)
+            }
+            AccountOp::CompleteRecovery { account_id, at } => {
+                on_time(at, now)?;
+                let account = self
+                    .by_id
+                    .get_mut(&account_id)
+                    .ok_or(OpError::UnknownAccount)?;
+                let place = account
+                    .recoveries
+                    .iter()
+                    .position(|recovery| recovery.device_key == signer)
+                    .ok_or(OpError::NoSuchRecovery)?;
+                let effective_at = account.recoveries[place].effective_at;
+                if at < effective_at {
+                    return Err(OpError::RecoveryWaiting { effective_at });
+                }
+                account.recoveries.remove(place);
+                account.devices.push(Device {
+                    key: signer,
+                    revoked: false,
+                });
+                account.seq += 1;
+                Ok(account)
+            }
+            AccountOp::CancelRecovery {
+                account_id,
+                seq,
+                device_key,
+            } => {
+                let account = authorized(&mut self.by_id, account_id, seq, &signer)?;
+                let place = account
+                    .recoveries
+                    .iter()
+                    .position(|recovery| recovery.device_key == device_key)
+                    .ok_or(OpError::NoSuchRecovery)?;
+                account.recoveries.remove(place);
+                account.seq += 1;
+                Ok(account)
+            }
         }
     }
 
@@ -205,6 +398,15 @@ fn authorized<'a>(
         });
     }
     Ok(account)
+}
+
+/// Refuses an operation that has just arrived if its own time, `at`, is far
+/// from `now`. An operation read back from a log has no `now` and passes.
+fn on_time(at: u64, now: Option<u64>) -> Result<(), OpError> {
+    match now {
+        Some(now) if now.abs_diff(at) > MAX_CLOCK_SKEW_SECS => Err(OpError::WrongTime),
+        _ => Ok(()),
+    }
 }
 
 fn claim_device(

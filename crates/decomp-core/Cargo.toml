@@ -15,10 +15,16 @@ ed25519-dalek = "3.0.0"
 getrandom = "0.4.3"
 hkdf = "0.13.0"
 hex = "0.4.3"
+# The signature checks of two kinds of account controller (see
+# `src/controller.rs`): a passkey signs with ECDSA on P-256, and a wallet with
+# ECDSA on secp256k1 over a Keccak-256 hash.
+k256 = "0.14.0"
+p256 = "0.14.0"
 rand = "0.10.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+sha3 = "0.12.0"
 # The homomorphic encryption library a device encrypts a private job's values
 # with (see `src/encrypted.rs`). Job modules compute on those values with the
 # same version of it, so a module's copy must change together with this one.

@@ -28,15 +28,15 @@ use std::path::Path;
 
 use decomp_core::{
     Account, AccountId, AccountStatus, Accounts, Assignment, Auditor, BatchRecords, Beacon,
-    Challenge, Change, CheckedIn, Closure, Conduct, ContentHash, Credits, Envelope, EnvelopeError,
-    Finding, FollowUps, Hosts, Inclusion, IncomingChannels, JobError, JobId, JobStatus, Jobs,
-    Ledger, LedgerAddress, LedgerEntry, LedgerError, Located, LogPage, MAX_APART_FROM,
-    MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES, MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, Merge,
-    OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT, Penalty, Placement, Posted, PrivacyError,
-    PublicKey, Receipt, RelayEntry, RelayError, Relays, Route, ScoreEvent, Scores, SealingKeys,
-    SettlementLog, ShardRef, SigningKey, Splits, SponsorError, Sponsored, Standing, StateEntry,
-    States, Storage, StorageEntry, StorageError, Storing, Through, UpheldDispute, channel_id, fee,
-    merkle, privacy, settlement,
+    CashOut, Challenge, Change, CheckedIn, Closure, Conduct, ContentHash, Credits, Envelope,
+    EnvelopeError, Finding, FollowUps, Hosts, Inclusion, IncomingChannels, JobError, JobId,
+    JobStatus, Jobs, Ledger, LedgerAddress, LedgerEntry, LedgerError, Located, LogPage,
+    MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES, MAX_READS, MAX_SHARD_NAME_BYTES,
+    Manifest, Merge, OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT, Penalty, Placement,
+    Posted, PrivacyError, PublicKey, Receipt, RelayEntry, RelayError, Relays, Route, ScoreEvent,
+    Scores, SealingKeys, SettlementLog, ShardRef, SigningKey, Splits, SponsorError, Sponsored,
+    Standing, StateEntry, States, Storage, StorageEntry, StorageError, Storing, Through,
+    UpheldDispute, channel_id, fee, merkle, privacy, settlement,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
@@ -141,6 +141,16 @@ pub enum SubmitError {
     Privacy(#[from] PrivacyError),
 }
 
+/// The waiting times a coordinator is started with, each in seconds.
+pub struct Waits {
+    /// How long a stored blob goes between challenges.
+    pub challenge_interval: u64,
+    /// How long after a batch is posted it may be disputed.
+    pub dispute_window: u64,
+    /// How long a recovery waits before it takes effect.
+    pub recovery_wait: u64,
+}
+
 pub struct Coordinator {
     pub accounts: Accounts,
     ops: Log,
@@ -181,13 +191,20 @@ pub struct Coordinator {
     challenge_interval: u64,
     /// How long after a batch is posted it may be disputed, in seconds.
     dispute_window: u64,
+    /// How long a recovery waits before it takes effect, in seconds.
+    recovery_wait: u64,
 }
 
 impl Coordinator {
-    pub fn open(data_dir: &Path, challenge_interval: u64, dispute_window: u64) -> io::Result<Self> {
+    pub fn open(data_dir: &Path, waits: Waits) -> io::Result<Self> {
+        let Waits {
+            challenge_interval,
+            dispute_window,
+            recovery_wait,
+        } = waits;
         fs::create_dir_all(data_dir)?;
 
-        let mut accounts = Accounts::default();
+        let mut accounts = Accounts::waiting(recovery_wait);
         let mut ledger = Ledger::default();
         let ops = replay(&data_dir.join("ops.jsonl"), |envelope: Envelope| {
             let account = accounts.apply(&envelope).map_err(|e| e.to_string())?;
@@ -296,6 +313,7 @@ impl Coordinator {
             sealing_log,
             challenge_interval,
             dispute_window,
+            recovery_wait,
         })
     }
 
@@ -421,7 +439,7 @@ impl Coordinator {
         let entries: Vec<LedgerEntry> = read(self.ledger_log.range(0, usize::MAX)?)?;
         let receipts = self.receipts.range(0, usize::MAX)?;
 
-        let mut auditor = Auditor::default();
+        let mut auditor = Auditor::waiting(self.recovery_wait);
         let log: Vec<Envelope> = read(self.settlement_log.range(0, usize::MAX)?)?;
         for entry in &log {
             let reach = Auditor::reach(entry).map_err(|error| invalid(error.to_string()))?;
@@ -503,10 +521,10 @@ impl Coordinator {
         self.receipts.append_line(text);
     }
 
-    /// Applies a change to an account and records it. A new account gets its
-    /// starter grant.
-    pub fn apply_op(&mut self, envelope: &Envelope) -> Result<AccountStatus, OpError> {
-        let account = self.accounts.apply(envelope)?.clone();
+    /// Applies a change to an account that has just arrived, at time `now`,
+    /// and records it. A new account gets its starter grant.
+    pub fn apply_op(&mut self, envelope: &Envelope, now: u64) -> Result<AccountStatus, OpError> {
+        let account = self.accounts.apply_at(envelope, now)?.clone();
         self.ledger.open(account.id);
         self.ops.append(envelope);
         Ok(self.status(account))
@@ -911,6 +929,11 @@ impl Coordinator {
             self.scores.apply(&event);
             self.scores_log.append(&event);
         }
+    }
+
+    /// The cash-outs that wait to be paid or refused.
+    pub fn cash_outs(&self) -> Vec<CashOut> {
+        self.ledger.cash_outs()
     }
 
     /// Moves credits and records the move.

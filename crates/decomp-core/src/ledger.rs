@@ -4,7 +4,7 @@
 //! Like `Accounts`, the ledger changes only by applying entries, so a log of
 //! entries is a complete copy of every balance.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::ops::{Add, AddAssign, Sub};
 use std::str::FromStr;
@@ -32,6 +32,11 @@ pub const BASE_PRICE: Credits = Credits::whole(1);
 const NODE_SHARE_PERCENT: u64 = 85;
 /// The part that funds verification. The protocol treasury receives the rest.
 const VERIFICATION_SHARE_PERCENT: u64 = 10;
+
+/// The longest name a payment may be given: the payment credits were bought
+/// with, or the payment a cash-out was paid by. It bounds the size of a ledger
+/// entry.
+pub const MAX_PAYMENT_NAME_BYTES: usize = 200;
 
 /// The part of its stake an account loses when one of its nodes is sent back to
 /// probation.
@@ -164,10 +169,16 @@ pub struct Balance {
     /// Starter credits. They can be spent but never staked, transferred, or cashed
     /// out, which limits what farming new accounts can earn.
     pub granted: Credits,
+    /// Credits the account earned or bought. The spec sets granted credits
+    /// apart and no others, so the two are counted together.
     pub earned: Credits,
     /// Earned credits put up as a guarantee for the account's nodes. They cannot
     /// be spent, and are lost if a node misbehaves.
     pub staked: Credits,
+    /// Earned credits set aside for cash-outs the account has asked for, until
+    /// each is paid out or refused. They cannot be spent meanwhile.
+    #[serde(default)]
+    pub cashing_out: Credits,
 }
 
 impl Balance {
@@ -181,7 +192,7 @@ impl Balance {
         let taken = Balance {
             granted,
             earned: amount - granted,
-            staked: Credits::ZERO,
+            ..Balance::default()
         };
         self.granted = self.granted - taken.granted;
         self.earned = self.earned - taken.earned;
@@ -241,6 +252,28 @@ pub enum LedgerEntry {
     /// Takes stake from an account whose node misbehaved, for the treasury. Takes
     /// what there is if the stake is smaller.
     Forfeit { account: AccountId, amount: Credits },
+    /// Credits an account with credits it bought (spec section 5: "Credits
+    /// can be bought and cashed out for money"). `payment` names the payment
+    /// they were bought with, and one payment is credited once. The credits
+    /// are new: they come from no other balance.
+    Buy {
+        account: AccountId,
+        amount: Credits,
+        payment: String,
+    },
+    /// Sets earned credits aside for a cash-out the account asked for. Granted
+    /// credits are never taken ("Granted credits can be spent but not
+    /// transferred or cashed out"). `id` names the cash-out.
+    CashOut {
+        id: ContentHash,
+        account: AccountId,
+        amount: Credits,
+    },
+    /// Closes a cash-out that was paid: the credits set aside for it are gone
+    /// for good. `payout` names the payment the account was paid by.
+    CashOutPaid { id: ContentHash, payout: String },
+    /// Closes a cash-out that was refused: its credits go back to the account.
+    CashOutRefused { id: ContentHash },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -259,11 +292,31 @@ pub enum LedgerError {
     NothingEscrowed,
     #[error("the fee is more than was set aside for the job")]
     FeeExceedsEscrow,
+    #[error("only earned credits can be cashed out, and the account has too few")]
+    TooFewToCashOut,
+    #[error("an amount of credits to buy or cash out must be more than nothing")]
+    NoAmount,
+    #[error("this payment has already been credited")]
+    PaymentCredited,
+    #[error("the name of a payment is empty or too long")]
+    BadPaymentName,
+    #[error("this cash-out has already been asked for")]
+    CashOutExists,
+    #[error("no such cash-out is waiting")]
+    UnknownCashOut,
 }
 
 struct Escrow {
     account: AccountId,
     held: Balance,
+}
+
+/// A cash-out that an account asked for and that is neither paid nor refused.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct CashOut {
+    pub id: ContentHash,
+    pub account: AccountId,
+    pub amount: Credits,
 }
 
 /// Who holds credits: an account, or one of the protocol's two pools.
@@ -283,6 +336,11 @@ pub struct Ledger {
     /// Credits set aside for data services: by root for a stored blob, by name
     /// for a relay channel.
     data_escrows: HashMap<ContentHash, Escrow>,
+    /// Cash-outs that wait to be paid or refused, by their names.
+    cash_outs: BTreeMap<ContentHash, CashOut>,
+    /// The names of the payments credits were bought with, so that none is
+    /// credited twice.
+    payments: HashSet<String>,
     verification_fund: Credits,
     treasury: Credits,
 }
@@ -304,12 +362,13 @@ impl Ledger {
 
     /// What every holder has, as settlement counts it: an account's credits and
     /// any stake (the spec's account record has "`balance`: Credits and any
-    /// stake"), together with what is set aside for its open jobs and data
-    /// services, which stays the account's until it is paid out.
+    /// stake"), together with what is set aside for its open jobs, its data
+    /// services, and its cash-outs, which stays the account's until it is paid
+    /// out.
     pub fn holdings(&self) -> BTreeMap<Holder, Credits> {
         let mut holdings = BTreeMap::new();
         for (account, balance) in &self.balances {
-            let all = balance.spendable() + balance.staked;
+            let all = balance.spendable() + balance.staked + balance.cashing_out;
             holdings.insert(Holder::Account(*account), all);
         }
         for escrow in self.escrows.values().chain(self.data_escrows.values()) {
@@ -319,6 +378,11 @@ impl Ledger {
         holdings.insert(Holder::VerificationFund, self.verification_fund);
         holdings.insert(Holder::Treasury, self.treasury);
         holdings
+    }
+
+    /// The cash-outs that wait to be paid or refused.
+    pub fn cash_outs(&self) -> Vec<CashOut> {
+        self.cash_outs.values().copied().collect()
     }
 
     /// Jobs with credits still set aside.
@@ -451,8 +515,67 @@ impl Ledger {
                 balance.staked = balance.staked - taken;
                 self.treasury += taken;
             }
+            LedgerEntry::Buy {
+                account,
+                amount,
+                payment,
+            } => {
+                if *amount == Credits::ZERO {
+                    return Err(LedgerError::NoAmount);
+                }
+                check_payment_name(payment)?;
+                if self.payments.contains(payment) {
+                    return Err(LedgerError::PaymentCredited);
+                }
+                self.account(account)?.earned += *amount;
+                self.payments.insert(payment.clone());
+            }
+            LedgerEntry::CashOut {
+                id,
+                account,
+                amount,
+            } => {
+                if *amount == Credits::ZERO {
+                    return Err(LedgerError::NoAmount);
+                }
+                if self.cash_outs.contains_key(id) {
+                    return Err(LedgerError::CashOutExists);
+                }
+                let balance = self.account(account)?;
+                if balance.earned < *amount {
+                    return Err(LedgerError::TooFewToCashOut);
+                }
+                balance.earned = balance.earned - *amount;
+                balance.cashing_out += *amount;
+                let cash_out = CashOut {
+                    id: *id,
+                    account: *account,
+                    amount: *amount,
+                };
+                self.cash_outs.insert(*id, cash_out);
+            }
+            LedgerEntry::CashOutPaid { id, payout } => {
+                check_payment_name(payout)?;
+                let CashOut {
+                    account, amount, ..
+                } = self.close_cash_out(id)?;
+                let balance = self.balances.entry(account).or_default();
+                balance.cashing_out = balance.cashing_out - amount;
+            }
+            LedgerEntry::CashOutRefused { id } => {
+                let CashOut {
+                    account, amount, ..
+                } = self.close_cash_out(id)?;
+                let balance = self.balances.entry(account).or_default();
+                balance.cashing_out = balance.cashing_out - amount;
+                balance.earned += amount;
+            }
         }
         Ok(())
+    }
+
+    fn close_cash_out(&mut self, id: &ContentHash) -> Result<CashOut, LedgerError> {
+        self.cash_outs.remove(id).ok_or(LedgerError::UnknownCashOut)
     }
 
     fn account(&mut self, account: &AccountId) -> Result<&mut Balance, LedgerError> {
@@ -460,4 +583,11 @@ impl Ledger {
             .get_mut(account)
             .ok_or(LedgerError::UnknownAccount)
     }
+}
+
+fn check_payment_name(name: &str) -> Result<(), LedgerError> {
+    if name.is_empty() || name.len() > MAX_PAYMENT_NAME_BYTES {
+        return Err(LedgerError::BadPaymentName);
+    }
+    Ok(())
 }
