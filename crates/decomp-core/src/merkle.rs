@@ -70,7 +70,71 @@ pub fn verify(
         return false;
     }
 
-    let mut hash = chunk_hash(chunk);
+    climbs_to(root, count, index, chunk_hash(chunk), proof)
+}
+
+/// The hash a list tree has for one of its items.
+pub fn item_hash(item: &[u8]) -> ContentHash {
+    ContentHash::from_bytes(chunk_hash(item))
+}
+
+/// The root of a hash tree over a list of items, given the hash of each (see
+/// `item_hash`). The tree is built as a blob's is over its chunks. An empty
+/// list has the root of a list of one empty item.
+pub fn list_root(items: &[ContentHash]) -> ContentHash {
+    let mut level = list_level(items);
+    while level.len() > 1 {
+        level = pair_up(&level);
+    }
+    ContentHash::from_bytes(level[0])
+}
+
+/// The hashes that link the item at `index` to the root of its list.
+pub fn list_proof(items: &[ContentHash], index: u64) -> Option<Vec<ContentHash>> {
+    let mut position = usize::try_from(index).ok()?;
+    if position >= items.len() {
+        return None;
+    }
+    let mut proof = Vec::new();
+    let mut level = list_level(items);
+    while level.len() > 1 {
+        if let Some(beside) = level.get(position ^ 1) {
+            proof.push(ContentHash::from_bytes(*beside));
+        }
+        level = pair_up(&level);
+        position /= 2;
+    }
+    Some(proof)
+}
+
+/// Whether `item` is the hash of the item at `index` of the list of `count`
+/// items whose tree has `root`.
+pub fn list_holds(
+    root: &ContentHash,
+    count: u64,
+    index: u64,
+    item: &ContentHash,
+    proof: &[ContentHash],
+) -> bool {
+    index < count && climbs_to(root, count, index, *item.as_bytes(), proof)
+}
+
+fn list_level(items: &[ContentHash]) -> Vec<[u8; 32]> {
+    if items.is_empty() {
+        return vec![chunk_hash(&[])];
+    }
+    items.iter().map(|item| *item.as_bytes()).collect()
+}
+
+/// Whether the hash at `index` of a level `count` wide, joined with the hashes
+/// in `proof` on the way up, gives `root`.
+fn climbs_to(
+    root: &ContentHash,
+    count: u64,
+    index: u64,
+    mut hash: [u8; 32],
+    proof: &[ContentHash],
+) -> bool {
     let mut proof = proof.iter();
     let (mut position, mut width) = (index, count);
     while width > 1 {

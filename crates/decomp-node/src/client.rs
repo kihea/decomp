@@ -2,11 +2,13 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use decomp_core::LogError;
 use decomp_core::{
     AccountId, AccountOp, AccountStatus, AppManifest, Blob, BlobData, BlobRef, Call, Challenge,
-    CheckedIn, ContentHash, Credits, Envelope, IncomingChannels, JobId, JobResult, JobStatus,
-    Located, MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey, PublishedKey, Refusal, Request,
-    Route, SealingKey, ShardNow, SigningKey, Standing, Submitted, seal,
+    CheckedIn, ContentHash, Credits, Envelope, Inclusion, IncomingChannels, JobId, JobResult,
+    JobStatus, Located, LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey,
+    PublishedKey, Refusal, Request, Route, SealingKey, SettlementLog, ShardNow, SigningKey,
+    Standing, Submitted, seal,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -22,6 +24,8 @@ pub enum ClientError {
     Unreachable(String),
     #[error("the coordinator sent a blob that does not match its hash")]
     CorruptBlob,
+    #[error("entry {0} of the coordinator's settlement log does not hold: {1}")]
+    BadLog(u64, LogError),
 }
 
 impl ClientError {
@@ -212,6 +216,29 @@ impl Client {
     pub fn submit_result(&self, result: JobResult) -> Result<(), ClientError> {
         self.call::<IgnoredAny>(Call::SubmitResult { result })?;
         Ok(())
+    }
+
+    /// The coordinator's settlement log, checked from its first entry: every
+    /// entry is signed by the one operator and follows the entry before it.
+    pub fn settlement_log(&self) -> Result<SettlementLog, ClientError> {
+        let mut log = SettlementLog::default();
+        let mut from = 0;
+        loop {
+            let LogPage { entries } = self.call(Call::GetLog { from })?;
+            for entry in &entries {
+                log.apply(entry)
+                    .map_err(|error| ClientError::BadLog(from, error))?;
+                from += 1;
+            }
+            if entries.len() < MAX_LOG_PAGE {
+                return Ok(log);
+            }
+        }
+    }
+
+    /// Proof that the receipt of a job is in a batch of the settlement log.
+    pub fn inclusion(&self, job_id: JobId) -> Result<Inclusion, ClientError> {
+        self.call(Call::GetInclusion { job_id })
     }
 
     fn call<R: DeserializeOwned>(&self, call: Call) -> Result<R, ClientError> {

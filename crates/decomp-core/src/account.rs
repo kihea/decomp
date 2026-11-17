@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::AppManifest;
 use crate::envelope::{Envelope, EnvelopeError};
-use crate::keys::{AccountId, PublicKey};
+use crate::keys::{AccountId, LedgerAddress, PublicKey};
 
 /// A signed request to create or change an account.
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,6 +45,9 @@ pub enum AccountOp {
 pub struct Account {
     pub id: AccountId,
     pub account_key: PublicKey,
+    /// Where the account's balance sits on the ledger (see `LedgerAddress`).
+    /// Only the account's own devices are shown it.
+    pub ledger_address: LedgerAddress,
     /// How many changes the account has had. The next change must carry this value,
     /// which orders changes and stops a captured one from being replayed.
     pub seq: u64,
@@ -112,6 +115,7 @@ impl Accounts {
                 Ok(slot.insert(Account {
                     id,
                     account_key: signer,
+                    ledger_address: LedgerAddress::of(&envelope.signature),
                     seq: 0,
                     devices: vec![Device {
                         key: device_key,

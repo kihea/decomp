@@ -18,6 +18,7 @@ mod relay;
 mod request;
 mod scores;
 pub mod seal;
+pub mod settlement;
 pub mod shares;
 mod splits;
 mod state;
@@ -37,11 +38,11 @@ pub use job::{
 };
 pub use jobs::{ClosedJob, Closure, Dispute, FollowUps, JobError, Jobs};
 pub use keys::{
-    AccountId, ContentHash, JobId, OpeningKey, PublicKey, SealingKey, ShareSet, Signature,
-    SigningKey,
+    AccountId, ContentHash, JobId, LedgerAddress, OpeningKey, PublicKey, SealingKey, ShareSet,
+    Signature, SigningKey,
 };
 pub use ledger::{
-    BASE_PRICE, Balance, Credits, FeeSplit, Ledger, LedgerEntry, LedgerError,
+    BASE_PRICE, Balance, Credits, FeeSplit, Holder, Ledger, LedgerEntry, LedgerError,
     PROBATION_FORFEIT_PERCENT, STARTER_GRANT, fee,
 };
 pub use privacy::{
@@ -58,6 +59,10 @@ pub use request::{
 };
 pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
 pub use seal::{SEAL_OVERHEAD_BYTES, SealingKeys};
+pub use settlement::{
+    BATCH_PERIOD_SECS, Batch, Change, Inclusion, LogEntry, LogError, LogPage, MAX_LOG_PAGE, Posted,
+    SettlementLog, Through,
+};
 pub use shares::{SHARES, ShareError};
 pub use splits::{Merge, Splits};
 pub use state::{MAX_SHARD_NAME_BYTES, ShardRef, StateEntry, States};

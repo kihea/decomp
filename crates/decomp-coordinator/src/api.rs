@@ -6,7 +6,7 @@
 
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
@@ -24,7 +24,7 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 use crate::referee::referee;
-use crate::state::{Coordinator, OpenRelayError, StoreError, SubmitError};
+use crate::state::{Coordinator, InclusionError, OpenRelayError, StoreError, SubmitError};
 
 struct App {
     coordinator: Mutex<Coordinator>,
@@ -32,18 +32,30 @@ struct App {
     sandbox: Sandbox,
 }
 
-pub fn router(coordinator: Coordinator) -> Router {
-    let app = App {
+/// The coordinator's API, and the clock that posts a batch to the settlement
+/// log every `batch_period`.
+pub fn router(coordinator: Coordinator, batch_period: Duration) -> Router {
+    let app = Arc::new(App {
         coordinator: Mutex::new(coordinator),
         sandbox: Sandbox::new(),
-    };
+    });
+    tokio::spawn(post_batches(Arc::clone(&app), batch_period));
     Router::new()
         .route("/v1/ops", post(submit_op))
         .route("/v1/request", post(request))
         .layer(DefaultBodyLimit::max(MAX_MESSAGE_BYTES))
         // Requests carry no cookies or credentials, so any web origin may call.
         .layer(CorsLayer::permissive())
-        .with_state(Arc::new(app))
+        .with_state(app)
+}
+
+async fn post_batches(app: Arc<App>, period: Duration) {
+    let mut ticks = tokio::time::interval(period);
+    loop {
+        ticks.tick().await;
+        let mut coordinator = app.coordinator.lock().expect("coordinator lock");
+        coordinator.post_batch(unix_now());
+    }
 }
 
 fn unix_now() -> u64 {
@@ -217,6 +229,8 @@ fn answer(
             coordinator.redeem_relay(&signer, &header, &receipt)?;
             Json(json!({})).into_response()
         }
+        Call::GetLog { from } => Json(coordinator.log_page(from)?).into_response(),
+        Call::GetInclusion { job_id } => Json(coordinator.inclusion(&job_id)?).into_response(),
         Call::SubmitResult { result } => {
             if let Outcome::Completed {
                 output,
@@ -488,6 +502,19 @@ impl From<StoreError> for ApiError {
             StoreError::UnknownDevice => {
                 Self::new(StatusCode::NOT_FOUND, "unknown_device", message)
             }
+        }
+    }
+}
+
+impl From<InclusionError> for ApiError {
+    fn from(error: InclusionError) -> Self {
+        let message = error.to_string();
+        match error {
+            InclusionError::NoReceipt => {
+                Self::new(StatusCode::NOT_FOUND, "unknown_receipt", message)
+            }
+            InclusionError::NotBatched => Self::new(StatusCode::CONFLICT, "not_batched", message),
+            InclusionError::Storage(inner) => inner.into(),
         }
     }
 }

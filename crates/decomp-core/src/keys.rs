@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 macro_rules! hex_newtype {
     ($(#[$meta:meta])* $name:ident, $len:expr) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name([u8; $len]);
 
         impl $name {
@@ -195,6 +195,42 @@ impl AccountId {
 impl ContentHash {
     pub fn of(bytes: &[u8]) -> Self {
         Self(Sha256::digest(bytes).into())
+    }
+}
+
+hex_newtype!(
+    /// Where a balance sits on the ledger (spec section 6: "No public balance
+    /// under a user's identity. Apps see the account ID. On a public ledger, a
+    /// balance sits under a separate ledger address that only the account's
+    /// controllers can link to that ID").
+    ///
+    /// An account's address is a hash that takes in the signature on the
+    /// request that created the account. Only the account key can make that
+    /// signature, and it is seen by nobody but the account's controller and the
+    /// coordinator operators, who hold the account's record. So nobody else can
+    /// work the address out from the account's ID or key, and the controller
+    /// can show the link by showing the request.
+    LedgerAddress,
+    32
+);
+
+impl LedgerAddress {
+    /// The address of the account created by the request that carries
+    /// `created`, the account key's signature.
+    pub fn of(created: &Signature) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"decomp/ledger-address/v1\n");
+        hasher.update(created.0);
+        Self(hasher.finalize().into())
+    }
+
+    /// The address of one of the protocol's own pools, which belong to no
+    /// account: the hash of the pool's name, which anyone can work out.
+    pub fn of_pool(name: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"decomp/ledger-pool/v1\n");
+        hasher.update(name);
+        Self(hasher.finalize().into())
     }
 }
 

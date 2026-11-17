@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
-    AccountId, AccountStatus, AppManifest, ContentHash, Credits, Encrypted, JobId, JobStatus,
-    Manifest, OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey, Receipt, SHARES, ShardRef,
-    Share, ShareSet, Split, Sponsorship, Verification, encrypted, merkle, privacy, shares,
+    AccountId, AccountStatus, AppManifest, Call, ContentHash, Credits, Encrypted, Inclusion, JobId,
+    JobStatus, Manifest, OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey, Receipt, Request,
+    SHARES, ShardRef, Share, ShareSet, Split, Sponsorship, Verification, encrypted, merkle,
+    privacy, shares,
 };
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::deliver::{self, Delivered};
@@ -178,6 +179,12 @@ enum Command {
         #[arg(value_parser = parse_shard)]
         shard: ShardRef,
     },
+    /// Check the coordinator's settlement log from its first entry, and show
+    /// the batches in it.
+    Log,
+    /// Check that the receipts of the jobs this node has run are in the
+    /// batches the coordinator posted.
+    Receipts,
     /// Run a job module on this device only, without the network. For a private
     /// job this is the local route.
     Run {
@@ -271,6 +278,8 @@ fn main() -> ExitCode {
             submit(&client, &cli.dir, job, limits)
         }),
         Command::State { shard } => connect().and_then(|client| show_state(&client, shard)),
+        Command::Log => connect().and_then(|client| show_log(&client)),
+        Command::Receipts => connect().and_then(|client| check_receipts(&client, &cli.dir)),
         Command::Run { job } => {
             read_job(&job).and_then(|files| run_here(&Sandbox::new(), &cli.dir, &job, &files))
         }
@@ -281,9 +290,93 @@ fn main() -> ExitCode {
     })
 }
 
+/// Checks the coordinator's settlement log and shows what it holds.
+fn show_log(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
+    let log = client.settlement_log()?;
+    let Some(operator) = log.operator() else {
+        println!("the settlement log has no entries yet");
+        return Ok(ExitCode::SUCCESS);
+    };
+    println!("operator {operator}");
+    for batch in log.batches() {
+        let (start, end) = log.receipts_of(batch.number).unwrap_or_default();
+        println!(
+            "batch {}  {} receipts, {} balances changed, fingerprint {}",
+            batch.number,
+            end - start,
+            batch.changes.len(),
+            batch.fingerprint
+        );
+    }
+    println!("every entry is signed by the operator and follows the one before it");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Checks, for every job this node has reported, that its receipt is in a
+/// batch of the settlement log (spec section 6: "Any node can check that its
+/// own receipts are included"). The log is checked from its first entry, each
+/// receipt is linked to its batch's fingerprint by the hashes the coordinator
+/// gives, and each must hold this node's own signed report of the job.
+fn check_receipts(client: &Client, dir: &Path) -> Result<ExitCode, Box<dyn Error>> {
+    let log = client.settlement_log()?;
+    let reported = fs::read_to_string(dir.join(agent::REPORTED_FILE)).unwrap_or_default();
+    let jobs: Vec<JobId> = reported.lines().filter_map(|id| id.parse().ok()).collect();
+    let (mut included, mut missing) = (0, 0);
+    for job_id in &jobs {
+        match client.inclusion(*job_id) {
+            Ok(inclusion) => {
+                if log.includes(&inclusion) && is_report_of(&inclusion, job_id, client) {
+                    println!("job {job_id}  in batch {}", inclusion.batch);
+                    included += 1;
+                } else {
+                    println!(
+                        "job {job_id}  NOT PROVEN to be in batch {}",
+                        inclusion.batch
+                    );
+                    missing += 1;
+                }
+            }
+            Err(error) if error.is("not_batched") => {
+                println!("job {job_id}  its receipt is not in a batch yet");
+            }
+            // A job that expired or was disputed has no receipt, and neither
+            // has one that was handed out to check this node.
+            Err(error) if error.is("unknown_receipt") => println!("job {job_id}  no receipt"),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    println!(
+        "{} jobs reported by this node: {included} proven to be in a batch, {missing} not proven",
+        jobs.len()
+    );
+    Ok(if missing == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Whether the receipt in `inclusion` is of `job_id` and holds this device's
+/// signed report of that job.
+fn is_report_of(inclusion: &Inclusion, job_id: &JobId, client: &Client) -> bool {
+    let Ok(receipt) = serde_json::from_str::<Receipt>(&inclusion.receipt) else {
+        return false;
+    };
+    let mine = |report: &&decomp_core::Envelope| report.signer == client.device_key();
+    let reported = receipt.results.iter().find(mine).and_then(|report| {
+        let request: Request = report.open().ok()?;
+        match request.call {
+            Call::SubmitResult { result } => Some(result.job_id),
+            _ => None,
+        }
+    });
+    receipt.job_id == *job_id && reported == Some(*job_id)
+}
+
 fn show_account(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
     let status = client.account()?;
     println!("account  {}", status.account.id);
+    println!("ledger   {}", status.account.ledger_address);
     for device in status
         .account
         .devices

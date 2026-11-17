@@ -104,6 +104,12 @@ pub enum Call {
     RedeemRelay { header: Envelope, receipt: Envelope },
     /// A node reporting what a job produced. Answer: an empty object.
     SubmitResult { result: JobResult },
+    /// The settlement log from entry number `from` on, counting from zero, at
+    /// most `MAX_LOG_PAGE` entries of it (see `settlement`). Answer: `LogPage`.
+    GetLog { from: u64 },
+    /// Proof that the receipt of a job is in a batch. Whoever knows a job's ID
+    /// may ask: its submitter and the nodes that ran it. Answer: `Inclusion`.
+    GetInclusion { job_id: JobId },
 }
 
 /// An account record together with its credits. Changing an account answers

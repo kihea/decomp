@@ -67,6 +67,11 @@ export type AppManifest = {
 export type Account = {
   id: string;
   account_key: string;
+  /**
+   * Where the account's balance sits on the ledger. Only the account's own
+   * devices are shown it; what the coordinator posts names this, never `id`.
+   */
+  ledger_address: string;
   /** Number of changes so far. The next change must carry this value. */
   seq: number;
   devices: Device[];

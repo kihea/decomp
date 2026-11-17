@@ -4,7 +4,7 @@
 //! Like `Accounts`, the ledger changes only by applying entries, so a log of
 //! entries is a complete copy of every balance.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::ops::{Add, AddAssign, Sub};
 use std::str::FromStr;
@@ -266,6 +266,15 @@ struct Escrow {
     held: Balance,
 }
 
+/// Who holds credits: an account, or one of the protocol's two pools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Holder {
+    Account(AccountId),
+    /// Pays spot checkers and known-answer jobs (spec section 5, "Fee split").
+    VerificationFund,
+    Treasury,
+}
+
 /// Every balance, plus the credits set aside for jobs that are still open.
 #[derive(Default)]
 pub struct Ledger {
@@ -291,6 +300,25 @@ impl Ledger {
 
     pub fn balance(&self, account: &AccountId) -> Balance {
         self.balances.get(account).copied().unwrap_or_default()
+    }
+
+    /// What every holder has, as settlement counts it: an account's credits and
+    /// any stake (the spec's account record has "`balance`: Credits and any
+    /// stake"), together with what is set aside for its open jobs and data
+    /// services, which stays the account's until it is paid out.
+    pub fn holdings(&self) -> BTreeMap<Holder, Credits> {
+        let mut holdings = BTreeMap::new();
+        for (account, balance) in &self.balances {
+            let all = balance.spendable() + balance.staked;
+            holdings.insert(Holder::Account(*account), all);
+        }
+        for escrow in self.escrows.values().chain(self.data_escrows.values()) {
+            *holdings.entry(Holder::Account(escrow.account)).or_default() +=
+                escrow.held.spendable();
+        }
+        holdings.insert(Holder::VerificationFund, self.verification_fund);
+        holdings.insert(Holder::Treasury, self.treasury);
+        holdings
     }
 
     /// Jobs with credits still set aside.

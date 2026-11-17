@@ -7,37 +7,43 @@
 //! | Node scores | `scores.jsonl`, replayed at startup | Yes |
 //! | Blobs | `blobs/`, one file per hash | Yes |
 //! | Receipts | `receipts.jsonl` | Yes |
+//! | The settlement log: batches, signed by the operator | `settlement.jsonl`, checked from its first entry at startup | Yes |
+//! | The operator's key | `operator.key` | Yes |
 //! | Which nodes hold which blobs | `storage.jsonl`, replayed at startup | Yes |
 //! | Relay channels | `relays.jsonl`, replayed at startup | Yes |
 //! | The sealing key each device published | `sealing.jsonl`, replayed at startup | Yes |
 //! | What each shard of app state holds now | `state.jsonl`, replayed at startup | Yes |
 //! | Open jobs, online nodes, and unanswered challenges | Memory | No, by design (spec section 6) |
 //!
-//! The log files are the "local signed log" that stands in for the ledger during
-//! development (spec section 6).
+//! `settlement.jsonl` is the "local signed log" that stands in for the ledger
+//! during development (spec section 6). The other files are the coordinator's
+//! own records, which the batches in it are made from.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
 
 use decomp_core::{
     Account, AccountId, AccountStatus, Accounts, Assignment, Challenge, CheckedIn, Closure,
-    Conduct, ContentHash, Credits, Envelope, EnvelopeError, FollowUps, Hosts, IncomingChannels,
-    JobError, JobId, JobStatus, Jobs, Ledger, LedgerEntry, LedgerError, Located, MAX_APART_FROM,
-    MAX_KEPT_FROM, MAX_PIECES, MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, Merge, OpError, Opening,
-    Outcome, PROBATION_FORFEIT_PERCENT, Penalty, Placement, PrivacyError, PublicKey, RelayEntry,
-    RelayError, Relays, Route, ScoreEvent, Scores, SealingKeys, ShardRef, Splits, SponsorError,
-    Sponsored, Standing, StateEntry, States, Storage, StorageEntry, StorageError, Storing,
-    channel_id, fee, privacy,
+    Conduct, ContentHash, Credits, Envelope, EnvelopeError, FollowUps, Hosts, Inclusion,
+    IncomingChannels, JobError, JobId, JobStatus, Jobs, Ledger, LedgerAddress, LedgerEntry,
+    LedgerError, Located, LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES,
+    MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, Merge, OpError, Opening, Outcome,
+    PROBATION_FORFEIT_PERCENT, Penalty, Placement, Posted, PrivacyError, PublicKey, Receipt,
+    RelayEntry, RelayError, Relays, Route, ScoreEvent, Scores, SealingKeys, SettlementLog,
+    ShardRef, SigningKey, Splits, SponsorError, Sponsored, Standing, StateEntry, States, Storage,
+    StorageEntry, StorageError, Storing, Through, channel_id, fee, merkle, privacy, settlement,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
 use decomp_schema::{Mismatch, Signature};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::blobs::Blobs;
 use crate::log::Log;
+use crate::operator;
 use crate::referee::{Case, Verdict};
 
 /// Why a blob was not accepted for storage.
@@ -60,6 +66,17 @@ pub enum OpenRelayError {
     Ledger(#[from] LedgerError),
     #[error("the receiving key is not a device in any account")]
     UnknownDevice,
+}
+
+/// Why no proof was given that a job's receipt is in a batch.
+#[derive(Debug, thiserror::Error)]
+pub enum InclusionError {
+    #[error("there is no receipt for this job")]
+    NoReceipt,
+    #[error("the job's receipt is not in a batch yet")]
+    NotBatched,
+    #[error(transparent)]
+    Storage(#[from] io::Error),
 }
 
 /// Why a job was not accepted.
@@ -115,6 +132,14 @@ pub struct Coordinator {
     /// `None` for a module that does not describe itself.
     signatures: HashMap<ContentHash, Option<Signature>>,
     receipts: Log,
+    /// The hash of each receipt's text, in the order the receipts were made,
+    /// and each job's place in that order. Batches are made from these.
+    receipt_hashes: Vec<ContentHash>,
+    receipt_of: HashMap<JobId, u64>,
+    /// The key the operator of this coordinator signs the settlement log with.
+    operator: SigningKey,
+    settlement: SettlementLog,
+    settlement_log: Log,
     /// The nodes other devices can connect to, which hold and relay data.
     hosts: Hosts,
     storage: Storage,
@@ -173,6 +198,35 @@ impl Coordinator {
             Ok(())
         })?;
 
+        let receipts = Log::open(&data_dir.join("receipts.jsonl"))?;
+        let mut receipt_hashes = Vec::new();
+        let mut receipt_of = HashMap::new();
+        for line in receipts.lines()? {
+            let line = line?;
+            let Named { job_id } = serde_json::from_str(&line)?;
+            receipt_of.insert(job_id, receipt_hashes.len() as u64);
+            receipt_hashes.push(merkle::item_hash(line.as_bytes()));
+        }
+
+        let mut settlement = SettlementLog::default();
+        let settlement_path = data_dir.join("settlement.jsonl");
+        let settlement_log = replay(&settlement_path, |entry: Envelope| {
+            settlement.apply(&entry).map_err(|e| e.to_string())
+        })?;
+        let Through {
+            ops: posted_ops,
+            entries,
+            receipts: posted_receipts,
+        } = settlement.through();
+        if posted_ops > ops.len() || entries > ledger_log.len() || posted_receipts > receipts.len()
+        {
+            let message = format!(
+                "{} reaches further than the records it was made from",
+                settlement_path.display()
+            );
+            return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+        }
+
         // Open jobs do not survive a restart, so hand back what was set aside for
         // any job that was still open when the coordinator last stopped.
         for job_id in ledger.escrowed_jobs() {
@@ -195,7 +249,12 @@ impl Coordinator {
             sponsored: Sponsored::default(),
             splits: Splits::default(),
             signatures: HashMap::new(),
-            receipts: Log::open(&data_dir.join("receipts.jsonl"))?,
+            receipts,
+            receipt_hashes,
+            receipt_of,
+            operator: operator::key(data_dir)?,
+            settlement,
+            settlement_log,
             hosts: Hosts::default(),
             storage,
             storage_log,
@@ -207,6 +266,85 @@ impl Coordinator {
             sealing_log,
             challenge_interval,
         })
+    }
+
+    /// The key that signs this coordinator's settlement log.
+    pub fn operator(&self) -> PublicKey {
+        self.operator.public_key()
+    }
+
+    /// Posts a batch to the settlement log (spec section 6: "Every 10 minutes
+    /// (starting value) the coordinator combines the new receipts into one
+    /// fingerprint and posts it with the net balance change per account").
+    /// Nothing is posted when there is no new receipt and no balance changed.
+    pub fn post_batch(&mut self, now: u64) {
+        let through = Through {
+            ops: self.ops.len(),
+            entries: self.ledger_log.len(),
+            receipts: self.receipts.len(),
+        };
+        let new = &self.receipt_hashes[self.settlement.through().receipts as usize..];
+        let holdings = self.holdings();
+        let Some(batch) = self.settlement.next_batch(new, &holdings, through) else {
+            return;
+        };
+        let entry = self.settlement.entry(now, Posted::Batch(batch));
+        let entry = Envelope::seal(&self.operator, &entry);
+        self.settlement
+            .apply(&entry)
+            .expect("the coordinator's own batch follows the log's rules");
+        self.settlement_log.append(&entry);
+    }
+
+    /// What sits at every ledger address now.
+    fn holdings(&self) -> BTreeMap<LedgerAddress, Credits> {
+        settlement::addressed(&self.ledger, &self.accounts)
+    }
+
+    /// Up to `MAX_LOG_PAGE` entries of the settlement log, from entry `from` on.
+    pub fn log_page(&self, from: u64) -> io::Result<LogPage> {
+        let lines = self.settlement_log.range(from, MAX_LOG_PAGE)?;
+        let entries = lines.iter().map(|line| serde_json::from_str(line));
+        Ok(LogPage {
+            entries: entries.collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// Proof that a job's receipt is in a batch (spec section 6: "Any node can
+    /// check that its own receipts are included").
+    pub fn inclusion(&self, job_id: &JobId) -> Result<Inclusion, InclusionError> {
+        let place = *self
+            .receipt_of
+            .get(job_id)
+            .ok_or(InclusionError::NoReceipt)?;
+        let batch = self
+            .settlement
+            .batch_holding(place)
+            .ok_or(InclusionError::NotBatched)?;
+        let (start, end) = self
+            .settlement
+            .receipts_of(batch.number)
+            .expect("the batch is in the log");
+        let hashes = &self.receipt_hashes[start as usize..end as usize];
+        let proof = merkle::list_proof(hashes, place - start);
+        let mut line = self.receipts.range(place, 1)?;
+        Ok(Inclusion {
+            batch: batch.number,
+            index: place - start,
+            receipt: line
+                .pop()
+                .expect("a receipt that was counted is in the file"),
+            proof: proof.expect("the receipt is one of the batch's"),
+        })
+    }
+
+    /// Keeps a receipt, as the exact text that batches and proofs are made from.
+    fn keep_receipt(&mut self, receipt: &Receipt) {
+        let text = serde_json::to_string(receipt).expect("receipts serialize");
+        self.receipt_of
+            .insert(receipt.job_id, self.receipt_hashes.len() as u64);
+        self.receipt_hashes.push(merkle::item_hash(text.as_bytes()));
+        self.receipts.append_line(text);
     }
 
     /// Applies a change to an account and records it. A new account gets its
@@ -678,7 +816,7 @@ impl Coordinator {
                         self.states.apply(&entry);
                         self.states_log.append(&entry);
                     }
-                    self.receipts.append(&receipt);
+                    self.keep_receipt(&receipt);
                     let amount = receipt.fee.per_node;
                     let settle = LedgerEntry::Settle {
                         job_id,
@@ -799,13 +937,20 @@ impl Coordinator {
     }
 }
 
+/// What a line of `receipts.jsonl` is read for at startup: the job it is the
+/// receipt of. The rest of the line is kept as text.
+#[derive(Deserialize)]
+struct Named {
+    job_id: JobId,
+}
+
 /// Opens a log and applies every entry already in it.
 fn replay<T: DeserializeOwned>(
     path: &Path,
     mut apply: impl FnMut(T) -> Result<(), String>,
 ) -> io::Result<Log> {
     let log = Log::open(path)?;
-    for (index, line) in log.lines().enumerate() {
+    for (index, line) in log.lines()?.enumerate() {
         let applied = serde_json::from_str(&line?)
             .map_err(|e| e.to_string())
             .and_then(&mut apply);

@@ -320,15 +320,61 @@ between them.
   results read as `submit` does it: the higher of two private numbers, at 244
   units, and a private number times a plain one less a plain one, each right.
 
+**Settlement** (build step 13).
+
+- **Batches.** "Every 10 minutes (starting value) the coordinator combines the
+  new receipts into one fingerprint and posts it with the net balance change
+  per account." The fingerprint is the root of a hash tree over the receipts
+  made since the batch before, and the changes are one signed amount for each
+  balance that moved. Nothing is posted in a period in which there was no
+  receipt and no balance moved.
+- **The log.** "During development and testing, a single coordinator and a
+  local signed log stand in for the operators and the ledger." Batches go to
+  that log, `settlement.jsonl`. Every entry is signed with the operator's key
+  and carries the hash of the entry before it, so no entry can be changed or
+  taken out without every later one ceasing to fit. Anyone can ask the
+  coordinator for the log and check it from its first entry, and whoever does
+  ends up with the balance at every address. An entry that would take a
+  balance below nothing does not check. The coordinator checks its own log the
+  same way each time it starts.
+- "The ledger records balances and batched proof of the work done; it never
+  sees individual jobs." "No ledger write per job." A job writes nothing to
+  the log. Its receipt stays with the coordinator and reaches the log only as
+  part of a fingerprint.
+- **Ledger addresses.** "No public balance under a user's identity. Apps see
+  the account ID. On a public ledger, a balance sits under a separate ledger
+  address that only the account's controllers can link to that ID." A batch
+  names balances by ledger address and never by account ID, account key, or
+  device key. An account's own devices are told its address, and `account`
+  shows it. The verification fund and the treasury have addresses anyone can
+  work out.
+- **A node checks its own receipts.** "Any node can check that its own receipts
+  are included." A node notes each job it reports. `decomp-node receipts`
+  fetches the log and checks it, then asks the coordinator for proof of each
+  noted job: the receipt and the hashes that link it to a batch's fingerprint.
+  It checks those hashes itself, and that the receipt holds its own signed
+  report of the job.
+- Run on the check network of five proven nodes, with a batch every 15
+  seconds. The first batch took in the 524 receipts and 47 balances the
+  network already had. Three jobs then went into two batches, of two receipts
+  and of one. The two nodes that had run them each found every job it had
+  reported in a batch, and the other three had none to look for. The log
+  checked from its first entry. With one amount in the last entry changed in
+  the file, the same check stopped at that entry with a bad signature. Added
+  up by a script, the log's balances came to 1,150 credits, the starter grants
+  of the network's 46 accounts, and the balance at one node's address was what
+  `account` showed for it, stake included. No account's ID, account key, or
+  first device key appeared anywhere in the log.
+
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment, which nodes a job is kept from, and verification), the storage and relay rules, sealing, app state, private jobs and their routes, cutting a private job's numbers into shares, encrypting its values for nodes that compute on them, and every message shape. No I/O. |
+| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment, which nodes a job is kept from, and verification), the storage and relay rules, sealing, app state, batches and the settlement log, private jobs and their routes, cutting a private job's numbers into shares, encrypting its values for nodes that compute on them, and every message shape. No I/O. |
 | `crates/decomp-schema` | How a job's input and output types and its privacy mode are described and checked, and the byte form of a set of records. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
-| `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, and what it stores (logs, blobs). |
-| `crates/decomp-node` | The node agent, as a library and as the `decomp-node` command: joins an account, works as a node, holds and relays data, submits jobs, stores files, and sends files to other devices. |
+| `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, the batches it posts, and what it stores (logs, blobs, its operator's key). |
+| `crates/decomp-node` | The node agent, as a library and as the `decomp-node` command: joins an account, works as a node, holds and relays data, submits jobs, stores files, sends files to other devices, and checks the settlement log and its own receipts against it. |
 | `client-ts` | The TypeScript client: message shapes, signing, calls, and sending to and collecting from other devices, from all senders or only those the device accepts, submitting a job and waiting for its result, and reading a shard of an app's state. It has no dependencies: a device supplies its keys and its cryptography, and a ready-made one for platforms with WebCrypto is included. |
 
 ## Run it
@@ -438,9 +484,22 @@ jobs from a release build (`cargo run --release -p decomp-node -- start`). A
 debug build of the node took eleven minutes over seven units of such a job,
 and a release build 23 seconds.
 
-Coordinator settings are `DECOMP_ADDR`, `DECOMP_DATA_DIR`, and
+The settlement log, checked from its first entry, and the batches in it:
+
+```bash
+cargo run -p decomp-node -- log
+```
+
+Whether the receipts of the jobs this node has run are in those batches:
+
+```bash
+cargo run -p decomp-node -- receipts
+```
+
+Coordinator settings are `DECOMP_ADDR`, `DECOMP_DATA_DIR`,
 `DECOMP_STORAGE_CHALLENGE_SECS` (how often each node is asked to show that it
-still holds a blob; an hour unless set). The node agent takes
+still holds a blob; an hour unless set), and `DECOMP_BATCH_SECS` (how often a
+batch is posted to the settlement log; ten minutes unless set). The node agent takes
 `--coordinator` and `--dir`, or `DECOMP_COORDINATOR_URL` and `DECOMP_NODE_DIR`.
 
 Checks, run before every commit, from this folder:
@@ -487,9 +546,42 @@ cap is refused, so settling a job can never fail or overdraw an account.
 replaying `ops.jsonl`, rebuilds balances by replaying `ledger.jsonl` on top of the
 starter grants, and appends each receipt to `receipts.jsonl`. Credits set aside
 for jobs that were open when the coordinator stopped are returned at startup. Open jobs and
-online nodes are kept only in memory, as the spec intends. The two files are the
-"local signed log" the spec allows during development; ledger settlement replaces
-them in build step 13.
+online nodes are kept only in memory, as the spec intends. These files are the
+coordinator's own records. What it posts for others to check is the settlement
+log, below.
+
+**The settlement log stands in for the ledger, and holds what the ledger
+would.** The spec puts two things on the ledger, balances and batch
+fingerprints, and both are in the log: a batch carries its fingerprint, and the
+changes in the batches so far add up to the balance at each address. The log is
+one file of signed entries, each naming the one before. It is kept by the
+coordinator that writes it, which is what "local" means, and what a public
+ledger will take away.
+
+**A batch's changes are what the records hold, less what the log holds.** The
+coordinator does not add up the credit movements of a period. It takes what
+every holder has now and subtracts the balance the log has for that address.
+So a batch can be made at any moment from the records and the log alone, and
+the log's balances cannot drift from the coordinator's.
+
+**A balance on the log counts stake and credits set aside.** The spec's account
+record has "`balance`: Credits and any stake", and credits set aside for an
+open job are still their owner's until the job is paid for. So putting up
+stake, taking it back, and setting credits aside for a job change no balance
+on the log. Paying for a job does, and so does a forfeit.
+
+**An account's ledger address comes from the request that created it.** It is
+a hash that takes in the account key's signature on that request. Nobody can
+work it out from the account's ID or key. The account's controller can, and
+can show anyone the link by showing the request. Coordinator operators can
+too, since "the coordinator holds each account's record ... so it can bill
+jobs to the right balance". Nothing had to be added to what a client sends,
+and every account that already existed has an address.
+
+**A receipt is hashed as the text it was written as.** As with signed
+requests, nothing is written out a second time to be hashed, so a proof hands
+over the receipt's exact text and a checker in any language hashes what it was
+given.
 
 **A module counts its own instructions.** Before a module runs, the sandbox
 rewrites it (`crates/decomp-sandbox/src/meter.rs`): it adds a counter that the code
@@ -865,6 +957,10 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 
 | Gap | Why it is open | Closes with |
 | --- | --- | --- |
+| Nothing is posted to a public ledger | The spec has "balances and batch fingerprints live on an existing public ledger, with ICP the first candidate". Posting to the Internet Computer needs a canister and its toolchain, `dfx`, to build and run one, and the machine this was built on has no `dfx`, no WSL distribution, and no Docker to run a local Internet Computer in. The local signed log the spec allows during development stands in. | A machine with `dfx` |
+| The settlement log is kept by the operator it is about | The coordinator that signs the log also holds the only copy and hands it out. It cannot change an entry unseen by someone who kept an earlier copy, but it can show different logs to different askers, or none. | A public ledger: see the row above |
+| A node finds a missing receipt only for jobs it noted | The command-line node notes a job when it reports it. A job reported by an older build of the node, or from a directory that has since been lost, is not looked for. | If it proves a nuisance |
+| Reading the log, a proof, or the records behind a batch scans a file from its start | Every such answer is read out of a log file by line number, under the coordinator's one lock. | When load needs it |
 | No automated tests | Tests are added only once the code is built, to guard against regressions. The flows were checked by hand. | Owner's go-ahead |
 | No test vectors shared by Rust and TypeScript | Same reason. Until then, a change to the envelope format must be checked end to end by hand. | First test pass |
 | The account key is the only controller | Passkeys, recovery keys, guardians, and email reset are build step 14. A device that loses its account key cannot be recovered. | Build step 14 |

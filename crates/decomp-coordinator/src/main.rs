@@ -1,23 +1,28 @@
 //! The DeComp coordinator: keeps account records and balances, stores blobs, hands
-//! jobs to nodes, checks their results, referees disputes, and keeps node scores.
-//! Settlement on a public ledger joins it in a later build step.
+//! jobs to nodes, checks their results, referees disputes, keeps node scores, and
+//! posts batches of receipts to a settlement log its operator signs.
 //!
 //! Configuration, by environment variable:
 //! - `DECOMP_ADDR`: address to listen on (default `127.0.0.1:8787`)
 //! - `DECOMP_DATA_DIR`: directory for logs and blobs (default `data`)
 //! - `DECOMP_STORAGE_CHALLENGE_SECS`: how long a stored blob goes between
 //!   challenges (default one hour)
+//! - `DECOMP_BATCH_SECS`: how often a batch is posted to the settlement log
+//!   (default ten minutes)
 
 mod api;
 mod blobs;
 mod log;
+mod operator;
 mod referee;
 mod state;
 
 use std::env;
 use std::error::Error;
 use std::path::Path;
+use std::time::Duration;
 
+use decomp_core::BATCH_PERIOD_SECS;
 use tokio::net::TcpListener;
 
 use crate::state::Coordinator;
@@ -36,9 +41,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(_) => DEFAULT_CHALLENGE_INTERVAL_SECS,
     };
 
+    let batch_period = match env::var("DECOMP_BATCH_SECS") {
+        Ok(seconds) => seconds.parse()?,
+        Err(_) => BATCH_PERIOD_SECS,
+    };
+
     let coordinator = Coordinator::open(Path::new(&data_dir), challenge_interval)?;
     let listener = TcpListener::bind(&addr).await?;
     println!("coordinator listening on http://{addr}, data in {data_dir}/");
-    axum::serve(listener, api::router(coordinator)).await?;
+    println!("operator key: {}", coordinator.operator());
+    let batch_period = Duration::from_secs(batch_period);
+    axum::serve(listener, api::router(coordinator, batch_period)).await?;
     Ok(())
 }

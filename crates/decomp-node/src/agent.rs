@@ -1,12 +1,14 @@
 //! The command's two long-running modes: joining an account, and working as a node.
 
 use std::error::Error;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, sleep};
 use std::time::Duration;
 
-use decomp_core::{Assignment, Blob, Challenge, CheckedIn, merkle};
+use decomp_core::{Assignment, Blob, Challenge, CheckedIn, JobId, merkle};
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::relay::Relay;
 use decomp_node::store::Store;
@@ -14,6 +16,11 @@ use decomp_node::{IDLE_POLL, RETRY_DELAY, server, work};
 use decomp_sandbox::Sandbox;
 
 use crate::device;
+
+/// The file, in this device's directory, listing the jobs this node has
+/// reported a result for, one ID to a line. `decomp-node receipts` reads it to
+/// check that their receipts are in the coordinator's batches.
+pub const REPORTED_FILE: &str = "reported";
 
 /// How often a device waiting to be approved asks whether it has been.
 const LINK_POLL: Duration = Duration::from_secs(3);
@@ -100,7 +107,7 @@ pub fn start(
             let pause = match turn(client, &store, &relay, address) {
                 Ok(Some(assignment)) if !on_a_job => {
                     let job_over = job_over.clone();
-                    jobs.spawn(move || run(client, sandbox, &assignment, &job_over));
+                    jobs.spawn(move || run(client, sandbox, dir, &assignment, &job_over));
                     on_a_job = true;
                     IDLE_POLL
                 }
@@ -168,12 +175,17 @@ fn turn(
 
 /// Runs one job and says when it is over. A job that could not be run or
 /// reported is handed back at a later check-in, so wait before saying so.
-fn run(client: &Client, sandbox: &Sandbox, assignment: &Assignment, over: &Sender<()>) {
+fn run(client: &Client, sandbox: &Sandbox, dir: &Path, assignment: &Assignment, over: &Sender<()>) {
     match work(client, sandbox, assignment) {
-        Ok(result) => println!(
-            "job {} reported, units used: {}",
-            result.job_id, result.units
-        ),
+        Ok(result) => {
+            println!(
+                "job {} reported, units used: {}",
+                result.job_id, result.units
+            );
+            if let Err(error) = remember(dir, &result.job_id) {
+                eprintln!("could not note job {}: {error}", result.job_id);
+            }
+        }
         Err(error) => {
             eprintln!("job {}: {error}; retrying", assignment.job_id);
             sleep(RETRY_DELAY);
@@ -181,6 +193,16 @@ fn run(client: &Client, sandbox: &Sandbox, assignment: &Assignment, over: &Sende
     }
     // The loop this reports to runs for as long as the program does.
     let _ = over.send(());
+}
+
+/// Notes a job this node has reported, so that its receipt can be looked for
+/// in a batch later.
+fn remember(dir: &Path, job_id: &JobId) -> std::io::Result<()> {
+    let mut reported = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(REPORTED_FILE))?;
+    writeln!(reported, "{job_id}")
 }
 
 /// Shows the coordinator the chunk it asked for. A node that no longer has the
