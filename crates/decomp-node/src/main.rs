@@ -12,13 +12,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
     AccountId, AccountStatus, AppManifest, ContentHash, Credits, JobId, JobStatus, Manifest,
     OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey, Receipt, SHARES, ShardRef, Share,
-    ShareSet, Split, Sponsorship, merkle, privacy, shares,
+    ShareSet, Split, Sponsorship, Verification, merkle, privacy, shares,
 };
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::deliver::{self, Delivered};
@@ -356,6 +356,40 @@ fn publish(
     Ok(ExitCode::SUCCESS)
 }
 
+/// What every result reports (spec section 7): "the privacy route used, how the
+/// result was verified, what it cost, how long it took, and whether an enclave
+/// was involved".
+struct Report {
+    route: String,
+    checked: &'static str,
+    fee: Credits,
+    time: Duration,
+    enclave: bool,
+}
+
+impl Report {
+    fn show(&self) {
+        println!("route   {}", self.route);
+        println!("checked {}", self.checked);
+        println!("fee     {} credits", self.fee);
+        println!("time    {:.1} s", self.time.as_secs_f64());
+        println!("enclave {}", if self.enclave { "yes" } else { "no" });
+    }
+}
+
+/// How a result that nodes produced was verified, in words. A result nothing
+/// was compared with is said to be so (spec section 7: "A result that is
+/// unverified or under dispute is flagged as such").
+fn how_checked(verified: Verification) -> &'static str {
+    match verified {
+        Verification::Agreed => "yes: the nodes that ran it agreed",
+        Verification::Refereed => {
+            "yes: nodes disagreed, and a referee ran it to find which were right"
+        }
+        Verification::Unchecked => "no: one proven node ran it, and no other was asked to",
+    }
+}
+
 /// The limits `submit` puts on a job, and who pays for it.
 struct Limits {
     deadline_secs: u64,
@@ -455,7 +489,7 @@ fn submit(
             let message = "a private job cannot be handed state, split by byte count, or given credits for follow-up jobs";
             return Err(message.into());
         }
-        // "The SDK takes the first route that fits and reports which one it used."
+        // A private job takes "the first route that fits" (spec section 7).
         let fits_device = job.compute_cap <= LOCAL_ROUTE_MAX_UNITS;
         return match privacy::route(&signature, fits_device)? {
             PrivateRoute::Local => run_here(&sandbox, dir, &job, &files),
@@ -521,7 +555,14 @@ fn submit(
             receipt.pieces.len()
         );
     }
-    println!("fee     {} credits", receipt.fee.total);
+    Report {
+        route: "open".into(),
+        checked: how_checked(receipt.verified),
+        fee: receipt.fee.total,
+        time: Duration::from_secs(receipt.seconds),
+        enclave: receipt.enclave,
+    }
+    .show();
     match receipt.outcome {
         Outcome::Completed {
             output,
@@ -566,7 +607,6 @@ fn submit_shares(
     let deadline = unix_now() + limits.deadline_secs;
     let set = ShareSet::generate();
     println!("module  {module}");
-    println!("route   private totals: cut into {SHARES} shares, each run by other accounts' nodes");
 
     let mut jobs = Vec::new();
     for (index, input) in (0..).zip(inputs) {
@@ -588,8 +628,7 @@ fn submit_shares(
         jobs.push(client.submit_job(manifest)?);
     }
 
-    let mut outputs = Vec::new();
-    let mut fee = Credits::ZERO;
+    let mut receipts = Vec::new();
     for (index, job_id) in jobs.into_iter().enumerate() {
         let receipt = match wait_for(client, job_id)? {
             Ok(receipt) => receipt,
@@ -601,13 +640,28 @@ fn submit_shares(
             receipt.units,
             receipt.results.len()
         );
-        fee += receipt.fee.total;
+        receipts.push(receipt);
+    }
+    // What the shares report together: the weakest check any of them had, what
+    // they cost in all, and, since they run side by side, the longest any took.
+    let checks = receipts.iter().map(|receipt| receipt.verified);
+    let times = receipts.iter().map(|receipt| receipt.seconds);
+    Report {
+        route: format!("private totals: {SHARES} shares, each run by other accounts' nodes"),
+        checked: how_checked(checks.min().unwrap_or(Verification::Unchecked)),
+        fee: (receipts.iter()).fold(Credits::ZERO, |sum, receipt| sum + receipt.fee.total),
+        time: Duration::from_secs(times.max().unwrap_or(0)),
+        enclave: receipts.iter().any(|receipt| receipt.enclave),
+    }
+    .show();
+
+    let mut outputs = Vec::new();
+    for receipt in receipts {
         match receipt.outcome {
             Outcome::Completed { output, .. } => outputs.push(client.get_blob(output)?),
             Outcome::Failed { failure } => return fail(&failure.to_string()),
         }
     }
-    println!("fee     {fee} credits");
     report_output(&shares::join(signature, &outputs)?, job.output.as_deref())?;
     Ok(ExitCode::SUCCESS)
 }
@@ -743,6 +797,7 @@ fn run_here(
     };
     // Off the network a job has no ID to draw its randomness from, so the seed is
     // fixed: every local run of a job draws the same bytes.
+    let started = Instant::now();
     let run = sandbox.run(&Job {
         module,
         input,
@@ -758,10 +813,18 @@ fn run_here(
     if let Some(signature) = sandbox.signature(module)? {
         println!("types   {}", String::from_utf8_lossy(&signature));
     }
-    if private {
-        println!("route   local: run on this device, and sent to no node");
-    }
     println!("units   {} of {}", run.units, job.compute_cap);
+    if private {
+        Report {
+            route: "local: run on this device, and sent to no node".into(),
+            // The spec's table: "Not needed; the device belongs to the user".
+            checked: "not needed: this device is its user's own",
+            fee: Credits::ZERO,
+            time: started.elapsed(),
+            enclave: false,
+        }
+        .show();
+    }
     let checkpoints = ContentHash::of(&run.checkpoints.concat());
     println!(
         "checks  {} checkpoints, list {checkpoints}",

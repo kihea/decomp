@@ -211,6 +211,14 @@ between them.
   `NoPrivateRoute` before anything is sent. The coordinator applies the same
   rule to what it is sent, so no node is handed a private job that came by no
   route.
+- **What every result reports.** "Each result carries a receipt with five
+  fields: the privacy route used, how the result was verified, what it cost,
+  how long it took, and whether an enclave was involved." A receipt already
+  had the cost. It now also has the private route, if the job took one; whether
+  nodes agreed, a referee settled a disagreement, or one proven node ran the
+  job and nothing was compared; the seconds from submission to result; and
+  `enclave`, which is false. `submit` shows the five as `route`, `checked`,
+  `fee`, `time`, and `enclave`, and so does `run` for a private job.
 - **Sealing inside a job.** A job can seal a message to a key with `seal`, so
   that only the device holding the opening key that goes with it can read the
   result. Every node that runs the job seals to the same bytes.
@@ -221,7 +229,7 @@ between them.
   agreed on the bytes, was opened by a private job on the device it was sealed
   to, and by no other device. The TypeScript client was not used to open one.
 - Private totals was run on four proven nodes of four accounts. With two nodes
-  to a share, no account was in both shares in seven runs, and the sums were
+  to a share, no account was in both shares in eight runs, and the sums were
   right. With three nodes online the second share waited for a fourth account
   and expired. A fifth node that reported a wrong result for a share was found
   out by the referee. That a share is never reissued as a known-answer job was
@@ -593,6 +601,32 @@ device reads the shares' outputs as JSON, adds, and writes the result out
 again, and that writes a struct's fields in the order of their names. The
 local route gives the module's own bytes.
 
+**A share is checked as any job is, and the receipt says how.** The spec's
+table has this route "verified by duplicate runs on each share", and also says
+verification is unchanged. Unchanged is what is built. Left to the coordinator,
+a share's job is run by one proven node and spot-checked now and then, or by
+two nodes when the first drawn is on probation, exactly like an open job, and
+`--redundancy 2` asks for two nodes on every share. The spec's "about 2x"
+holds either way, since an open job is checked by the same rule.
+
+**A result nothing was compared with says so.** "A result that is unverified or
+under dispute is flagged as such." A proven node runs most jobs alone, and the
+protocol counts its result as standing. The receipt's `verified` field then
+reads `unchecked`, and `submit` prints "no: one proven node ran it, and no
+other was asked to". A job whose pieces were checked in different ways reports
+the weakest of them.
+
+**A job on the local route has no receipt.** Receipts are written by the
+coordinator, and a job that runs on its user's device never reaches it. The
+device reports the five things itself: the route is local, checking is "not
+needed; the device belongs to the user", the cost is nothing, the time is what
+the device measured, and no enclave was involved.
+
+**`enclave` is reported before any enclave exists.** It is one of the spec's
+five fields, and "no" is a true answer today: no node can show that it runs in
+an enclave, so no job is sent to one. The field is set in one place, where a
+receipt is made.
+
 **What fits a device is one unit, for now.** The spec takes the local route when
 "the job fits the user's device". How much a device can do is its hardware-fit
 score, which nothing measures yet. Until something does, `submit` takes a device
@@ -646,7 +680,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | What an app has set aside for an account today is kept in memory | A restart forgets it, so a daily cap can be passed once for each restart. It counts the highest possible fee of each job, not what the job cost. | Settlement, build step 13 |
 | A daily cap limits an account, not a person | Accounts are free to make, so someone can get around an app's cap with new ones. What the app's account holds is the real limit. | Sign-in, build step 14 |
 | A job seals to one device, not to a user | The spec's sealing "encrypts to a user's key". The sealing keys there are belong to devices, so what a job seals can be opened on one device, and a private job run by the local route opens only what was sealed to the device it runs on. | Keys that no single party holds, later in build step 9 |
-| A follow-up job gets less than a submitted one | Its input is not checked against its module's types before it runs, so a wrong one fails when run. It cannot be split or handed state. | With the first app that needs any of these |
+| A follow-up job gets less than a submitted one | Its input is not checked against its module's types before it runs, so a wrong one fails when run. Nor is its module's privacy mode checked: it runs in the mode of the job that asked for it, and, if that job was a share, under the same name, so it stays off the accounts that hold the job's other shares. It cannot be split or handed state. | With the first app that needs any of these |
 | A job reads and writes its whole shard | Every job on a shard fetches all its records and stores all of them again, which is why a shard is capped at 8 MiB. | A hash tree over the records, if apps need larger shards |
 | Every past version of a shard is kept | Each is a blob on the coordinator, and nothing removes old ones. | With job blobs moving to node storage |
 | Records have no declared types and cannot be removed | The SDK reads and writes them as JSON of whatever type the module asks for, and the spec lists no call to delete one. | With the first app that needs either |

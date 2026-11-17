@@ -30,7 +30,7 @@ pub use envelope::{Envelope, EnvelopeError};
 pub use hosts::{Host, Hosts};
 pub use job::{
     Assignment, Failure, JobResult, JobStatus, MAX_PIECES, MAX_READS, MAX_SPAWNED, MAX_TIER,
-    Manifest, Outcome, Receipt, Share, Spawn, Split, UNPROVEN_REDUNDANCY,
+    Manifest, Outcome, Receipt, Share, Spawn, Split, UNPROVEN_REDUNDANCY, Verification,
 };
 pub use jobs::{ClosedJob, Closure, Dispute, FollowUps, JobError, Jobs};
 pub use keys::{

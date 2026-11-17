@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::Envelope;
 use crate::keys::{AccountId, ContentHash, JobId, ShareSet};
 use crate::ledger::{Credits, FeeSplit, fee};
-use crate::privacy::Privacy;
+use crate::privacy::{Privacy, PrivateRoute};
 use crate::state::ShardRef;
 
 /// How many nodes run a job when the first node drawn for it is still on
@@ -211,8 +211,29 @@ pub struct Assignment {
     pub shard: Option<ContentHash>,
 }
 
+/// How a job's result came to stand. The first of these that is true of any
+/// piece of a split job is what is said of the whole job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verification {
+    /// One proven node ran the job and no other was asked to (spec section 4,
+    /// "Earning spot checks"). Nothing was compared: the result rests on that
+    /// node's record, and on its not knowing which of its jobs are checked.
+    Unchecked,
+    /// The nodes that ran the job disagreed, and the referee ran it to find
+    /// which of them were right.
+    Refereed,
+    /// Every node that ran the job, two or more, reported the same result.
+    Agreed,
+}
+
 /// Proof of a finished job (spec section 6, "Receipts"). `results` holds the signed
 /// request of each node whose result stood, so anyone can recheck them.
+///
+/// With `fee`, which is what the job cost, the last four fields are what the
+/// spec has every result report (section 7): "the privacy route used, how the
+/// result was verified, what it cost, how long it took, and whether an enclave
+/// was involved".
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Receipt {
     pub job_id: JobId,
@@ -233,6 +254,16 @@ pub struct Receipt {
     /// its own holding its nodes' reports; this one totals their units and fees.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pieces: Vec<JobId>,
+    /// The private route the job was run by. Left out for an open job, which is
+    /// run by none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<PrivateRoute>,
+    pub verified: Verification,
+    /// Seconds from when the job was submitted to when its result stood.
+    pub seconds: u64,
+    /// Whether the job ran inside a hardware enclave. No node can yet show that
+    /// it runs in one, so no job is sent to one, and this is always false.
+    pub enclave: bool,
 }
 
 /// Where a job stands, as its submitter sees it.

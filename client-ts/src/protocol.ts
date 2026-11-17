@@ -222,8 +222,32 @@ export type Outcome =
   | { status: 'completed'; output: string }
   | { status: 'failed'; failure: Failure };
 
-/** The parts of a job's receipt this client reads (`Receipt`). */
-export type Receipt = { units: number; fee: { total: number }; outcome: Outcome };
+/** The private route a job was run by (`PrivateRoute`). */
+export type PrivateRoute = 'local' | 'private_totals';
+
+/**
+ * How a job's result came to stand (`Verification`): two or more nodes agreed,
+ * a referee settled a disagreement, or one proven node ran it and nothing was
+ * compared.
+ */
+export type Verification = 'agreed' | 'refereed' | 'unchecked';
+
+/**
+ * The parts of a job's receipt this client reads (`Receipt`). With the fee,
+ * the last four are what every result reports.
+ */
+export type Receipt = {
+  units: number;
+  fee: { total: number };
+  outcome: Outcome;
+  /** Left out for an open job. */
+  route?: PrivateRoute;
+  verified: Verification;
+  /** Seconds from when the job was submitted to when its result stood. */
+  seconds: number;
+  /** Whether the job ran inside a hardware enclave. Always false so far. */
+  enclave: boolean;
+};
 
 /** Where a job stands, as its submitter sees it (`JobStatus`). */
 export type JobStatus =

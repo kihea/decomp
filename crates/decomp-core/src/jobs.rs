@@ -17,9 +17,11 @@ use rand::{Rng, RngExt};
 use crate::envelope::Envelope;
 use crate::job::{
     Assignment, JobResult, JobStatus, Manifest, Outcome, Receipt, Spawn, UNPROVEN_REDUNDANCY,
+    Verification,
 };
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, ShareSet};
 use crate::ledger::{Credits, FeeSplit, fee};
+use crate::privacy::PrivateRoute;
 use crate::scores::{Conduct, FIRST_STAKED_TIER, ScoreEvent, Standing};
 use crate::state::ShardRef;
 
@@ -136,6 +138,8 @@ struct Known {
 struct Job {
     kind: Kind,
     manifest: Manifest,
+    /// When the job was accepted, in seconds since 1970.
+    submitted_at: u64,
     /// The contents its shard had when the job was handed out, which is what
     /// every node on it reads. `None` before then, and for an empty shard.
     shard: Option<ContentHash>,
@@ -221,7 +225,7 @@ impl Jobs {
     ) -> Result<(), JobError> {
         self.check(&id, &manifest, now)?;
         self.jobs
-            .insert(id, Job::new(Kind::Submitted { submitter }, manifest));
+            .insert(id, Job::new(Kind::Submitted { submitter }, manifest, now));
         self.waiting.push_back(id);
         Ok(())
     }
@@ -416,6 +420,13 @@ impl Jobs {
             .get_mut(&job_id)
             .expect("the job being closed exists");
         job.closed_at = Some(now);
+        // A job is closed here either because every node agreed or, if it was
+        // in dispute, because the referee has said which nodes were right.
+        let verified = match (job.in_dispute, right.len()) {
+            (true, _) => Verification::Refereed,
+            (false, 1) => Verification::Unchecked,
+            (false, _) => Verification::Agreed,
+        };
         job.in_dispute = false;
         for report in &job.results {
             let what = if right.contains(&report.node) {
@@ -477,6 +488,11 @@ impl Jobs {
                 .map(|report| report.envelope.clone())
                 .collect(),
             pieces: Vec::new(),
+            // Nodes are handed a private job only as a share.
+            route: job.manifest.share.map(|_| PrivateRoute::PrivateTotals),
+            verified,
+            seconds: now.saturating_sub(job.submitted_at),
+            enclave: false,
         };
         job.status = JobStatus::Verified {
             receipt: Box::new(receipt.clone()),
@@ -684,6 +700,7 @@ impl Jobs {
                 expected: Box::new(expected),
             },
             manifest,
+            now,
         );
         job.shard = shard;
         job.workers.push(Worker {
@@ -754,10 +771,11 @@ impl Job {
         }
     }
 
-    fn new(kind: Kind, manifest: Manifest) -> Self {
+    fn new(kind: Kind, manifest: Manifest, now: u64) -> Self {
         Self {
             kind,
             manifest,
+            submitted_at: now,
             shard: None,
             workers: Vec::new(),
             results: Vec::new(),

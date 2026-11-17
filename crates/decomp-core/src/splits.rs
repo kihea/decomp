@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::job::{JobStatus, Manifest, Outcome, Receipt};
+use crate::job::{JobStatus, Manifest, Outcome, Receipt, Verification};
 use crate::jobs::{CLOSED_JOB_RETENTION_SECS, ClosedJob, Closure};
 use crate::keys::{AccountId, ContentHash, JobId};
 use crate::ledger::FeeSplit;
@@ -18,6 +18,8 @@ enum PieceEnd {
         units: u64,
         fee: FeeSplit,
         outcome: Outcome,
+        verified: Verification,
+        seconds: u64,
     },
     Disputed,
     Expired,
@@ -71,6 +73,8 @@ impl Splits {
                 units: receipt.units,
                 fee: receipt.fee,
                 outcome: receipt.outcome.clone(),
+                verified: receipt.verified,
+                seconds: receipt.seconds,
             },
             Closure::Disputed => PieceEnd::Disputed,
             Closure::Expired => PieceEnd::Expired,
@@ -142,25 +146,39 @@ impl Splits {
 }
 
 impl SplitJob {
-    /// The receipt for the whole job: the totals of its pieces' receipts.
+    /// The receipt for the whole job: the totals of its pieces' receipts. The
+    /// pieces are submitted together, so the job took as long as its slowest
+    /// piece. A job is given a receipt only once a piece of it is verified.
     fn receipt(&self, id: JobId, outcome: Outcome) -> Receipt {
-        let verified = || {
+        let pieces = || {
             self.pieces.iter().filter_map(|(_, end)| match end {
-                Some(PieceEnd::Verified { units, fee, .. }) => Some((*units, *fee)),
+                Some(PieceEnd::Verified {
+                    units,
+                    fee,
+                    verified,
+                    seconds,
+                    ..
+                }) => Some((*units, *fee, *verified, *seconds)),
                 _ => None,
             })
         };
+        let weakest = pieces().map(|(_, _, verified, _)| verified).min();
         Receipt {
             job_id: id,
             module: self.manifest.module,
             input: self.manifest.input,
-            units: verified().map(|(units, _)| units).sum(),
-            fee: verified().map(|(_, fee)| fee).sum(),
+            units: pieces().map(|(units, ..)| units).sum(),
+            fee: pieces().map(|(_, fee, ..)| fee).sum(),
             outcome,
             state: None,
             handed: None,
             results: Vec::new(),
             pieces: self.pieces.iter().map(|(id, _)| *id).collect(),
+            // A job that is split is never private.
+            route: None,
+            verified: weakest.unwrap_or(Verification::Unchecked),
+            seconds: pieces().map(|(.., seconds)| seconds).max().unwrap_or(0),
+            enclave: false,
         }
     }
 }
