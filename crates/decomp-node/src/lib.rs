@@ -2,6 +2,7 @@
 //! command and the desktop app. Each front end decides where the device key is
 //! kept and when to work; this crate talks to the coordinator and runs the jobs.
 
+pub mod beacon;
 pub mod client;
 pub mod deliver;
 mod peer;

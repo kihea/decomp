@@ -354,6 +354,21 @@ between them.
   noted job: the receipt and the hashes that link it to a batch's fingerprint.
   It checks those hashes itself, and that the receipt holds its own signed
   report of the job.
+- **Draws from public randomness.** "The random draws for assignment and spot
+  checks come from a public source, such as the drand beacon." The coordinator
+  fetches each round of the drand beacon, one every three seconds. The nodes
+  that run a job, and whether and by whom it is spot-checked, are worked out
+  from the newest round, the job's ID, and the nodes that could have been
+  drawn, by a rule with no other input. While the beacon cannot be reached,
+  jobs wait.
+- **Published draws.** "Each operator publishes its draws, so steering jobs to
+  friendly nodes is detectable." When a job closes, the operator signs the
+  record of its draw and publishes it: the round and its randomness, the nodes
+  that could have been drawn with their weights, and the nodes that were.
+  `decomp-node draws` checks every published draw: the operator's signature,
+  that the round was the newest when the draw was made, that the beacon itself
+  gives that round the same randomness, and that the rule draws the nodes the
+  record names.
 - Run on the check network of five proven nodes, with a batch every 15
   seconds. The first batch took in the 524 receipts and 47 balances the
   network already had. Three jobs then went into two batches, of two receipts
@@ -365,6 +380,14 @@ between them.
   of the network's 46 accounts, and the balance at one node's address was what
   `account` showed for it, stake included. No account's ID, account key, or
   first device key appeared anywhere in the log.
+- Draws were run on the same network: 23 jobs, one of them asked to run on two
+  nodes. Three were given a spot checker and two were paired because the
+  first node drawn was on probation. All 23 published draws held when checked
+  by `decomp-node draws`, against rounds it fetched from the beacon itself. A
+  draw that named another node than the rule gives, signed with the
+  operator's own key and added to the published file by a script, was
+  refused by the same check. A draw with other randomness than the beacon's,
+  and one from a round that was not the newest, were not tried.
 
 ## Layout
 
@@ -496,6 +519,12 @@ Whether the receipts of the jobs this node has run are in those batches:
 cargo run -p decomp-node -- receipts
 ```
 
+Whether every draw the operator has published is the one the rule gives:
+
+```bash
+cargo run -p decomp-node -- draws
+```
+
 Coordinator settings are `DECOMP_ADDR`, `DECOMP_DATA_DIR`,
 `DECOMP_STORAGE_CHALLENGE_SECS` (how often each node is asked to show that it
 still holds a blob; an hour unless set), and `DECOMP_BATCH_SECS` (how often a
@@ -577,6 +606,36 @@ can show anyone the link by showing the request. Coordinator operators can
 too, since "the coordinator holds each account's record ... so it can bill
 jobs to the right balance". Nothing had to be added to what a client sends,
 and every account that already existed has an address.
+
+**A draw is a rule anyone can work out again.** The spec names "the drand
+beacon or ICP's verifiable randomness" as sources; drand can be reached from
+anywhere, so it is the one used, on its "quicknet" chain. A draw's numbers are
+SHA-256 hashes of a seed and a count, and the seed is a hash of the round's
+randomness, the job's ID, and the list of nodes that could be drawn. Nodes are
+picked with chances in proportion to weight, one to an account, and a job left
+to one proven node is given a spot checker when the next number is under one
+in ten. The rule is `drawn` in `crates/decomp-core/src/draw.rs`, and the
+coordinator hands out jobs by calling the same function a checker calls.
+
+The list of nodes is part of the seed for a reason. A node is handed its job's
+ID and can fetch any round, so from those two alone it could work out whether
+its job is spot-checked, and the spec has it that a node "never learns which
+jobs are checked". It does not know the other nodes' weights. For the same
+reason a draw is published only once its job has closed.
+
+Weights are recorded as whole millionths, so a checker starts from exactly the
+numbers the draw was made with. The first build recorded fractions, and a
+fraction written as text does not always read back as the same number: every
+draw then failed its check. A record lists only the nodes that could be drawn,
+not the ones the job was kept from, which would show whose result a job
+matters to. Nodes of one account share a number in a record, counted afresh in
+each, so that "one to an account" can be checked without naming an account.
+
+**Only the draws the spec names come from the beacon.** Those are "the random
+draws for assignment and spot checks". Which known-answer job a node is handed
+and when, which nodes hold a blob or carry a channel, and which chunk a
+storage challenge asks for still use the coordinator's own randomness. A
+known-answer job has to stay unpredictable to the node it tests.
 
 **A receipt is hashed as the text it was written as.** As with signed
 requests, nothing is written out a second time to be hashed, so a proof hands
@@ -966,7 +1025,10 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | The account key is the only controller | Passkeys, recovery keys, guardians, and email reset are build step 14. A device that loses its account key cannot be recovered. | Build step 14 |
 | The command-line node keeps its keys in plain files | It has no access to the system keychain. On Unix the files are readable by their owner only. | When the command needs it |
 | A job is not handed to another node if one goes silent | It waits for its deadline and expires; the silent node loses availability. A working node now checks in, but the coordinator does not yet use that to tell a node that has gone from one that is busy. | Re-assignment of jobs |
-| Assignment draws on the coordinator's own randomness | The spec calls for a public source so anyone can recheck a draw. | With staked operators, build step 13 |
+| A beacon round is taken on the word of the server it is fetched from | Each drand round carries a BLS signature that proves it against the network's public key. Neither the coordinator nor a checker verifies it: both fetch the round from `api.drand.sh` over HTTPS and compare. | A BLS12-381 signature check, when a draw must hold against someone who controls that server |
+| Who could have been drawn is the operator's word | A published draw shows that the rule was followed over the nodes it lists. That an idle node was left off the list, or the draw made a few seconds late to get a better round, can be seen only by the node left out, and nothing here tells it. | A node's own check that it is listed in the draws made while it was idle |
+| Jobs wait while the beacon cannot be reached | The coordinator has no other source of public randomness, and uses a round for at most nine seconds. | A second source, such as ICP's verifiable randomness |
+| Draws for data services and known-answer jobs are not public | See "Only the draws the spec names come from the beacon". | If the owner wants storage and relay placement to be checkable too |
 | The price of a unit is fixed at one credit | The spec lets the base price float with load and each tier carry a premium that moves with supply and demand. Both need load measurements that a test network cannot give. | When there is real traffic to steer |
 | Disputes re-run a job from its start, and spot checks re-run all of it | The spec re-runs one segment between two checkpoints. That needs a job's state to be restored mid-run, which a compiled engine cannot do; an interpreter with saved state, or a proof system, could. A spot check therefore costs a whole second run. | Zero-knowledge proofs, or an interpreter built for it |
 | A referee's verdict rests on one checkpoint | As the spec says, the node whose checkpoint matches the referee's is taken to be right. If two nodes are wrong in different ways, the one that went wrong later is believed. | A full re-run on every dispute, if that proves needed |

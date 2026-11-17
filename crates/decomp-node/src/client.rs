@@ -236,6 +236,11 @@ impl Client {
         }
     }
 
+    /// A page of the draws the operator has published, from number `from` on.
+    pub fn draws(&self, from: u64) -> Result<LogPage, ClientError> {
+        self.call(Call::GetDraws { from })
+    }
+
     /// Proof that the receipt of a job is in a batch of the settlement log.
     pub fn inclusion(&self, job_id: JobId) -> Result<Inclusion, ClientError> {
         self.call(Call::GetInclusion { job_id })

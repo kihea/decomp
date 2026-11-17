@@ -2,9 +2,12 @@
 //! and when a result stands (spec section 2 "Lifecycle", section 3 "Assignment",
 //! and section 4).
 //!
-//! Like `Accounts`, this does no I/O. The caller passes in the time, the source of
-//! randomness, each node's standing, and the contents of each shard of state, so
-//! the same calls always produce the same decisions. What the caller must act on comes back through three lists it
+//! Like `Accounts`, this does no I/O. The caller passes in the time, each round
+//! of the public randomness beacon, each node's standing, and the contents of
+//! each shard of state, so the same calls always produce the same decisions.
+//! Which nodes run a job is drawn from the beacon (see `draw`); only the choice
+//! of known-answer jobs uses randomness of the caller's own, because a node must
+//! not be able to tell one is coming. What the caller must act on comes back through three lists it
 //! takes after each call: jobs that closed, score events, and disputes to referee.
 //!
 //! Nothing here is durable: assignments and results are needed only until a job
@@ -14,10 +17,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use rand::{Rng, RngExt};
 
+use crate::draw::{Beacon, Draw, Eligible, WEIGHT_SCALE};
 use crate::envelope::Envelope;
 use crate::job::{
-    Assignment, JobResult, JobStatus, Manifest, Outcome, Receipt, Spawn, UNPROVEN_REDUNDANCY,
-    Verification,
+    Assignment, JobResult, JobStatus, Manifest, Outcome, Receipt, Spawn, Verification,
 };
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, ShareSet};
 use crate::ledger::{Credits, FeeSplit, fee};
@@ -30,10 +33,6 @@ pub const ONLINE_WINDOW_SECS: u64 = 10;
 
 /// How long a closed job stays readable by its submitter before it is forgotten.
 pub const CLOSED_JOB_RETENTION_SECS: u64 = 3600;
-
-/// The share of jobs given to one proven node that a second node is also asked
-/// to run, without either being told. A starting value.
-pub const SPOT_CHECK_RATE: f64 = 0.10;
 
 /// After a node reports a result, the chance that its next job is one whose
 /// answer the coordinator already knows. A starting value.
@@ -149,6 +148,8 @@ struct Job {
     /// every node on it reads. `None` before then, and for an empty shard.
     shard: Option<ContentHash>,
     workers: Vec<Worker>,
+    /// How its nodes were drawn, kept until the job closes and then published.
+    draw: Option<Draw>,
     results: Vec<Report>,
     status: JobStatus,
     closed_at: Option<u64>,
@@ -198,6 +199,10 @@ pub struct Jobs {
     closed: Vec<ClosedJob>,
     events: Vec<ScoreEvent>,
     disputes: Vec<Dispute>,
+    /// The draws of jobs that have closed, for the caller to publish.
+    draws: Vec<Draw>,
+    /// The newest round of public randomness the caller has passed in.
+    beacon: Option<Beacon>,
 }
 
 impl Jobs {
@@ -216,6 +221,13 @@ impl Jobs {
             return Err(JobError::JobExists);
         }
         Ok(())
+    }
+
+    /// Takes in the newest round of public randomness, which the nodes for
+    /// waiting jobs are drawn from (spec section 6: "Assignment draws on public
+    /// randomness").
+    pub fn set_beacon(&mut self, beacon: Beacon) {
+        self.beacon = Some(beacon);
     }
 
     /// Accepts a job. The caller sets aside its highest possible fee first, so a
@@ -263,7 +275,7 @@ impl Jobs {
             known_answer_due: false,
         });
         entry.last_seen = now;
-        self.assign(now, rng, standing, contents);
+        self.assign(now, standing, contents);
         if self.nodes[&node].job.is_none() && self.nodes[&node].known_answer_due {
             self.issue_known_answer(node, account, now, rng, &standing(&node, &account));
         }
@@ -416,6 +428,12 @@ impl Jobs {
         std::mem::take(&mut self.events)
     }
 
+    /// The draws of the jobs that closed since this was last called (spec
+    /// section 6: "Each operator publishes its draws").
+    pub fn take_draws(&mut self) -> Vec<Draw> {
+        std::mem::take(&mut self.draws)
+    }
+
     /// The disputes that arose since this was last called.
     pub fn take_disputes(&mut self) -> Vec<Dispute> {
         std::mem::take(&mut self.disputes)
@@ -429,6 +447,7 @@ impl Jobs {
             .get_mut(&job_id)
             .expect("the job being closed exists");
         job.closed_at = Some(now);
+        self.draws.extend(job.draw.take());
         // A job is closed here either because every node agreed or, if it was
         // in dispute, because the referee has said which nodes were right.
         let verified = match (job.in_dispute, right.len()) {
@@ -561,7 +580,9 @@ impl Jobs {
     /// Hands each waiting job to idle online nodes, drawn at random in proportion
     /// to their scores, one per account. A job is handed out whole or not at all,
     /// so that every node on it is drawn from everyone eligible and not from
-    /// whoever checked in first.
+    /// whoever checked in first. The draw comes from the newest round of the
+    /// beacon by the rule in `draw`, and its record is kept with the job.
+    /// Without a round that is current, jobs wait.
     ///
     /// Jobs on the same shard of state run one at a time: a job waits while
     /// another that was handed its shard is still open.
@@ -580,7 +601,6 @@ impl Jobs {
     fn assign(
         &mut self,
         now: u64,
-        rng: &mut impl Rng,
         standing: &dyn Fn(&PublicKey, &AccountId) -> Standing,
         contents: &dyn Fn(&ShardRef) -> Option<ContentHash>,
     ) {
@@ -588,8 +608,12 @@ impl Jobs {
             jobs,
             waiting,
             nodes,
+            beacon,
             ..
         } = self;
+        let Some(beacon) = beacon.filter(|beacon| beacon.is_current(now)) else {
+            return;
+        };
         let mut idle: Vec<Candidate> = nodes
             .iter()
             .filter(|(_, node)| node.job.is_none() && is_online(node, now))
@@ -599,6 +623,8 @@ impl Jobs {
                 standing: standing(key, &node.account),
             })
             .collect();
+        // A draw lists the nodes it was made from in order of key.
+        idle.sort_by_key(|candidate| candidate.node);
 
         // A job reissued as a known answer reads old contents and changes
         // nothing, so it does not hold its shard.
@@ -640,32 +666,15 @@ impl Jobs {
             {
                 return true;
             }
-            let Some(first) = draw(&idle, &job.manifest, &[], &barred, rng) else {
+            let listed = eligible(&idle, &job.manifest, &barred);
+            let redundancy = job.manifest.redundancy;
+            let Some(draw) = Draw::make(*id, now, beacon, redundancy, listed) else {
                 return true;
             };
-            // A proven node runs a job alone; a node on probation is always paired.
-            let wanted = job
-                .manifest
-                .redundancy
-                .unwrap_or(if idle[first].standing.proven {
-                    1
-                } else {
-                    UNPROVEN_REDUNDANCY
-                });
-            let mut drawn = vec![first];
-            while drawn.len() < wanted as usize {
-                match draw(&idle, &job.manifest, &drawn, &barred, rng) {
-                    Some(next) => drawn.push(next),
-                    None => return true,
-                }
-            }
-            let spot_check = job.manifest.redundancy.is_none() && wanted == 1;
-            let checker = (spot_check && rng.random_bool(SPOT_CHECK_RATE))
-                .then(|| draw(&idle, &job.manifest, &drawn, &barred, rng))
-                .flatten();
-
-            for &index in drawn.iter().chain(&checker) {
-                let Candidate { node, account, .. } = idle[index];
+            let running = draw.nodes.iter().map(|node| (node, false));
+            for (drawn, checker) in running.chain(draw.checker.iter().map(|node| (node, true))) {
+                let place = idle.iter().position(|candidate| candidate.node == *drawn);
+                let Candidate { node, account, .. } = idle.remove(place.expect("drawn from idle"));
                 nodes.get_mut(&node).expect("idle nodes exist").job = Some(*id);
                 if let Some(shares) = shares {
                     holders.entry(shares).or_default().insert(account);
@@ -673,15 +682,10 @@ impl Jobs {
                 job.workers.push(Worker {
                     node,
                     account,
-                    checker: Some(index) == checker,
+                    checker,
                 });
             }
-            let mut taken: Vec<usize> = drawn.into_iter().chain(checker).collect();
-            // Remove from the back so earlier indexes stay valid.
-            taken.sort_unstable_by(|a, b| b.cmp(a));
-            for index in taken {
-                idle.remove(index);
-            }
+            job.draw = Some(draw);
             if let Some(shard) = &job.manifest.state {
                 job.shard = contents(shard);
                 held.insert(shard.clone());
@@ -749,6 +753,7 @@ impl Jobs {
             nodes,
             closed,
             events,
+            draws,
             ..
         } = self;
         for (id, job) in jobs.iter_mut() {
@@ -757,6 +762,7 @@ impl Jobs {
             }
             job.status = JobStatus::Expired;
             job.closed_at = Some(now);
+            draws.extend(job.draw.take());
             if matches!(job.kind, Kind::Submitted { .. }) {
                 closed.push(ClosedJob {
                     job_id: *id,
@@ -804,6 +810,7 @@ impl Job {
             submitted_at: now,
             shard: None,
             workers: Vec::new(),
+            draw: None,
             results: Vec::new(),
             status: JobStatus::Waiting,
             closed_at: None,
@@ -825,36 +832,26 @@ fn may_take(standing: &Standing, manifest: &Manifest) -> bool {
         && (tier < FIRST_STAKED_TIER || standing.stake >= fee(manifest.compute_cap, 1))
 }
 
-/// Draws one candidate for a job, with chances in proportion to the candidates'
-/// weights. Skips candidates already drawn and any from their accounts, and any
-/// from the `barred` accounts.
-fn draw(
-    idle: &[Candidate],
-    manifest: &Manifest,
-    drawn: &[usize],
-    barred: &HashSet<AccountId>,
-    rng: &mut impl Rng,
-) -> Option<usize> {
-    let eligible: Vec<usize> = (0..idle.len())
-        .filter(|&index| may_take(&idle[index].standing, manifest))
-        .filter(|&index| !barred.contains(&idle[index].account))
-        .filter(|&index| {
-            drawn
-                .iter()
-                .all(|&other| idle[other].account != idle[index].account)
+/// The idle nodes that may be drawn for a job, as its draw lists them: those
+/// that may take it and are not of a `barred` account, in the order of `idle`.
+fn eligible(idle: &[Candidate], manifest: &Manifest, barred: &HashSet<AccountId>) -> Vec<Eligible> {
+    // Nodes of one account get one number, counted in the order they come.
+    let mut owners: Vec<AccountId> = Vec::new();
+    let mut owner = |account: AccountId| {
+        let known = owners.iter().position(|other| *other == account);
+        known.unwrap_or_else(|| {
+            owners.push(account);
+            owners.len() - 1
+        }) as u32
+    };
+    idle.iter()
+        .filter(|candidate| may_take(&candidate.standing, manifest))
+        .filter(|candidate| !barred.contains(&candidate.account))
+        .map(|candidate| Eligible {
+            node: candidate.node,
+            owner: owner(candidate.account),
+            weight: (candidate.standing.weight() * WEIGHT_SCALE).round() as u64,
+            proven: candidate.standing.proven,
         })
-        .collect();
-    let total: f64 = eligible
-        .iter()
-        .map(|&index| idle[index].standing.weight())
-        .sum();
-    let mut point = rng.random::<f64>() * total;
-    for &index in &eligible {
-        point -= idle[index].standing.weight();
-        if point <= 0.0 {
-            return Some(index);
-        }
-    }
-    // Rounding can leave `point` a hair above zero after the last candidate.
-    eligible.last().copied()
+        .collect()
 }

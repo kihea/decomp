@@ -17,10 +17,11 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
     AccountId, AccountStatus, AppManifest, Call, ContentHash, Credits, Encrypted, Inclusion, JobId,
-    JobStatus, Manifest, OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey, Receipt, Request,
-    SHARES, ShardRef, Share, ShareSet, Split, Sponsorship, Verification, encrypted, merkle,
-    privacy, shares,
+    JobStatus, MAX_LOG_PAGE, Manifest, OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey,
+    Receipt, Request, SHARES, ShardRef, Share, ShareSet, Split, Sponsorship, Verification,
+    encrypted, merkle, privacy, shares,
 };
+use decomp_node::beacon::Rounds;
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::deliver::{self, Delivered};
 use decomp_node::relay;
@@ -185,6 +186,9 @@ enum Command {
     /// Check that the receipts of the jobs this node has run are in the
     /// batches the coordinator posted.
     Receipts,
+    /// Check the draws the coordinator's operator has published: that each
+    /// job's nodes are the ones the rule draws from public randomness.
+    Draws,
     /// Run a job module on this device only, without the network. For a private
     /// job this is the local route.
     Run {
@@ -280,6 +284,7 @@ fn main() -> ExitCode {
         Command::State { shard } => connect().and_then(|client| show_state(&client, shard)),
         Command::Log => connect().and_then(|client| show_log(&client)),
         Command::Receipts => connect().and_then(|client| check_receipts(&client, &cli.dir)),
+        Command::Draws => connect().and_then(|client| check_draws(&client)),
         Command::Run { job } => {
             read_job(&job).and_then(|files| run_here(&Sandbox::new(), &cli.dir, &job, &files))
         }
@@ -354,6 +359,44 @@ fn check_receipts(client: &Client, dir: &Path) -> Result<ExitCode, Box<dyn Error
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// Checks every draw the operator has published (spec section 4: "Each draw is
+/// published, so anyone can recheck that nodes were not hand-picked"). Each
+/// must be signed by the operator that signs the settlement log, name the
+/// beacon round that was newest when it was made, with the randomness the
+/// beacon itself gives for that round, and draw the nodes the rule gives.
+fn check_draws(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
+    let operator = client.settlement_log()?.operator();
+    let mut rounds = Rounds::default();
+    let (mut from, mut spot_checked) = (0, 0);
+    loop {
+        let page = client.draws(from)?;
+        for signed in &page.entries {
+            let draw = rounds
+                .check(signed, &operator.unwrap_or(signed.signer))
+                .map_err(|fault| format!("draw {from} does not hold: {fault}"))?;
+            println!(
+                "job {}  round {}, {} of {} nodes drawn{}",
+                draw.job_id,
+                draw.beacon.round,
+                draw.nodes.len(),
+                draw.eligible.len(),
+                if draw.checker.is_some() {
+                    ", and a spot checker"
+                } else {
+                    ""
+                }
+            );
+            spot_checked += u64::from(draw.checker.is_some());
+            from += 1;
+        }
+        if page.entries.len() < MAX_LOG_PAGE {
+            break;
+        }
+    }
+    println!("{from} draws hold, {spot_checked} of them with a spot checker");
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Whether the receipt in `inclusion` is of `job_id` and holds this device's

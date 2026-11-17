@@ -7,6 +7,8 @@ description = "DeComp coordinator service."
 [dependencies]
 axum = "0.8.9"
 decomp-core = { version = "0.1.0", path = "../decomp-core" }
+# For reading the public randomness beacon, as a node does to check a draw.
+decomp-node = { version = "0.1.0", path = "../decomp-node" }
 decomp-sandbox = { version = "0.1.0", path = "../decomp-sandbox" }
 decomp-schema = { version = "0.1.0", path = "../decomp-schema" }
 rand = "0.10.4"

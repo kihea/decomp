@@ -100,7 +100,8 @@ pub fn entry_hash(entry: &Envelope) -> ContentHash {
     ContentHash::from_bytes(hasher.finalize().into())
 }
 
-/// A page of the settlement log, oldest entry first.
+/// A page of signed entries, oldest first: of the settlement log, or of the
+/// draws the operator has published.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogPage {
     pub entries: Vec<Envelope>,

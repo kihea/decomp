@@ -5,6 +5,7 @@
 
 mod account;
 mod app;
+mod draw;
 pub mod encrypted;
 mod envelope;
 mod hosts;
@@ -27,6 +28,10 @@ mod storage;
 pub use account::{Account, AccountOp, Accounts, Device, OpError};
 pub use app::{
     AppManifest, MAX_APP_MODULES, MAX_APP_NAME_BYTES, SponsorError, Sponsored, Sponsorship,
+};
+pub use draw::{
+    BEACON_CHAIN, BEACON_MAX_LAG_ROUNDS, BEACON_PERIOD_SECS, Beacon, Draw, DrawError, Eligible,
+    SPOT_CHECK_RATE, round_at,
 };
 pub use encrypted::{EncryptError, Encrypted, EncryptionKey};
 pub use envelope::{Envelope, EnvelopeError};

@@ -9,6 +9,7 @@
 //! | Receipts | `receipts.jsonl` | Yes |
 //! | The settlement log: batches, signed by the operator | `settlement.jsonl`, checked from its first entry at startup | Yes |
 //! | The operator's key | `operator.key` | Yes |
+//! | The draws of closed jobs, signed by the operator | `draws.jsonl` | Yes |
 //! | Which nodes hold which blobs | `storage.jsonl`, replayed at startup | Yes |
 //! | Relay channels | `relays.jsonl`, replayed at startup | Yes |
 //! | The sealing key each device published | `sealing.jsonl`, replayed at startup | Yes |
@@ -25,7 +26,7 @@ use std::io;
 use std::path::Path;
 
 use decomp_core::{
-    Account, AccountId, AccountStatus, Accounts, Assignment, Challenge, CheckedIn, Closure,
+    Account, AccountId, AccountStatus, Accounts, Assignment, Beacon, Challenge, CheckedIn, Closure,
     Conduct, ContentHash, Credits, Envelope, EnvelopeError, FollowUps, Hosts, Inclusion,
     IncomingChannels, JobError, JobId, JobStatus, Jobs, Ledger, LedgerAddress, LedgerEntry,
     LedgerError, Located, LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES,
@@ -140,6 +141,8 @@ pub struct Coordinator {
     operator: SigningKey,
     settlement: SettlementLog,
     settlement_log: Log,
+    /// The draws of jobs that have closed, each signed by the operator.
+    draws_log: Log,
     /// The nodes other devices can connect to, which hold and relay data.
     hosts: Hosts,
     storage: Storage,
@@ -255,6 +258,7 @@ impl Coordinator {
             operator: operator::key(data_dir)?,
             settlement,
             settlement_log,
+            draws_log: Log::open(&data_dir.join("draws.jsonl"))?,
             hosts: Hosts::default(),
             storage,
             storage_log,
@@ -294,6 +298,21 @@ impl Coordinator {
             .apply(&entry)
             .expect("the coordinator's own batch follows the log's rules");
         self.settlement_log.append(&entry);
+    }
+
+    /// Takes in the newest round of public randomness. Nodes are drawn for
+    /// jobs from it, so until there is one, jobs wait.
+    pub fn set_beacon(&mut self, beacon: Beacon) {
+        self.jobs.set_beacon(beacon);
+    }
+
+    /// Up to `MAX_LOG_PAGE` of the draws published so far, from number `from` on.
+    pub fn draws_page(&self, from: u64) -> io::Result<LogPage> {
+        let lines = self.draws_log.range(from, MAX_LOG_PAGE)?;
+        let entries = lines.iter().map(|line| serde_json::from_str(line));
+        Ok(LogPage {
+            entries: entries.collect::<Result<_, _>>()?,
+        })
     }
 
     /// What sits at every ledger address now.
@@ -781,6 +800,12 @@ impl Coordinator {
                 let lost = |staked: Credits| staked.percent(PROBATION_FORFEIT_PERCENT);
                 self.forfeit(&event.node, lost);
             }
+        }
+        // A job's draw is published once the job has closed (spec section 6:
+        // "Each operator publishes its draws").
+        for draw in self.jobs.take_draws() {
+            let signed = Envelope::seal(&self.operator, &draw);
+            self.draws_log.append(&signed);
         }
         for closed in self.jobs.take_closed() {
             let job_id = closed.job_id;

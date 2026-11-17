@@ -110,6 +110,10 @@ pub enum Call {
     /// Proof that the receipt of a job is in a batch. Whoever knows a job's ID
     /// may ask: its submitter and the nodes that ran it. Answer: `Inclusion`.
     GetInclusion { job_id: JobId },
+    /// The draws the operator has published, from number `from` on, counting
+    /// from zero, at most `MAX_LOG_PAGE` of them. Each is a `Draw` signed by
+    /// the operator (see `draw`). Answer: `LogPage`.
+    GetDraws { from: u64 },
 }
 
 /// An account record together with its credits. Changing an account answers

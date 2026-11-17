@@ -14,11 +14,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use decomp_core::{
-    Account, AccountStatus, Accounts, Addressed, Blob, BlobData, BlobRef, Call, ContentHash,
-    Envelope, EnvelopeError, JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS,
+    Account, AccountStatus, Accounts, Addressed, BEACON_PERIOD_SECS, Blob, BlobData, BlobRef, Call,
+    ContentHash, Envelope, EnvelopeError, JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS,
     MAX_MESSAGE_BYTES, OpError, Outcome, PrivacyError, PublicKey, PublishedKey, Refusal,
     RelayError, Request, ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted,
 };
+use decomp_node::beacon::Rounds;
 use decomp_sandbox::Sandbox;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
@@ -32,14 +33,16 @@ struct App {
     sandbox: Sandbox,
 }
 
-/// The coordinator's API, and the clock that posts a batch to the settlement
-/// log every `batch_period`.
+/// The coordinator's API, the clock that posts a batch to the settlement log
+/// every `batch_period`, and the one that fetches each round of public
+/// randomness.
 pub fn router(coordinator: Coordinator, batch_period: Duration) -> Router {
     let app = Arc::new(App {
         coordinator: Mutex::new(coordinator),
         sandbox: Sandbox::new(),
     });
     tokio::spawn(post_batches(Arc::clone(&app), batch_period));
+    tokio::spawn(follow_beacon(Arc::clone(&app)));
     Router::new()
         .route("/v1/ops", post(submit_op))
         .route("/v1/request", post(request))
@@ -47,6 +50,34 @@ pub fn router(coordinator: Coordinator, batch_period: Duration) -> Router {
         // Requests carry no cookies or credentials, so any web origin may call.
         .layer(CorsLayer::permissive())
         .with_state(app)
+}
+
+/// Fetches the beacon's newest round every time there is a new one. Nodes are
+/// drawn for jobs from it (spec section 6: "Assignment draws on public
+/// randomness"), so while the beacon cannot be reached, jobs wait.
+async fn follow_beacon(app: Arc<App>) {
+    let rounds = Arc::new(Rounds::default());
+    let mut ticks = tokio::time::interval(Duration::from_secs(BEACON_PERIOD_SECS));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut reached = true;
+    loop {
+        ticks.tick().await;
+        let beacon = Arc::clone(&rounds);
+        let fetched = tokio::task::spawn_blocking(move || beacon.latest()).await;
+        match fetched.expect("fetching a round does not panic") {
+            Ok(beacon) => {
+                let mut coordinator = app.coordinator.lock().expect("coordinator lock");
+                coordinator.set_beacon(beacon);
+                reached = true;
+            }
+            // Said once each time the beacon is lost, not every three seconds.
+            Err(error) if reached => {
+                eprintln!("no public randomness, so jobs wait: {error}");
+                reached = false;
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 async fn post_batches(app: Arc<App>, period: Duration) {
@@ -231,6 +262,7 @@ fn answer(
         }
         Call::GetLog { from } => Json(coordinator.log_page(from)?).into_response(),
         Call::GetInclusion { job_id } => Json(coordinator.inclusion(&job_id)?).into_response(),
+        Call::GetDraws { from } => Json(coordinator.draws_page(from)?).into_response(),
         Call::SubmitResult { result } => {
             if let Outcome::Completed {
                 output,
