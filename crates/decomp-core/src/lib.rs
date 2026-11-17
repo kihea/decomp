@@ -17,6 +17,7 @@ mod relay;
 mod request;
 mod scores;
 pub mod seal;
+pub mod shares;
 mod splits;
 mod state;
 mod storage;
@@ -29,11 +30,12 @@ pub use envelope::{Envelope, EnvelopeError};
 pub use hosts::{Host, Hosts};
 pub use job::{
     Assignment, Failure, JobResult, JobStatus, MAX_PIECES, MAX_READS, MAX_SPAWNED, MAX_TIER,
-    Manifest, Outcome, Receipt, Spawn, Split, UNPROVEN_REDUNDANCY,
+    Manifest, Outcome, Receipt, Share, Spawn, Split, UNPROVEN_REDUNDANCY,
 };
 pub use jobs::{ClosedJob, Closure, Dispute, FollowUps, JobError, Jobs};
 pub use keys::{
-    AccountId, ContentHash, JobId, OpeningKey, PublicKey, SealingKey, Signature, SigningKey,
+    AccountId, ContentHash, JobId, OpeningKey, PublicKey, SealingKey, ShareSet, Signature,
+    SigningKey,
 };
 pub use ledger::{
     BASE_PRICE, Balance, Credits, FeeSplit, Ledger, LedgerEntry, LedgerError,
@@ -51,6 +53,7 @@ pub use request::{
 };
 pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
 pub use seal::{SEAL_OVERHEAD_BYTES, SealingKeys};
+pub use shares::{SHARES, ShareError};
 pub use splits::{Merge, Splits};
 pub use state::{MAX_SHARD_NAME_BYTES, ShardRef, StateEntry, States};
 pub use storage::{

@@ -18,7 +18,7 @@ use crate::envelope::Envelope;
 use crate::job::{
     Assignment, JobResult, JobStatus, Manifest, Outcome, Receipt, Spawn, UNPROVEN_REDUNDANCY,
 };
-use crate::keys::{AccountId, ContentHash, JobId, PublicKey};
+use crate::keys::{AccountId, ContentHash, JobId, PublicKey, ShareSet};
 use crate::ledger::{Credits, FeeSplit, fee};
 use crate::scores::{Conduct, FIRST_STAKED_TIER, ScoreEvent, Standing};
 use crate::state::ShardRef;
@@ -481,8 +481,10 @@ impl Jobs {
         job.status = JobStatus::Verified {
             receipt: Box::new(receipt.clone()),
         };
-        // Two nodes agreeing is what makes an answer known.
-        if right.len() >= 2 {
+        // Two nodes agreeing is what makes an answer known. A share is never
+        // reissued: the node asked might be of an account that holds another
+        // share of the same job.
+        if right.len() >= 2 && job.manifest.share.is_none() {
             self.known.push_back(Known {
                 manifest: job.manifest.clone(),
                 seed: job_id,
@@ -538,6 +540,13 @@ impl Jobs {
     ///
     /// Jobs on the same shard of state run one at a time: a job waits while
     /// another that was handed its shard is still open.
+    ///
+    /// The shares of one private job go to different accounts (spec section 7:
+    /// "shares held by nodes on different accounts"). A share is never handed to
+    /// a node of an account that was handed any share of the same job, so it
+    /// waits until enough other accounts have idle nodes. Which accounts hold a
+    /// job's shares is known for as long as the shares' jobs are remembered,
+    /// which is why a device submits all of a job's shares together.
     fn assign(
         &mut self,
         now: u64,
@@ -570,8 +579,20 @@ impl Jobs {
             .filter_map(|job| job.manifest.state.clone())
             .collect();
 
+        // The accounts that have been handed a share of each private job.
+        let mut holders: HashMap<(AccountId, ShareSet), HashSet<AccountId>> = HashMap::new();
+        for job in jobs.values() {
+            if let Some(shares) = job.shares() {
+                let accounts = job.workers.iter().map(|worker| worker.account);
+                holders.entry(shares).or_default().extend(accounts);
+            }
+        }
+
         waiting.retain(|id| {
             let job = jobs.get_mut(id).expect("waiting jobs exist");
+            let shares = job.shares();
+            let barred = shares.and_then(|shares| holders.get(&shares));
+            let barred = barred.cloned().unwrap_or_default();
             if job
                 .manifest
                 .state
@@ -580,7 +601,7 @@ impl Jobs {
             {
                 return true;
             }
-            let Some(first) = draw(&idle, &job.manifest, &[], rng) else {
+            let Some(first) = draw(&idle, &job.manifest, &[], &barred, rng) else {
                 return true;
             };
             // A proven node runs a job alone; a node on probation is always paired.
@@ -594,19 +615,22 @@ impl Jobs {
                 });
             let mut drawn = vec![first];
             while drawn.len() < wanted as usize {
-                match draw(&idle, &job.manifest, &drawn, rng) {
+                match draw(&idle, &job.manifest, &drawn, &barred, rng) {
                     Some(next) => drawn.push(next),
                     None => return true,
                 }
             }
             let spot_check = job.manifest.redundancy.is_none() && wanted == 1;
             let checker = (spot_check && rng.random_bool(SPOT_CHECK_RATE))
-                .then(|| draw(&idle, &job.manifest, &drawn, rng))
+                .then(|| draw(&idle, &job.manifest, &drawn, &barred, rng))
                 .flatten();
 
             for &index in drawn.iter().chain(&checker) {
                 let Candidate { node, account, .. } = idle[index];
                 nodes.get_mut(&node).expect("idle nodes exist").job = Some(*id);
+                if let Some(shares) = shares {
+                    holders.entry(shares).or_default().insert(account);
+                }
                 job.workers.push(Worker {
                     node,
                     account,
@@ -720,6 +744,16 @@ impl Jobs {
 }
 
 impl Job {
+    /// If the job is a share of a private job: whose, and the name its shares
+    /// carry. An account names its own shares, so one account cannot use
+    /// another's name to keep that account's shares from being handed out.
+    fn shares(&self) -> Option<(AccountId, ShareSet)> {
+        match (&self.kind, self.manifest.share) {
+            (Kind::Submitted { submitter }, Some(share)) => Some((*submitter, share.set)),
+            _ => None,
+        }
+    }
+
     fn new(kind: Kind, manifest: Manifest) -> Self {
         Self {
             kind,
@@ -748,15 +782,18 @@ fn may_take(standing: &Standing, manifest: &Manifest) -> bool {
 }
 
 /// Draws one candidate for a job, with chances in proportion to the candidates'
-/// weights. Skips candidates already drawn and any from their accounts.
+/// weights. Skips candidates already drawn and any from their accounts, and any
+/// from the `barred` accounts.
 fn draw(
     idle: &[Candidate],
     manifest: &Manifest,
     drawn: &[usize],
+    barred: &HashSet<AccountId>,
     rng: &mut impl Rng,
 ) -> Option<usize> {
     let eligible: Vec<usize> = (0..idle.len())
         .filter(|&index| may_take(&idle[index].standing, manifest))
+        .filter(|&index| !barred.contains(&idle[index].account))
         .filter(|&index| {
             drawn
                 .iter()

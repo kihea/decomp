@@ -43,7 +43,18 @@ pub enum Schema {
     /// A value marked private: no node may see it as it is. It is carried as the
     /// value inside is.
     Private(Box<Schema>),
+    /// A private whole number, from 0 up to but not including
+    /// `PRIVATE_NUMBER_MODULUS`. Unlike other private values it can be cut into
+    /// shares: numbers that each say nothing about it and that add up to it. A
+    /// node may be handed one share.
+    PrivateNumber,
 }
+
+/// One more than the largest private number. Sums of private numbers wrap around
+/// at it. It is 2^53 because a share is as likely to be large as small, and
+/// every whole number below 2^53 comes through any JSON reader unchanged, also
+/// one that keeps all numbers as 64-bit floating point.
+pub const PRIVATE_NUMBER_MODULUS: u64 = 1 << 53;
 
 /// The mode a job runs in (spec section 2, the manifest's `privacy` field: "open
 /// or private"). An open job's data can be read by the nodes that run it. Of a
@@ -103,15 +114,40 @@ impl Signature {
         let value: Value = serde_json::from_slice(input).map_err(|_| Mismatch::NotJson)?;
         Schema::Tuple(self.input.clone()).check(&value, &mut String::new())
     }
+
+    /// Whether the job takes or returns private numbers and no private value of
+    /// any other kind. All that can be done with a private number is to add it
+    /// to another and to multiply it by a number that is not private. So such a
+    /// job "only adds, counts, averages, or applies fixed weights" (spec section
+    /// 7), and run on shares of its input it gives shares of its output.
+    pub fn is_totals(&self) -> bool {
+        let values = || self.input.iter().chain([&self.output]);
+        values().any(|value| value.holds(&|part| *part == Schema::PrivateNumber))
+            && !values().any(|value| value.holds(&|part| matches!(part, Schema::Private(_))))
+    }
 }
 
 impl Schema {
+    /// Whether this schema, or any schema it is built from, passes `test`.
+    fn holds(&self, test: &dyn Fn(&Schema) -> bool) -> bool {
+        test(self)
+            || match self {
+                Self::List(inner) | Self::Option(inner) | Self::Private(inner) => inner.holds(test),
+                Self::Tuple(items) => items.iter().any(|item| item.holds(test)),
+                Self::Struct(fields) => fields.values().any(|field| field.holds(test)),
+                _ => false,
+            }
+    }
+
     /// Checks `value` against this schema. `path` is where `value` sits in the
     /// input; on a mismatch it is extended to name the part that is wrong.
     fn check(&self, value: &Value, path: &mut String) -> Result<(), Mismatch> {
         let fits = match (self, value) {
             (Self::Bool, Value::Bool(_)) => true,
             (Self::Integer, Value::Number(number)) => number.is_i64() || number.is_u64(),
+            (Self::PrivateNumber, Value::Number(number)) => number
+                .as_u64()
+                .is_some_and(|number| number < PRIVATE_NUMBER_MODULUS),
             (Self::Float, Value::Number(_)) => true,
             (Self::String, Value::String(_)) => true,
             (Self::Bytes, Value::String(text)) => is_base64(text),

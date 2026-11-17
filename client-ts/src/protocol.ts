@@ -176,6 +176,19 @@ export type Manifest = {
   max_fee: number;
   /** Left out, open. It must be what the job's module declares. */
   privacy?: Privacy;
+  /** Set when the job is one share of a private job. */
+  share?: Share;
+};
+
+/** Which share of which private job a job is (`Share`). */
+export type Share = {
+  /**
+   * The name the submitter's device gave the private job's shares: 32 random
+   * bytes, as hex. No account is handed two jobs that carry the same name.
+   */
+  set: string;
+  /** The share's place among the job's shares, counting from zero. */
+  index: number;
 };
 
 /** The mode a job runs in (`Privacy`). The nodes that run an open job can read its data. */

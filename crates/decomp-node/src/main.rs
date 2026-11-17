@@ -17,8 +17,8 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
     AccountId, AccountStatus, AppManifest, ContentHash, Credits, JobId, JobStatus, Manifest,
-    OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey, Receipt, ShardRef, Split, Sponsorship,
-    merkle, privacy,
+    OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey, Receipt, SHARES, ShardRef, Share,
+    ShareSet, Split, Sponsorship, merkle, privacy, shares,
 };
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::deliver::{self, Delivered};
@@ -26,7 +26,7 @@ use decomp_node::relay;
 
 use crate::agent::Reachable;
 use decomp_sandbox::{Blobs, Job, Sandbox};
-use decomp_schema::records;
+use decomp_schema::{Signature, records};
 
 const NO_KEY: &str = "this device has no key yet; run `decomp-node link` first";
 
@@ -446,6 +446,22 @@ fn submit(
     job: JobArgs,
     limits: Limits,
 ) -> Result<ExitCode, Box<dyn Error>> {
+    let files = read_job(&job)?;
+    let sandbox = Sandbox::new();
+    let declared = sandbox.declared(&files.module);
+    if let Some(signature) = declared.filter(|signature| signature.privacy == Privacy::Private) {
+        let follow_ups = limits.follow_up_credits > Credits::ZERO;
+        if limits.state.is_some() || limits.split_bytes.is_some() || follow_ups {
+            let message = "a private job cannot be handed state, split by byte count, or given credits for follow-up jobs";
+            return Err(message.into());
+        }
+        // "The SDK takes the first route that fits and reports which one it used."
+        let fits_device = job.compute_cap <= LOCAL_ROUTE_MAX_UNITS;
+        return match privacy::route(&signature, fits_device)? {
+            PrivateRoute::Local => run_here(&sandbox, dir, &job, &files),
+            PrivateRoute::PrivateTotals => submit_shares(client, &job, files, &signature, limits),
+        };
+    }
     let Limits {
         deadline_secs,
         redundancy,
@@ -454,19 +470,6 @@ fn submit(
         state,
         follow_up_credits,
     } = limits;
-    let files = read_job(&job)?;
-    let sandbox = Sandbox::new();
-    let declared = sandbox.declared(&files.module);
-    if declared.is_some_and(|signature| signature.privacy == Privacy::Private) {
-        if state.is_some() {
-            return Err("a private job cannot be handed state".into());
-        }
-        // "The SDK takes the first route that fits and reports which one it used."
-        let fits_device = job.compute_cap <= LOCAL_ROUTE_MAX_UNITS;
-        return match privacy::route(fits_device)? {
-            PrivateRoute::Local => run_here(&sandbox, dir, &job, &files),
-        };
-    }
     let JobFiles {
         module,
         input,
@@ -489,6 +492,7 @@ fn submit(
             .collect::<Result<_, _>>()?,
         state,
         privacy: Privacy::Open,
+        share: None,
     };
     // Set aside the most the job can cost, and what its follow-ups may; what is
     // not spent comes back.
@@ -540,6 +544,72 @@ fn submit(
         }
         Outcome::Failed { failure } => fail(&failure.to_string()),
     }
+}
+
+/// Runs a private job by the private totals route (spec section 7: "Private
+/// totals splits each input into shares held by nodes on different accounts").
+/// The input is cut into shares here, each share is submitted as a job of its
+/// own, and their outputs are added together here. Only this device sees the
+/// input or the result.
+fn submit_shares(
+    client: &Client,
+    job: &JobArgs,
+    files: JobFiles,
+    signature: &Signature,
+    limits: Limits,
+) -> Result<ExitCode, Box<dyn Error>> {
+    let inputs = shares::cut(signature, &files.input)?;
+    let module = client.put_blob(files.module)?;
+    let reads = (files.blobs.into_values())
+        .map(|blob| client.put_blob(blob))
+        .collect::<Result<Vec<_>, _>>()?;
+    let deadline = unix_now() + limits.deadline_secs;
+    let set = ShareSet::generate();
+    println!("module  {module}");
+    println!("route   private totals: cut into {SHARES} shares, each run by other accounts' nodes");
+
+    let mut jobs = Vec::new();
+    for (index, input) in (0..).zip(inputs) {
+        let mut manifest = Manifest {
+            module,
+            input: client.put_blob(input)?,
+            compute_cap: job.compute_cap,
+            deadline,
+            redundancy: limits.redundancy,
+            split: None,
+            max_fee: Credits::ZERO,
+            sponsor: limits.sponsor,
+            reads: reads.clone(),
+            state: None,
+            privacy: Privacy::Private,
+            share: Some(Share { set, index }),
+        };
+        manifest.max_fee = manifest.highest_fee();
+        jobs.push(client.submit_job(manifest)?);
+    }
+
+    let mut outputs = Vec::new();
+    let mut fee = Credits::ZERO;
+    for (index, job_id) in jobs.into_iter().enumerate() {
+        let receipt = match wait_for(client, job_id)? {
+            Ok(receipt) => receipt,
+            Err(reason) => return fail(reason),
+        };
+        println!(
+            "share   {} of {SHARES}: job {job_id}, {} units on each of {} nodes",
+            index + 1,
+            receipt.units,
+            receipt.results.len()
+        );
+        fee += receipt.fee.total;
+        match receipt.outcome {
+            Outcome::Completed { output, .. } => outputs.push(client.get_blob(output)?),
+            Outcome::Failed { failure } => return fail(&failure.to_string()),
+        }
+    }
+    println!("fee     {fee} credits");
+    report_output(&shares::join(signature, &outputs)?, job.output.as_deref())?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Pays for a file to be held by nodes and sends it to each of them.

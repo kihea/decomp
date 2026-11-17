@@ -132,6 +132,22 @@ impl SigningKey {
     }
 }
 
+hex_newtype!(
+    /// The name a device gives the shares it cuts one private job into (see
+    /// `shares`): 32 bytes drawn at random, so that no two jobs' shares carry
+    /// the same name by accident.
+    ShareSet,
+    32
+);
+
+impl ShareSet {
+    pub fn generate() -> Self {
+        let mut name = [0u8; 32];
+        getrandom::fill(&mut name).expect("the operating system provides randomness");
+        Self(name)
+    }
+}
+
 impl JobId {
     pub fn of(submitter: &PublicKey, payload: &str) -> Self {
         let mut hasher = Sha256::new();

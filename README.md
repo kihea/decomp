@@ -191,9 +191,22 @@ between them.
   description it gives of itself, and a job's manifest must say the same. The
   coordinator refuses a job whose manifest and module disagree.
 - A device runs a private job by "the first route that fits", and says which
-  it used. So far there is one route. **Local** is taken when "the job fits the
-  user's device": the module runs there, with no verification, and nothing of
-  the job reaches a node or the coordinator.
+  it used. There are two routes so far.
+- **Local** is taken when "the job fits the user's device": the module runs
+  there, with no verification, and nothing of the job reaches a node or the
+  coordinator.
+- **Private totals** is taken next, when "the job only adds, counts, averages,
+  or applies fixed weights". The device cuts each private number in the input
+  into two shares: random numbers that add up to it. It submits the two
+  resulting inputs as two jobs on the same module, and adds the two outputs
+  together. A share alone says nothing about the number it is a share of.
+- The two jobs carry one name, and jobs with one name are never handed to nodes
+  of the same account. A share waits until a node of another account is free.
+- Each share's job is assigned, run, checked, and paid for like any job, so the
+  route costs two jobs. Verification is unchanged: nodes that run a share must
+  agree, and a referee settles it if they do not.
+- Nodes do see every value that is not marked private, and how many private
+  numbers there are.
 - A private job that no route fits is not run. `submit` stops with the spec's
   `NoPrivateRoute` before anything is sent. The coordinator applies the same
   rule to what it is sent, so no node is handed a private job that came by no
@@ -207,6 +220,12 @@ between them.
 - Run with the command-line node: a message sealed by a job on two nodes, which
   agreed on the bytes, was opened by a private job on the device it was sealed
   to, and by no other device. The TypeScript client was not used to open one.
+- Private totals was run on four proven nodes of four accounts. With two nodes
+  to a share, no account was in both shares in seven runs, and the sums were
+  right. With three nodes online the second share waited for a fourth account
+  and expired. A fifth node that reported a wrong result for a share was found
+  out by the referee. That a share is never reissued as a known-answer job was
+  not seen in a run: such jobs come up one time in fifty.
 
 ## Layout
 
@@ -310,7 +329,9 @@ cargo run -p decomp-node -- run path/to/module.wasm --input path/to/input --comp
 
 A private job is sent with the same two commands, and each shows the route it
 took. `run` is the local route. `submit` takes the first route that fits: the
-local route for a job of one compute unit, which is then never sent anywhere.
+local route for a job of one compute unit, which is then never sent anywhere,
+and private totals for a larger job that only adds up private numbers. Any
+other private job is refused with `NoPrivateRoute`.
 
 Coordinator settings are `DECOMP_ADDR`, `DECOMP_DATA_DIR`, and
 `DECOMP_STORAGE_CHALLENGE_SECS` (how often each node is asked to show that it
@@ -530,6 +551,48 @@ device. The coordinator asks it again about every job it is sent, because a
 device could be wrong or could lie, and what the rule protects is on the
 coordinator's side: which jobs nodes are handed.
 
+**A share is an ordinary job with a name on it.** "Shares and encrypted values
+are ordinary bytes to a job, so duplicate runs and checkpoint disputes work in
+both modes." So the coordinator has no second kind of job for shares. A share's
+job is submitted, assigned, checked, refereed, and paid for by the rules every
+job goes by. The manifest's `share` field names the set of shares a job belongs
+to, and the job rules add two things for a job that has one: it is not handed
+to an account that was handed another job of the same set, and it is not kept
+to be reissued as a known-answer job, because the node asked could be of such an
+account. The name is the submitter's own: two accounts that use the same name
+do not affect each other. A share is also refused a shard of state, since a job
+could leave its share there and anyone can read a shard.
+
+**Shares are numbers that add up, wrapping at 2^53.** Nothing else is needed for
+adding and for weights that are not private, so no heavier scheme is used. All
+but one of a number's shares are drawn from the operating system's randomness
+and the last is what is missing from the sum. The sum wraps at 2^53 and not at
+2^64 because a share is as likely to be large as small, and a whole number
+below 2^53 comes through every JSON reader unchanged, including one that keeps
+numbers as 64-bit floating point, as a browser does. A private number is
+therefore a whole number from 0 to 2^53 - 1.
+
+**Two shares.** The spec prices this route at "about 2x" an open job. Each
+share's job costs what the job would cost open, so two shares is the count that
+matches (`SHARES` in `crates/decomp-core/src/shares.rs`). More shares would keep
+a number private from more accounts working together, at that many times the
+price. With two, the two accounts that hold a job's shares can read it if they
+work together.
+
+**A job's types say whether it can run on shares.** A module's description
+names each private number it takes and returns. A job whose private values are
+all private numbers is taken to do nothing but add them and weight them, which
+is what the types it is written with allow. The device cuts shares and adds
+results by that description, and the coordinator accepts a share only of such a
+job. Privacy does not rest on the module keeping to this: its nodes are handed
+only shares whatever it does. What rests on it is the answer, which is wrong if
+a module does anything else with a share.
+
+**A result by private totals is the same values, not the same bytes.** The
+device reads the shares' outputs as JSON, adds, and writes the result out
+again, and that writes a struct's fields in the order of their names. The
+local route gives the module's own bytes.
+
 **What fits a device is one unit, for now.** The spec takes the local route when
 "the job fits the user's device". How much a device can do is its hardware-fit
 score, which nothing measures yet. Until something does, `submit` takes a device
@@ -588,7 +651,13 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | Every past version of a shard is kept | Each is a blob on the coordinator, and nothing removes old ones. | With job blobs moving to node storage |
 | Records have no declared types and cannot be removed | The SDK reads and writes them as JSON of whatever type the module asks for, and the spec lists no call to delete one. | With the first app that needs either |
 | A job run on this device alone is handed no state | `run` has no way to name a shard. | When someone needs to try a stateful module off the network |
-| A private job of more than one unit has no route | The local route is the only one, and `submit` takes it for one-unit jobs only. Such a job stops with `NoPrivateRoute`, or is run with `run`. | The other routes, later in build step 9 |
+| A private job of more than one unit has no route unless it only adds up private numbers | Encrypted compute and the enclave route are not built. Such a job stops with `NoPrivateRoute`, or is run with `run`. | The other routes, later in build step 9 |
+| The coordinator can read every share | Job blobs are still held by the coordinator, so the inputs of both shares, and both outputs, pass through one party that could add them. The spec's promise is about nodes, and it holds for nodes; the spec also has jobs reach nodes "through relays under one-time IDs" and private values stored "with keys that no single party holds". | Those two, later in build step 9, and job blobs moving to node storage |
+| One owner with nodes on two accounts can be handed both shares | Shares go to different accounts, and accounts are free to make. The spec lists this as an open risk: "Secret sharing fails if one owner controls all the nodes holding a job's shares". | Stake and sign-in raise the cost; measuring how concentrated node ownership is |
+| A share that is not run leaves the other paid for | The shares are jobs of their own. If one expires, is disputed, or is refused when submitted, the other still runs and is charged, and the device has no result. | A job of several parts that is paid for only as a whole |
+| Which accounts hold a job's shares is forgotten with the shares' jobs | Jobs are kept an hour after they close and not across a restart. A share submitted later than that could go to an account that held another. The command-line node submits a job's shares together. | Settlement, build step 13 |
+| A private total is of one device's numbers | The spec's use of this route totals numbers from many users, each sending shares of its own. Here one device submits the whole input. | The feed app, build step 11 |
+| The number of shares is fixed at two | See "Two shares" above. | If the owner wants a job to choose |
 | `submit` takes a device to fit one-unit jobs only | Hardware fit is not measured, so one unit, which the spec says any device can run, stands in for what this device can do. The owner has not confirmed it. | The hardware-fit score, build step 12 |
 | A private job is not handed to another device of the account | The spec's local route also takes "another device on the same account". Only the device that was asked runs the job. | With a way to send a job to one's own devices |
 | The manifest has no `allow_enclave` | The spec lets a private job allow the enclave route. That route needs attested nodes, and a field nothing reads would be a promise nothing keeps. | The enclave route, with attested nodes (build step 12) |

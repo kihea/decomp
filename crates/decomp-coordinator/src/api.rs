@@ -414,6 +414,7 @@ impl From<SubmitError> for ApiError {
                 let code = match inner {
                     PrivacyError::Mismatch => "privacy_mismatch",
                     PrivacyError::NoRoute(_) => "no_private_route",
+                    PrivacyError::State => "bad_state",
                 };
                 Self::new(StatusCode::BAD_REQUEST, code, message)
             }

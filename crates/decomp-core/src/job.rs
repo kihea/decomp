@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::Envelope;
-use crate::keys::{AccountId, ContentHash, JobId};
+use crate::keys::{AccountId, ContentHash, JobId, ShareSet};
 use crate::ledger::{Credits, FeeSplit, fee};
 use crate::privacy::Privacy;
 use crate::state::ShardRef;
@@ -68,6 +68,24 @@ pub struct Manifest {
     /// open. It must be what the job's module declares (see `privacy`).
     #[serde(default, skip_serializing_if = "Privacy::is_open")]
     pub privacy: Privacy,
+    /// Set when the job is one share of a private job (see `shares`). Only a
+    /// private job may be a share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<Share>,
+}
+
+/// Which share of which private job a job is (see `shares`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Share {
+    /// The name the submitter's device gave the private job's shares. Jobs from
+    /// one account that carry the same name are never handed to nodes of the
+    /// same account, so no account holds two shares of anything.
+    pub set: ShareSet,
+    /// The share's place among the job's shares, counting from zero. It tells
+    /// apart two shares that are otherwise alike, as the shares of an input
+    /// with no private number in it are.
+    pub index: u32,
 }
 
 /// The rule for cutting a job into pieces (spec section 2, "Decomposition"). The
