@@ -131,9 +131,7 @@ fn answer(
             Json(BlobData { data: Blob(bytes) }).into_response()
         }
         Call::SubmitJob { manifest } => {
-            let payload = &envelope.payload;
-            let job_id =
-                coordinator.submit_job(&signer, account.id, payload, manifest, now, sandbox)?;
+            let job_id = coordinator.submit_job(&envelope, account.id, manifest, now, sandbox)?;
             Json(Submitted { job_id }).into_response()
         }
         Call::GetJob { job_id } => {

@@ -273,11 +273,14 @@ impl Coordinator {
     /// it. The fee comes from the submitter's account, or from the app the
     /// manifest names as sponsor if that app agrees to pay. A job with a split rule is cut into pieces here, each queued as a job
     /// of its own on its own part of the input.
+    ///
+    /// `request` is the signed request that submits the job. The job's ID is
+    /// made from it, signature and all, which is what makes it a one-time ID
+    /// (see `JobId`).
     pub fn submit_job(
         &mut self,
-        signer: &PublicKey,
+        request: &Envelope,
         account: AccountId,
-        payload: &str,
         manifest: Manifest,
         now: u64,
         sandbox: &Sandbox,
@@ -309,7 +312,7 @@ impl Coordinator {
             }
         }
         self.check_against_module(&manifest, sandbox)?;
-        let job_id = JobId::of(signer, payload);
+        let job_id = JobId::of(&request.signer, &request.payload, &request.signature);
 
         // The jobs that will actually run: this one, or its pieces.
         let mut runs = vec![(job_id, manifest.clone())];
@@ -330,10 +333,7 @@ impl Coordinator {
                     max_fee: manifest.highest_fee(),
                     ..manifest.clone()
                 };
-                runs.push((
-                    JobId::of(signer, &format!("{payload} piece {index}")),
-                    piece,
-                ));
+                runs.push((JobId::piece(&job_id, index as u64), piece));
             }
         }
 

@@ -99,6 +99,12 @@ hex_newtype!(
 hex_newtype!(
     /// A job: the hash of the signed request that submitted it, so the same request
     /// sent twice names the same job.
+    ///
+    /// It is a one-time ID (spec section 7: jobs reach nodes "under one-time IDs,
+    /// so a node cannot tell whose job it is running"). A job has its own, and
+    /// the hash takes in the request's signature, which only the submitter and
+    /// the coordinator have. So a node that is handed the ID, and knows what the
+    /// job is and which device it suspects, still cannot check the guess.
     JobId,
     32
 );
@@ -149,10 +155,23 @@ impl ShareSet {
 }
 
 impl JobId {
-    pub fn of(submitter: &PublicKey, payload: &str) -> Self {
+    /// The ID of the job submitted by the request with this signer, payload,
+    /// and signature.
+    pub fn of(submitter: &PublicKey, payload: &str, signature: &Signature) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(submitter.0);
         hasher.update(payload);
+        hasher.update(signature.0);
+        Self(hasher.finalize().into())
+    }
+
+    /// The ID of piece number `index`, counting from zero, of the split job
+    /// `whole`.
+    pub fn piece(whole: &JobId, index: u64) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(whole.0);
+        hasher.update(b"piece");
+        hasher.update(index.to_le_bytes());
         Self(hasher.finalize().into())
     }
 

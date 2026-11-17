@@ -243,6 +243,23 @@ between them.
 - A job can ask to `open` a sealed message. A private job run by the local
   route opens what was sealed to the device it runs on. A node holds no user's
   key, so on a node `open` answers that it cannot, whatever it is given.
+- **One-time job IDs.** "In both modes, jobs reach nodes through relays under
+  one-time IDs, so a node cannot tell whose job it is running." Every job has
+  an ID of its own, and a node that is handed one cannot trace it to whoever
+  submitted the job: the ID is a hash that takes in the signature on the
+  request, which only the submitter and the coordinator have. Before, a node
+  that knew a job and guessed its submitter's device could check the guess.
+  The ID of a known-answer job is now drawn at random, because a node could
+  work out the old one and tell that it was being tested.
+- What a node is handed with a job: its ID, its module, input, and other blobs,
+  its limits and fee cap, the app that pays for it if one does, the shard of
+  state it works on if any, and, for a share, the name its shares carry. None
+  of that is the submitter's account or device. A job comes to a node from the
+  coordinator and never from the submitter's device, so a node learns no
+  network address either.
+- The coordinator knows whose every job is, as the spec has it: "The
+  coordinator holds each account's record ... so it can bill jobs to the right
+  balance." Jobs do not pass through relay nodes; "Known gaps" says why.
 - Run with the command-line node: a message sealed by a job on two nodes, which
   agreed on the bytes, was opened by a private job on the device it was sealed
   to, and by no other device. The TypeScript client was not used to open one.
@@ -264,6 +281,14 @@ between them.
   `NoPrivateRoute` on the device, and the coordinator refused the same jobs
   sent to it directly, and a job on the encrypted route whose private values
   were sent as they are.
+- One-time IDs were checked with a job submitted by hand: the ID the
+  coordinator gave it was the hash of its signer, payload, and signature, and
+  was not the hash of its signer and payload, which is all a node could put
+  together. The same signed request sent again was refused. An open job, a
+  job cut into pieces, a job with follow-up jobs, a job on shares, and a job on
+  encrypted values then ran as before. Three known-answer jobs came up among
+  70 small jobs: each ran under an ID the old rule could not have given, and
+  its node was paid for it.
 - Arithmetic on encrypted numbers was not run on the network: see "Known
   gaps". It was run in the sandbox on one machine, on input encrypted and
   results read as `submit` does it: the higher of two private numbers, at 244
@@ -587,6 +612,22 @@ Each costs a job what checking a signature does, and one instruction more for
 each byte (`SEAL_INSTRUCTIONS` in `crates/decomp-sandbox/src/lib.rs`). That
 figure was not measured for sealing itself.
 
+**A job's ID is one-time because it takes in the request's signature.** A
+job's ID was the hash of the submitting device's key and the request it signed.
+A node is handed the ID and nearly everything in the request, so it could hash
+a device's key with a rebuilt request and see whether a device it suspected
+had submitted the job. The hash now also takes in the request's signature.
+That is fixed by the request, so the same request sent twice still names one
+job and is refused the second time, and nobody without the device's key can
+make it or guess it. The other way would have been random bytes in the
+request that are kept from nodes. That changes the request every client sends
+and gives no more. The pieces of a split job and a job's follow-ups get IDs
+made from the job's own.
+
+A node still learns which app pays for a job and which app's state it works
+on, where there is one. Those name an app, not a person, and a node holds the
+app's module anyway.
+
 **A module declares its own privacy.** The mode is part of the description a
 module gives of itself, next to its types, because it is a property of the code:
 a private job is one written with private types. The manifest repeats it, as the
@@ -807,6 +848,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | A lost copy is not replaced | When a node's copy is counted as lost, no other node is asked to take one. | With re-replication |
 | A node's address is taken on trust | The coordinator does not check that a node can be reached where it says. A node that lies is never sent the blob, so it is never paid, but the blob ends up with fewer copies. | A reachability check at check-in |
 | Job blobs are still held by the coordinator | Modules, inputs, and outputs do not yet go through node storage. | Later in build step 7 |
+| A job does not pass through a relay node on its way to a node | The spec has jobs "reach nodes through relays under one-time IDs, so a node cannot tell whose job it is running". The one-time IDs are built, and a node cannot tell. But a job reaches a node from the coordinator, which holds every job's blobs, and no device ever connects to a node that runs its job, so there is no connection between the two for a relay to stand in. Sending the same bytes through a relay as well would hide nothing more from a node, would charge the submitter the relay's fee, and would stop jobs on a network where no node can be reached from outside. | Job blobs moving to node storage, which is when a device first sends a job's data to nodes itself |
 | The same blob cannot be stored twice | A second request for a root already stored is refused, even from another account. | When two accounts need the same data |
 | Stored blobs are readable by anyone with the root | `store` keeps a file as it is. Sealing exists now, but who a stored file is sealed to is for the app that stores it to say. | Build step 8, when Send stores what waits for a device |
 | Logs can fall out of step on a crash | A storage or relay change and the credits that go with it are written to two files, one after the other. | Settlement, build step 13 |

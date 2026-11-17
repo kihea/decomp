@@ -190,7 +190,6 @@ pub struct Jobs {
     waiting: VecDeque<JobId>,
     nodes: HashMap<PublicKey, Node>,
     known: VecDeque<Known>,
-    known_answer_jobs_issued: u64,
     closed: Vec<ClosedJob>,
     events: Vec<ScoreEvent>,
     disputes: Vec<Dispute>,
@@ -685,11 +684,10 @@ impl Jobs {
             return;
         }
         let expected = usable[rng.random_range(0..usable.len())].clone();
-        // To the node this must look like any other job, so it gets a fresh ID and
-        // a deadline of its own.
-        self.known_answer_jobs_issued += 1;
-        let label = format!("known answer {} at {now}", self.known_answer_jobs_issued);
-        let job_id = JobId::of(&node, &label);
+        // To the node this must look like any other job, so it gets a deadline of
+        // its own and an ID drawn at random, which the node cannot work out as it
+        // could one made from a count of the jobs issued this way.
+        let job_id = JobId::from_bytes(rng.random());
         let mut manifest = expected.manifest.clone();
         manifest.deadline = now + KNOWN_ANSWER_DEADLINE_SECS;
         let shard = expected.shard;
