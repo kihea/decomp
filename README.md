@@ -183,6 +183,31 @@ between them.
   cover are not started. They keep the asking job's deadline, node count, and
   payer, and belong to the same submitter.
 
+**Keeping a job from some nodes** (build step 11).
+
+- A job's manifest can name keys, each an account's own or one of its devices'.
+  No node of an account one of those keys belongs to is handed the job. This
+  keeps a job from the nodes of someone with a stake in its result.
+- A manifest can also name earlier jobs. No node of an account that was handed
+  one of them is handed this job. A job that is run again and again, each time
+  apart from the time before, goes to different nodes every time.
+- Both rules hold for every node on the job, a spot checker included. The
+  first also holds when the job is later reissued to a node as a known-answer
+  job.
+- A job waits until enough accounts it is not kept from have idle nodes, and
+  expires if they never do.
+- A node is not told which keys or jobs a job names: they are left out of what
+  it is handed, since they would show whose result the job matters to.
+- Run on four proven nodes of four accounts, two nodes to a job. Five jobs kept
+  from the accounts of two nodes ran on the other two every time, and so did
+  three that named one of those accounts by its account key. Of five jobs each
+  kept apart from the one before, no two in a row shared a node. A job that
+  was kept from enough accounts to leave one waited and expired, and was
+  refunded. A key of no account and a job nobody knows barred nobody. A
+  program standing in for a node was handed such a job, and the manifest it
+  got named neither keys nor jobs. A known-answer job on a kept-from job was
+  not seen: such jobs come up one time in fifty.
+
 **Private jobs** (build step 9).
 
 - A job is open or private. The nodes that run an open job can read its data;
@@ -254,7 +279,7 @@ between them.
 - What a node is handed with a job: its ID, its module, input, and other blobs,
   its limits and fee cap, the app that pays for it if one does, the shard of
   state it works on if any, and, for a share, the name its shares carry. None
-  of that is the submitter's account or device. A job comes to a node from the
+  of that is the submitter's account or device, or a key the job is kept from. A job comes to a node from the
   coordinator and never from the submitter's device, so a node learns no
   network address either.
 - The coordinator knows whose every job is, as the spec has it: "The
@@ -298,7 +323,7 @@ between them.
 
 | Path | What it is |
 | --- | --- |
-| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage and relay rules, sealing, app state, private jobs and their routes, cutting a private job's numbers into shares, encrypting its values for nodes that compute on them, and every message shape. No I/O. |
+| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment, which nodes a job is kept from, and verification), the storage and relay rules, sealing, app state, private jobs and their routes, cutting a private job's numbers into shares, encrypting its values for nodes that compute on them, and every message shape. No I/O. |
 | `crates/decomp-schema` | How a job's input and output types and its privacy mode are described and checked, and the byte form of a set of records. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
 | `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, and what it stores (logs, blobs). |
@@ -387,6 +412,10 @@ if its module is one of that app's. The records a shard holds:
 ```bash
 cargo run -p decomp-node -- state <app ID>/<shard>
 ```
+
+A job is kept from the nodes of an account with `--keep-from <key>`, once for
+each account, by the account's key or a device's code, and from the nodes that
+ran an earlier job with `--apart-from <job ID>`.
 
 The same job on this device alone, without the network:
 
@@ -523,6 +552,25 @@ of its result, so it counts only once the result stands. Nothing a job that was
 wrong, or failed, asked for is ever run. The follow-ups are funded from what the
 job left of its own fee cap, so one cap, set by the submitter, bounds what a job
 and everything it sets off can cost.
+
+**A job is kept from accounts, and they are named by key.** The spec asks for
+this of one app: "A player's own nodes are never assigned the zone that player
+is in", and "the nodes simulating a zone change every tick". Both are rules
+about which nodes may run a job, so they are built as two fields any job's
+manifest can carry, `keep_from` and `apart_from`, and applied where every node
+is drawn, in `jobs.rs`.
+
+An app knows a user by an account ID or, if the user chose, by one device's
+key, and from a device's key nobody but the coordinator can tell the account.
+So `keep_from` takes keys, and the coordinator finds the accounts: "The
+coordinator holds each account's record, including which devices belong to
+it." It bars the whole account, because a second node of the same owner has
+the same stake.
+
+`apart_from` names jobs, not nodes, because a submitter is not told which
+accounts ran its job. Independence is counted in accounts, as it is for the
+nodes of one job: "Nodes assigned to the same piece must belong to different
+accounts."
 
 **Data services are node work.** Storing, serving, and relaying data are done by
 nodes and paid for in credits. DeComp does not lean on an outside peer-to-peer
@@ -827,6 +875,9 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | A referee's verdict rests on one checkpoint | As the spec says, the node whose checkpoint matches the referee's is taken to be right. If two nodes are wrong in different ways, the one that went wrong later is believed. | A full re-run on every dispute, if that proves needed |
 | Splitting cuts by byte count only, and only when asked | The spec's split rules follow the job's data types, and the coordinator also splits large jobs on its own to steer the mix of tiers. | Typed split rules, with the first job that needs them; steering when there is real traffic |
 | No holdback | The spec holds a tenth of a spot-checked node's earnings for a day so a late check can be enforced. Checks here happen at the time of the job, so there is nothing to hold for. | If checks ever run after payment |
+| A job kept from too many accounts is accepted and then expires | The coordinator cannot tell, when a job is submitted, that enough other accounts will have idle nodes before its deadline. | If it proves a nuisance |
+| Which accounts ran an earlier job is forgotten with the job | Jobs are kept an hour after they close and not across a restart, so a job named in `apart_from` bars nobody after that. | Settlement, build step 13 |
+| A submitter can find out which nodes are of one account | It keeps jobs from a key and sees, in their receipts, which nodes never run them. The spec has the device list of an account not publicly readable. | Receipts that name nodes by one-time keys, or the owner's decision that this is acceptable |
 | Two of the four node scores | Bandwidth and hardware fit are not measured, and a node offers one slot. | Data-heavy jobs (step 7) and inference (step 12) |
 | No penalty for proven fraud | Removal from the network and loss of the whole stake apply to offenses such as running a swapped model, which need inference to exist. | Build step 12 |
 | Stake can be taken back between a wrong result and its verdict | Taking stake back is refused only while a node is on a job; refereeing takes seconds more. | A waiting period on taking stake back |

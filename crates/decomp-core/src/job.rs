@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::Envelope;
-use crate::keys::{AccountId, ContentHash, JobId, ShareSet};
+use crate::keys::{AccountId, ContentHash, JobId, PublicKey, ShareSet};
 use crate::ledger::{Credits, FeeSplit, fee};
 use crate::privacy::{Privacy, PrivateRoute};
 use crate::state::ShardRef;
@@ -23,6 +23,12 @@ pub const MAX_SPAWNED: usize = 64;
 
 /// The highest size tier. Jobs of 16 units or more all fall in it.
 pub const MAX_TIER: u32 = 4;
+
+/// The most keys a job may name whose accounts' nodes it is kept from.
+pub const MAX_KEPT_FROM: usize = 64;
+
+/// The most earlier jobs a job may name whose nodes' accounts it is kept from.
+pub const MAX_APART_FROM: usize = 8;
 
 /// What to run and within what limits (spec section 2, "Manifest fields"). Fields
 /// the spec lists but that nothing reads yet are added with the features that
@@ -72,6 +78,19 @@ pub struct Manifest {
     /// private job may be a share.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<Share>,
+    /// Keys whose accounts' nodes are never handed the job. A key is an
+    /// account's own or one of its devices'; a key that belongs to no account
+    /// bars nobody. This is how a job is kept from the nodes of someone with a
+    /// stake in its result. A node is not told which keys a job names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keep_from: Vec<PublicKey>,
+    /// Earlier jobs whose nodes this job is kept apart from: no node of an
+    /// account that was handed one of them is handed this one. This is how a
+    /// job that is run again and again goes to different nodes each time. A job
+    /// that has been forgotten, or was never known, bars nobody. A node is not
+    /// told which jobs a job names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apart_from: Vec<JobId>,
 }
 
 /// Which share of which private job a job is (see `shares`).
@@ -124,6 +143,16 @@ impl Manifest {
     /// so on.
     pub fn tier(&self) -> u32 {
         self.compute_cap.max(1).ilog2().min(MAX_TIER)
+    }
+
+    /// The manifest as a node is handed it: without the keys and jobs it is
+    /// kept from, which would tell the node whose result the job matters to.
+    pub fn as_handed(&self) -> Self {
+        Self {
+            keep_from: Vec::new(),
+            apart_from: Vec::new(),
+            ..self.clone()
+        }
     }
 }
 

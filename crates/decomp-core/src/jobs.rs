@@ -127,6 +127,8 @@ enum Kind {
 #[derive(Clone)]
 struct Known {
     manifest: Manifest,
+    /// The accounts the job was kept from, which it is kept from again.
+    kept_from: HashSet<AccountId>,
     seed: JobId,
     /// The contents of the shard the job was handed, if any.
     shard: Option<ContentHash>,
@@ -138,6 +140,9 @@ struct Known {
 struct Job {
     kind: Kind,
     manifest: Manifest,
+    /// The accounts whose nodes are never handed the job: those that the keys
+    /// in its manifest's `keep_from` belong to.
+    kept_from: HashSet<AccountId>,
     /// When the job was accepted, in seconds since 1970.
     submitted_at: u64,
     /// The contents its shard had when the job was handed out, which is what
@@ -215,16 +220,21 @@ impl Jobs {
 
     /// Accepts a job. The caller sets aside its highest possible fee first, so a
     /// job never runs without the credits to pay for it.
+    ///
+    /// `kept_from` holds the accounts that the keys in the manifest's
+    /// `keep_from` belong to. Only the caller knows which account a key is of.
     pub fn submit(
         &mut self,
         id: JobId,
         submitter: AccountId,
         manifest: Manifest,
+        kept_from: HashSet<AccountId>,
         now: u64,
     ) -> Result<(), JobError> {
         self.check(&id, &manifest, now)?;
-        self.jobs
-            .insert(id, Job::new(Kind::Submitted { submitter }, manifest, now));
+        let mut job = Job::new(Kind::Submitted { submitter }, manifest, now);
+        job.kept_from = kept_from;
+        self.jobs.insert(id, job);
         self.waiting.push_back(id);
         Ok(())
     }
@@ -266,7 +276,7 @@ impl Jobs {
         };
         Some(Assignment {
             job_id,
-            manifest: job.manifest.clone(),
+            manifest: job.manifest.as_handed(),
             seed,
             shard: job.shard,
         })
@@ -501,6 +511,7 @@ impl Jobs {
         if right.len() >= 2 && job.manifest.share.is_none() {
             self.known.push_back(Known {
                 manifest: job.manifest.clone(),
+                kept_from: job.kept_from.clone(),
                 seed: job_id,
                 shard: job.shard,
                 units: result.units,
@@ -561,6 +572,11 @@ impl Jobs {
     /// waits until enough other accounts have idle nodes. Which accounts hold a
     /// job's shares is known for as long as the shares' jobs are remembered,
     /// which is why a device submits all of a job's shares together.
+    ///
+    /// A job is never handed to a node of an account it is kept from: one that
+    /// a key in its `keep_from` belongs to, or one that was handed a job named
+    /// in its `apart_from`. It waits until enough other accounts have idle
+    /// nodes.
     fn assign(
         &mut self,
         now: u64,
@@ -603,10 +619,19 @@ impl Jobs {
         }
 
         waiting.retain(|id| {
+            // The accounts that were handed a job this one is kept apart from.
+            let apart_from = &jobs[id].manifest.apart_from;
+            let earlier = apart_from.iter().filter_map(|other| jobs.get(other));
+            let apart: Vec<AccountId> = earlier
+                .flat_map(|other| other.workers.iter().map(|worker| worker.account))
+                .collect();
+
             let job = jobs.get_mut(id).expect("waiting jobs exist");
             let shares = job.shares();
             let barred = shares.and_then(|shares| holders.get(&shares));
-            let barred = barred.cloned().unwrap_or_default();
+            let mut barred = barred.cloned().unwrap_or_default();
+            barred.extend(job.kept_from.iter().copied());
+            barred.extend(apart);
             if job
                 .manifest
                 .state
@@ -675,10 +700,13 @@ impl Jobs {
         rng: &mut impl Rng,
         standing: &Standing,
     ) {
+        // A job is kept from the same accounts when it is reissued as when it
+        // was first handed out.
         let usable: Vec<&Known> = self
             .known
             .iter()
             .filter(|known| may_take(standing, &known.manifest))
+            .filter(|known| !known.kept_from.contains(&account))
             .collect();
         if usable.is_empty() {
             return;
@@ -772,6 +800,7 @@ impl Job {
         Self {
             kind,
             manifest,
+            kept_from: HashSet::new(),
             submitted_at: now,
             shard: None,
             workers: Vec::new(),

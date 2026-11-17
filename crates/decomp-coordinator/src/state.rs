@@ -16,7 +16,7 @@
 //! The log files are the "local signed log" that stands in for the ledger during
 //! development (spec section 6).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -24,12 +24,12 @@ use std::path::Path;
 use decomp_core::{
     Account, AccountId, AccountStatus, Accounts, Assignment, Challenge, CheckedIn, Closure,
     Conduct, ContentHash, Credits, Envelope, EnvelopeError, FollowUps, Hosts, IncomingChannels,
-    JobError, JobId, JobStatus, Jobs, Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES,
-    MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, Merge, OpError, Opening, Outcome,
-    PROBATION_FORFEIT_PERCENT, Penalty, Placement, PrivacyError, PublicKey, RelayEntry, RelayError,
-    Relays, Route, ScoreEvent, Scores, SealingKeys, ShardRef, Splits, SponsorError, Sponsored,
-    Standing, StateEntry, States, Storage, StorageEntry, StorageError, Storing, channel_id, fee,
-    privacy,
+    JobError, JobId, JobStatus, Jobs, Ledger, LedgerEntry, LedgerError, Located, MAX_APART_FROM,
+    MAX_KEPT_FROM, MAX_PIECES, MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, Merge, OpError, Opening,
+    Outcome, PROBATION_FORFEIT_PERCENT, Penalty, Placement, PrivacyError, PublicKey, RelayEntry,
+    RelayError, Relays, Route, ScoreEvent, Scores, SealingKeys, ShardRef, Splits, SponsorError,
+    Sponsored, Standing, StateEntry, States, Storage, StorageEntry, StorageError, Storing,
+    channel_id, fee, privacy,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
@@ -79,6 +79,10 @@ pub enum SubmitError {
     TooManyPieces,
     #[error("a job may be given at most {MAX_READS} blobs to read")]
     TooManyReads,
+    #[error(
+        "a job may be kept from the accounts of at most {MAX_KEPT_FROM} keys and from the nodes of at most {MAX_APART_FROM} earlier jobs"
+    )]
+    KeptFromTooMany,
     #[error("{0}")]
     TypeMismatch(Mismatch),
     #[error("a job with typed input cannot be split by byte count")]
@@ -288,6 +292,9 @@ impl Coordinator {
         if manifest.reads.len() > MAX_READS {
             return Err(SubmitError::TooManyReads);
         }
+        if manifest.keep_from.len() > MAX_KEPT_FROM || manifest.apart_from.len() > MAX_APART_FROM {
+            return Err(SubmitError::KeptFromTooMany);
+        }
         for hash in [manifest.module, manifest.input]
             .iter()
             .chain(&manifest.reads)
@@ -366,7 +373,9 @@ impl Coordinator {
                 account: payer,
                 amount: run.max_fee,
             })?;
-            self.jobs.submit(*id, account, run.clone(), now)?;
+            let kept_from = self.kept_from(run);
+            self.jobs
+                .submit(*id, account, run.clone(), kept_from, now)?;
         }
         if let Some(app) = manifest.sponsor {
             self.sponsored.count(app, account, to_set_aside, now);
@@ -376,6 +385,15 @@ impl Coordinator {
             self.splits.add(job_id, account, manifest, pieces);
         }
         Ok(job_id)
+    }
+
+    /// The accounts a job is kept from: those that the keys its manifest names
+    /// belong to. A key that belongs to no account bars nobody.
+    fn kept_from(&self, manifest: &Manifest) -> HashSet<AccountId> {
+        let keys = manifest.keep_from.iter();
+        keys.filter_map(|key| self.accounts.account_of(key))
+            .map(|account| account.id)
+            .collect()
     }
 
     /// Refuses a job that is not what its module says of itself: one in another
@@ -716,8 +734,9 @@ impl Coordinator {
                 break;
             }
             spare = spare - amount;
+            let kept_from = self.kept_from(&manifest);
             self.jobs
-                .submit(id, submitter, manifest, now)
+                .submit(id, submitter, manifest, kept_from, now)
                 .expect("the job was checked just above");
         }
     }

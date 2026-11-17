@@ -163,6 +163,14 @@ enum Command {
         /// follow-up jobs it may ask for. What is not spent comes back.
         #[arg(long, default_value = "0")]
         follow_up_credits: Credits,
+        /// A key, an account's or a device's, whose account's nodes must not be
+        /// handed the job. Repeat for each one.
+        #[arg(long = "keep-from")]
+        keep_from: Vec<PublicKey>,
+        /// An earlier job whose nodes must not be handed this one: no node of
+        /// an account that was handed it is. Repeat for each one.
+        #[arg(long = "apart-from")]
+        apart_from: Vec<JobId>,
     },
     /// Show the records in a shard of an app's state.
     State {
@@ -247,6 +255,8 @@ fn main() -> ExitCode {
             sponsor,
             state,
             follow_up_credits,
+            keep_from,
+            apart_from,
         } => connect().and_then(|client| {
             let limits = Limits {
                 deadline_secs,
@@ -255,6 +265,8 @@ fn main() -> ExitCode {
                 sponsor,
                 state,
                 follow_up_credits,
+                keep_from,
+                apart_from,
             };
             submit(&client, &cli.dir, job, limits)
         }),
@@ -390,7 +402,8 @@ fn how_checked(verified: Verification) -> &'static str {
     }
 }
 
-/// The limits `submit` puts on a job, and who pays for it.
+/// The limits `submit` puts on a job, who pays for it, and whose nodes it is
+/// kept from.
 struct Limits {
     deadline_secs: u64,
     redundancy: Option<u32>,
@@ -398,6 +411,8 @@ struct Limits {
     sponsor: Option<AccountId>,
     state: Option<ShardRef>,
     follow_up_credits: Credits,
+    keep_from: Vec<PublicKey>,
+    apart_from: Vec<JobId>,
 }
 
 /// Waits until a job closes. Gives its receipt, or says why it has none.
@@ -506,6 +521,8 @@ fn submit(
         sponsor,
         state,
         follow_up_credits,
+        keep_from,
+        apart_from,
     } = limits;
     let JobFiles {
         module,
@@ -530,6 +547,8 @@ fn submit(
         state,
         privacy: Privacy::Open,
         share: None,
+        keep_from,
+        apart_from,
     };
     // Set aside the most the job can cost, and what its follow-ups may; what is
     // not spent comes back.
@@ -626,6 +645,8 @@ fn submit_shares(
             state: None,
             privacy: Privacy::Private,
             share: Some(Share { set, index }),
+            keep_from: limits.keep_from.clone(),
+            apart_from: limits.apart_from.clone(),
         };
         manifest.max_fee = manifest.highest_fee();
         jobs.push(client.submit_job(manifest)?);
@@ -704,6 +725,8 @@ fn submit_encrypted(
         state: None,
         privacy: Privacy::Private,
         share: None,
+        keep_from: limits.keep_from,
+        apart_from: limits.apart_from,
     };
     manifest.max_fee = manifest.highest_fee();
     println!("module  {}", manifest.module);

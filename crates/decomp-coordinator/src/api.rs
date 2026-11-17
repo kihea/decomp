@@ -402,6 +402,9 @@ impl From<SubmitError> for ApiError {
             SubmitError::TooManyReads => {
                 Self::new(StatusCode::BAD_REQUEST, "too_many_reads", message)
             }
+            SubmitError::KeptFromTooMany => {
+                Self::new(StatusCode::BAD_REQUEST, "kept_from_too_many", message)
+            }
             SubmitError::StateNotAllowed => {
                 Self::new(StatusCode::FORBIDDEN, "state_not_allowed", message)
             }

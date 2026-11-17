@@ -178,6 +178,16 @@ export type Manifest = {
   privacy?: Privacy;
   /** Set when the job is one share of a private job. */
   share?: Share;
+  /**
+   * Keys, an account's or a device's, as hex. No node of an account one of
+   * them belongs to is handed the job.
+   */
+  keep_from?: string[];
+  /**
+   * IDs of earlier jobs. No node of an account that was handed one of them is
+   * handed this job.
+   */
+  apart_from?: string[];
 };
 
 /** Which share of which private job a job is (`Share`). */
