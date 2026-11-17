@@ -183,12 +183,28 @@ between them.
   cover are not started. They keep the asking job's deadline, node count, and
   payer, and belong to the same submitter.
 
+**Private jobs** (the first half of build step 9).
+
+- A job is open or private. The nodes that run an open job can read its data;
+  of a private job the spec promises that "no node ever sees the data
+  unencrypted". A module says which mode its job was written for in the
+  description it gives of itself, and a job's manifest must say the same. The
+  coordinator refuses a job whose manifest and module disagree.
+- A device runs a private job by "the first route that fits", and says which
+  it used. So far there is one route. **Local** is taken when "the job fits the
+  user's device": the module runs there, with no verification, and nothing of
+  the job reaches a node or the coordinator.
+- A private job that no route fits is not run. `submit` stops with the spec's
+  `NoPrivateRoute` before anything is sent. The coordinator applies the same
+  rule to what it is sent, so no node is handed a private job that came by no
+  route.
+
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage and relay rules, sealing, app state, and every message shape. No I/O. |
-| `crates/decomp-schema` | How a job's input and output types are described and checked, and the byte form of a set of records. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
+| `crates/decomp-core` | Protocol rules: keys, signed envelopes, account state, credits, node scores, the job rules (assignment and verification), the storage and relay rules, sealing, app state, private jobs and their routes, and every message shape. No I/O. |
+| `crates/decomp-schema` | How a job's input and output types and its privacy mode are described and checked, and the byte form of a set of records. Kept apart from `decomp-core` so that code compiled into a job module can use it. |
 | `crates/decomp-sandbox` | Runs job modules: deterministic, metered WebAssembly. Its crate docs define the module interface. |
 | `crates/decomp-coordinator` | The coordinator service: the HTTP API, the dispute referee, and what it stores (logs, blobs). |
 | `crates/decomp-node` | The node agent, as a library and as the `decomp-node` command: joins an account, works as a node, holds and relays data, submits jobs, stores files, and sends files to other devices. |
@@ -282,6 +298,10 @@ The same job on this device alone, without the network:
 ```bash
 cargo run -p decomp-node -- run path/to/module.wasm --input path/to/input --compute-cap 4
 ```
+
+A private job is sent with the same two commands, and each shows the route it
+took. `run` is the local route. `submit` takes the first route that fits: the
+local route for a job of one compute unit, which is then never sent anywhere.
 
 Coordinator settings are `DECOMP_ADDR`, `DECOMP_DATA_DIR`, and
 `DECOMP_STORAGE_CHALLENGE_SECS` (how often each node is asked to show that it
@@ -452,6 +472,28 @@ compute price implies. They are `CREDITS_PER_GIB_DAY` in
 `crates/decomp-core/src/storage.rs` and `CREDITS_PER_GIB_RELAYED` in
 `crates/decomp-core/src/relay.rs`, and the owner has not yet confirmed them.
 
+**A module declares its own privacy.** The mode is part of the description a
+module gives of itself, next to its types, because it is a property of the code:
+a private job is one written with private types. The manifest repeats it, as the
+spec's manifest does, and the coordinator checks one against the other. So a
+module written to be private cannot be run as an open job by mistake, nor the
+other way round. A module that does not describe itself is open.
+
+**The route rule is in one place and applied twice.** Which route a private job
+takes is decided by `privacy` in `decomp-core`. The device that wants the job
+run asks it first, so a job with no route is stopped before anything leaves the
+device. The coordinator asks it again about every job it is sent, because a
+device could be wrong or could lie, and what the rule protects is on the
+coordinator's side: which jobs nodes are handed.
+
+**What fits a device is one unit, for now.** The spec takes the local route when
+"the job fits the user's device". How much a device can do is its hardware-fit
+score, which nothing measures yet. Until something does, `submit` takes a device
+to fit what the spec's tier table says any node can run: tier 0, a job of one
+compute unit (`LOCAL_ROUTE_MAX_UNITS` in `crates/decomp-node/src/main.rs`).
+`run` sets no limit, because there the user has said to use this device. The
+owner has not yet confirmed this value.
+
 ## Known gaps
 
 These are deliberate omissions at this step, listed so they are not forgotten.
@@ -502,3 +544,7 @@ These are deliberate omissions at this step, listed so they are not forgotten.
 | Every past version of a shard is kept | Each is a blob on the coordinator, and nothing removes old ones. | With job blobs moving to node storage |
 | Records have no declared types and cannot be removed | The SDK reads and writes them as JSON of whatever type the module asks for, and the spec lists no call to delete one. | With the first app that needs either |
 | A job run on this device alone is handed no state | `run` has no way to name a shard. | When someone needs to try a stateful module off the network |
+| A private job of more than one unit has no route | The local route is the only one, and `submit` takes it for one-unit jobs only. Such a job stops with `NoPrivateRoute`, or is run with `run`. | The other routes, later in build step 9 |
+| `submit` takes a device to fit one-unit jobs only | Hardware fit is not measured, so one unit, which the spec says any device can run, stands in for what this device can do. The owner has not confirmed it. | The hardware-fit score, build step 12 |
+| A private job is not handed to another device of the account | The spec's local route also takes "another device on the same account". Only the device that was asked runs the job. | With a way to send a job to one's own devices |
+| The manifest has no `allow_enclave` | The spec lets a private job allow the enclave route. That route needs attested nodes, and a field nothing reads would be a promise nothing keeps. | The enclave route, with attested nodes (build step 12) |

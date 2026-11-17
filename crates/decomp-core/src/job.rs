@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::Envelope;
 use crate::keys::{AccountId, ContentHash, JobId};
 use crate::ledger::{Credits, FeeSplit, fee};
+use crate::privacy::Privacy;
 use crate::state::ShardRef;
 
 /// How many nodes run a job when the first node drawn for it is still on
@@ -63,6 +64,10 @@ pub struct Manifest {
     /// its state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<ShardRef>,
+    /// The mode the job runs in: "open or private" (spec section 2). Left out,
+    /// open. It must be what the job's module declares (see `privacy`).
+    #[serde(default, skip_serializing_if = "Privacy::is_open")]
+    pub privacy: Privacy,
 }
 
 /// The rule for cutting a job into pieces (spec section 2, "Decomposition"). The

@@ -12,6 +12,7 @@ mod jobs;
 mod keys;
 mod ledger;
 pub mod merkle;
+pub mod privacy;
 mod relay;
 mod request;
 mod scores;
@@ -38,6 +39,7 @@ pub use ledger::{
     BASE_PRICE, Balance, Credits, FeeSplit, Ledger, LedgerEntry, LedgerError,
     PROBATION_FORFEIT_PERCENT, STARTER_GRANT, fee,
 };
+pub use privacy::{NoPrivateRoute, Privacy, PrivacyError, PrivateRoute};
 pub use relay::{
     CHANNEL_SECS, CREDITS_PER_GIB_RELAYED, Checked, FRAME_BYTES, Frame, FrameError, FrameHeader,
     Incoming, LISTEN_WINDOW_SECS, MAX_CHANNEL_BYTES, Opening, REDEEM_GRACE_SECS, RelayEntry,

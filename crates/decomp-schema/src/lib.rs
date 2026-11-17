@@ -8,6 +8,9 @@
 //! description means.
 //!
 //! Typed inputs and outputs travel as JSON, so a schema describes JSON values.
+//!
+//! A description also says which of the two privacy modes the job was written
+//! for, and which of its values are private (spec section 7, "Privacy modes").
 
 pub mod records;
 
@@ -37,6 +40,26 @@ pub enum Schema {
     Struct(BTreeMap<String, Schema>),
     /// One of a fixed set of names, carried as a string.
     Enum(Vec<String>),
+    /// A value marked private: no node may see it as it is. It is carried as the
+    /// value inside is.
+    Private(Box<Schema>),
+}
+
+/// The mode a job runs in (spec section 2, the manifest's `privacy` field: "open
+/// or private"). An open job's data can be read by the nodes that run it. Of a
+/// private job the spec promises that "no node ever sees the data unencrypted".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Privacy {
+    #[default]
+    Open,
+    Private,
+}
+
+impl Privacy {
+    pub fn is_open(&self) -> bool {
+        *self == Self::Open
+    }
 }
 
 /// The inputs a job takes, in order, and the output it produces. A job's input is
@@ -45,6 +68,9 @@ pub enum Schema {
 pub struct Signature {
     pub input: Vec<Schema>,
     pub output: Schema,
+    /// The mode the job was written for. A module that says nothing is open.
+    #[serde(default, skip_serializing_if = "Privacy::is_open")]
+    pub privacy: Privacy,
 }
 
 /// An input that does not fit a job's signature.
@@ -91,7 +117,9 @@ impl Schema {
             (Self::Bytes, Value::String(text)) => is_base64(text),
             (Self::Enum(names), Value::String(name)) => names.contains(name),
             (Self::Option(_), Value::Null) => true,
-            (Self::Option(inner), value) => return inner.check(value, path),
+            (Self::Option(inner) | Self::Private(inner), value) => {
+                return inner.check(value, path);
+            }
             (Self::List(item), Value::Array(values)) => {
                 return each(values.iter().map(|value| (item.as_ref(), value)), path);
             }

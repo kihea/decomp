@@ -354,6 +354,13 @@ impl Sandbox {
         }
     }
 
+    /// What a module says of its job: its types and its privacy mode. `None` if
+    /// the module does not describe itself, or cannot be run at all.
+    pub fn declared(&self, module: &[u8]) -> Option<decomp_schema::Signature> {
+        let described = self.signature(module).ok().flatten()?;
+        serde_json::from_slice(&described).ok()
+    }
+
     /// Whether `module` is a valid job module, leaving aside any signature.
     fn run_is_possible(&self, module: &[u8]) -> bool {
         add_metering(module)

@@ -26,9 +26,10 @@ use decomp_core::{
     Conduct, ContentHash, Credits, Envelope, EnvelopeError, FollowUps, Hosts, IncomingChannels,
     JobError, JobId, JobStatus, Jobs, Ledger, LedgerEntry, LedgerError, Located, MAX_PIECES,
     MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, Merge, OpError, Opening, Outcome,
-    PROBATION_FORFEIT_PERCENT, Penalty, Placement, PublicKey, RelayEntry, RelayError, Relays,
-    Route, ScoreEvent, Scores, SealingKeys, ShardRef, Splits, SponsorError, Sponsored, Standing,
-    StateEntry, States, Storage, StorageEntry, StorageError, Storing, channel_id, fee,
+    PROBATION_FORFEIT_PERCENT, Penalty, Placement, PrivacyError, PublicKey, RelayEntry, RelayError,
+    Relays, Route, ScoreEvent, Scores, SealingKeys, ShardRef, Splits, SponsorError, Sponsored,
+    Standing, StateEntry, States, Storage, StorageEntry, StorageError, Storing, channel_id, fee,
+    privacy,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
@@ -90,6 +91,8 @@ pub enum SubmitError {
     BadShardName,
     #[error("a job that is handed state cannot be split")]
     SplitWithState,
+    #[error(transparent)]
+    Privacy(#[from] PrivacyError),
 }
 
 pub struct Coordinator {
@@ -305,7 +308,7 @@ impl Coordinator {
                 return Err(SubmitError::SplitWithState);
             }
         }
-        self.check_types(&manifest, sandbox)?;
+        self.check_against_module(&manifest, sandbox)?;
         let job_id = JobId::of(signer, payload);
 
         // The jobs that will actually run: this one, or its pieces.
@@ -375,17 +378,24 @@ impl Coordinator {
         Ok(job_id)
     }
 
-    /// Refuses an input that does not fit the types the module says its job takes
-    /// (spec section 7, "Typing"). A module that does not describe itself takes
-    /// any input.
-    fn check_types(&mut self, manifest: &Manifest, sandbox: &Sandbox) -> Result<(), SubmitError> {
+    /// Refuses a job that is not what its module says of itself: one in another
+    /// privacy mode than the module declares, or a private one that no route
+    /// lets nodes run (see `privacy`), or one whose input does not fit the types
+    /// the module says its job takes (spec section 7, "Typing"). A module that
+    /// does not describe itself is open and takes any input.
+    fn check_against_module(
+        &mut self,
+        manifest: &Manifest,
+        sandbox: &Sandbox,
+    ) -> Result<(), SubmitError> {
         if !self.signatures.contains_key(&manifest.module) {
             let module = self.blobs.get(&manifest.module)?.unwrap_or_default();
-            let described = sandbox.signature(&module).ok().flatten();
-            let signature = described.and_then(|bytes| serde_json::from_slice(&bytes).ok());
-            self.signatures.insert(manifest.module, signature);
+            self.signatures
+                .insert(manifest.module, sandbox.declared(&module));
         }
-        let Some(signature) = &self.signatures[&manifest.module] else {
+        let signature = self.signatures[&manifest.module].as_ref();
+        privacy::check(manifest, signature)?;
+        let Some(signature) = signature else {
             return Ok(());
         };
         // Cutting typed input at byte boundaries would hand each piece broken data.

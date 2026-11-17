@@ -17,7 +17,8 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
     AccountId, AccountStatus, AppManifest, ContentHash, Credits, JobId, JobStatus, Manifest,
-    OpeningKey, Outcome, PublicKey, Receipt, ShardRef, Split, Sponsorship, merkle,
+    OpeningKey, Outcome, Privacy, PrivateRoute, PublicKey, Receipt, ShardRef, Split, Sponsorship,
+    merkle, privacy,
 };
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::deliver::{self, Delivered};
@@ -35,6 +36,13 @@ const COLLECTED_FILE: &str = "collected";
 
 /// How often `submit` asks whether its job has finished.
 const JOB_POLL: Duration = Duration::from_secs(1);
+
+/// The largest private job, in compute units, that `submit` takes to fit this
+/// device and so runs here (spec section 7: the local route is taken when "the
+/// job fits the user's device"). What a device can do is its hardware-fit score,
+/// which nothing measures yet. Until it is, a device is taken to fit what the
+/// spec says any device can run: tier 0, a job of one unit.
+const LOCAL_ROUTE_MAX_UNITS: u64 = 1;
 
 #[derive(Parser)]
 #[command(name = "decomp-node", about = "The DeComp node agent", version)]
@@ -127,7 +135,8 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Submit a job to the network and wait for its result.
+    /// Submit a job to the network and wait for its result. A private job is
+    /// run by the first private route that fits it, which may be on this device.
     Submit {
         #[command(flatten)]
         job: JobArgs,
@@ -161,7 +170,8 @@ enum Command {
         #[arg(value_parser = parse_shard)]
         shard: ShardRef,
     },
-    /// Run a job module on this device only, without the network.
+    /// Run a job module on this device only, without the network. For a private
+    /// job this is the local route.
     Run {
         #[command(flatten)]
         job: JobArgs,
@@ -249,7 +259,9 @@ fn main() -> ExitCode {
             submit(&client, job, limits)
         }),
         Command::State { shard } => connect().and_then(|client| show_state(&client, shard)),
-        Command::Run { job } => run_locally(job),
+        Command::Run { job } => {
+            read_job(&job).and_then(|files| run_here(&Sandbox::new(), &job, &files))
+        }
     };
     outcome.unwrap_or_else(|error| {
         eprintln!("error: {error}");
@@ -437,11 +449,24 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
         state,
         follow_up_credits,
     } = limits;
+    let files = read_job(&job)?;
+    let sandbox = Sandbox::new();
+    let declared = sandbox.declared(&files.module);
+    if declared.is_some_and(|signature| signature.privacy == Privacy::Private) {
+        if state.is_some() {
+            return Err("a private job cannot be handed state".into());
+        }
+        // "The SDK takes the first route that fits and reports which one it used."
+        let fits_device = job.compute_cap <= LOCAL_ROUTE_MAX_UNITS;
+        return match privacy::route(fits_device)? {
+            PrivateRoute::Local => run_here(&sandbox, &job, &files),
+        };
+    }
     let JobFiles {
         module,
         input,
         blobs,
-    } = read_job(&job)?;
+    } = files;
     let split = split_bytes.map(|chunk_bytes| Split { chunk_bytes });
     let pieces = split.map_or(1, |split| split.pieces(input.len() as u64));
     let mut manifest = Manifest {
@@ -458,6 +483,7 @@ fn submit(client: &Client, job: JobArgs, limits: Limits) -> Result<ExitCode, Box
             .map(|blob| client.put_blob(blob))
             .collect::<Result<_, _>>()?,
         state,
+        privacy: Privacy::Open,
     };
     // Set aside the most the job can cost, and what its follow-ups may; what is
     // not spent comes back.
@@ -607,28 +633,48 @@ fn receive(
     }
 }
 
-fn run_locally(job: JobArgs) -> Result<ExitCode, Box<dyn Error>> {
+/// Runs a job on this device and shows what it produced. For a private job this
+/// is the local route: "Local runs the module on the user's device with no
+/// verification" (spec section 7), and nothing of the job reaches a node.
+fn run_here(
+    sandbox: &Sandbox,
+    job: &JobArgs,
+    files: &JobFiles,
+) -> Result<ExitCode, Box<dyn Error>> {
     let JobFiles {
         module,
         input,
         blobs,
-    } = read_job(&job)?;
+    } = files;
+    let declared = sandbox.declared(module);
+    let private = declared
+        .as_ref()
+        .is_some_and(|signature| signature.privacy == Privacy::Private);
+    // The coordinator checks an input's types when a job is submitted to it. A
+    // private job run here never reaches it, so the check is made here.
+    if let Some(signature) = declared.filter(|_| private) {
+        signature
+            .check_input(input)
+            .map_err(|mismatch| mismatch.to_string())?;
+    }
     // Off the network a job has no ID to draw its randomness from, so the seed is
     // fixed: every local run of a job draws the same bytes.
-    let sandbox = Sandbox::new();
     let run = sandbox.run(&Job {
-        module: &module,
-        input: &input,
+        module,
+        input,
         compute_cap: job.compute_cap,
         seed: [0; 32],
-        blobs: &blobs,
+        blobs,
         // Nor is there any state to hand it.
         state: None,
     })?;
 
-    println!("module  {}", ContentHash::of(&module));
-    if let Some(signature) = sandbox.signature(&module)? {
+    println!("module  {}", ContentHash::of(module));
+    if let Some(signature) = sandbox.signature(module)? {
         println!("types   {}", String::from_utf8_lossy(&signature));
+    }
+    if private {
+        println!("route   local: run on this device, and sent to no node");
     }
     println!("units   {} of {}", run.units, job.compute_cap);
     let checkpoints = ContentHash::of(&run.checkpoints.concat());

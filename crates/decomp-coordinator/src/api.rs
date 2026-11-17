@@ -16,8 +16,8 @@ use axum::{Json, Router};
 use decomp_core::{
     Account, AccountStatus, Accounts, Addressed, Blob, BlobData, BlobRef, Call, ContentHash,
     Envelope, EnvelopeError, JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS,
-    MAX_MESSAGE_BYTES, OpError, Outcome, PublicKey, PublishedKey, Refusal, RelayError, Request,
-    ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted,
+    MAX_MESSAGE_BYTES, OpError, Outcome, PrivacyError, PublicKey, PublishedKey, Refusal,
+    RelayError, Request, ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted,
 };
 use decomp_sandbox::Sandbox;
 use serde_json::json;
@@ -409,6 +409,13 @@ impl From<SubmitError> for ApiError {
             }
             SubmitError::BadShardName | SubmitError::SplitWithState => {
                 Self::new(StatusCode::BAD_REQUEST, "bad_state", message)
+            }
+            SubmitError::Privacy(inner) => {
+                let code = match inner {
+                    PrivacyError::Mismatch => "privacy_mismatch",
+                    PrivacyError::NoRoute(_) => "no_private_route",
+                };
+                Self::new(StatusCode::BAD_REQUEST, code, message)
             }
             SubmitError::Sponsor(inner) => {
                 let (status, code) = match inner {

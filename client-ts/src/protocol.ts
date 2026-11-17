@@ -174,7 +174,12 @@ export type Manifest = {
   deadline: number;
   /** Credits set aside for the job, in millionths. */
   max_fee: number;
+  /** Left out, open. It must be what the job's module declares. */
+  privacy?: Privacy;
 };
+
+/** The mode a job runs in (`Privacy`). The nodes that run an open job can read its data. */
+export type Privacy = 'open' | 'private';
 
 /** The price of one compute unit on one node, in millionths of a credit (`BASE_PRICE`). */
 export const BASE_PRICE_MICROS = MICROS_PER_CREDIT;
