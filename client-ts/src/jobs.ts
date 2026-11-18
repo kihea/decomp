@@ -40,13 +40,13 @@ export type JobResult = {
   fee: number;
 };
 
-/** Stores bytes with the control; resolves with their hash. */
+/** Stores bytes with the network; resolves with their hash. */
 export async function putBlob(
-  control: ControlPlane,
+  controlPlane: ControlPlane,
   signer: Signer,
   data: Uint8Array,
 ): Promise<string> {
-  const stored = await control.request<BlobRef>(signer, {
+  const stored = await controlPlane.request<BlobRef>(signer, {
     type: 'put_blob',
     data: toBase64(data),
   });
@@ -54,11 +54,11 @@ export async function putBlob(
 }
 
 export async function getBlob(
-  control: ControlPlane,
+  controlPlane: ControlPlane,
   signer: Signer,
   hash: string,
 ): Promise<Uint8Array> {
-  const blob = await control.request<BlobData>(signer, { type: 'get_blob', hash });
+  const blob = await controlPlane.request<BlobData>(signer, { type: 'get_blob', hash });
   return fromBase64(blob.data);
 }
 
@@ -68,23 +68,23 @@ export async function getBlob(
  * does not use comes back.
  */
 export async function runJob(
-  control: ControlPlane,
+  controlPlane: ControlPlane,
   signer: Signer,
   order: JobOrder,
 ): Promise<JobResult> {
   const manifest: Manifest = {
     module: order.module,
-    input: await putBlob(control, signer, order.input),
+    input: await putBlob(controlPlane, signer, order.input),
     compute_cap: order.computeCap,
     deadline: now() + order.deadlineSecs,
     max_fee: 0,
   };
   // Set aside the most the job can cost at the rate posted now.
-  const quote = await control.request<Quote>(signer, { type: 'quote_job', manifest });
+  const quote = await controlPlane.request<Quote>(signer, { type: 'quote_job', manifest });
   manifest.max_fee = quote.highest_fee;
-  const { job_id } = await control.request<Submitted>(signer, { type: 'submit_job', manifest });
+  const { job_id } = await controlPlane.request<Submitted>(signer, { type: 'submit_job', manifest });
   for (;;) {
-    const status = await control.request<JobStatus>(signer, { type: 'get_receipt', job_id });
+    const status = await controlPlane.request<JobStatus>(signer, { type: 'get_receipt', job_id });
     switch (status.state) {
       case 'submitted':
       case 'leased':
@@ -99,7 +99,7 @@ export async function runJob(
       case 'settled': {
         const { outcome, fee } = status.receipt;
         if (outcome.status === 'failed') throw new JobError(FAILURES[outcome.failure]);
-        return { output: await getBlob(control, signer, outcome.output), fee: fee.total };
+        return { output: await getBlob(controlPlane, signer, outcome.output), fee: fee.total };
       }
     }
   }

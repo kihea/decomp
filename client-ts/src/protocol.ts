@@ -318,6 +318,9 @@ export type Privacy = 'open' | 'private';
 /** The base rate for compute, in microcredits per compute unit (`BASE_MICROS_PER_UNIT`). */
 export const BASE_MICROS_PER_UNIT = 250;
 
+/** The most runs a job's fee is set aside for: a first and a confirming pickup (`MAX_RUNS`). */
+export const MAX_RUNS = 2;
+
 /** The rate posted for one class and tier (`Rate`). */
 export type Rate = {
   class: JobClass;

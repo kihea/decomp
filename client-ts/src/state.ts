@@ -18,14 +18,14 @@ export type Records = Map<string, Uint8Array>;
  * to holds none.
  */
 export async function readShard(
-  control: ControlPlane,
+  controlPlane: ControlPlane,
   signer: Signer,
   app: string,
   shard: string,
 ): Promise<Records> {
-  const now = await control.request<ShardNow>(signer, { type: 'get_state', app, shard });
+  const now = await controlPlane.request<ShardNow>(signer, { type: 'get_state', app, shard });
   if (now.contents === null) return new Map();
-  return decodeRecords(await getBlob(control, signer, now.contents));
+  return decodeRecords(await getBlob(controlPlane, signer, now.contents));
 }
 
 /**
