@@ -183,6 +183,12 @@ enum Command {
         #[arg(long)]
         days: u32,
     },
+    /// Delete a file this account stored: the nodes drop it, and what is left
+    /// of its fee comes back.
+    Delete {
+        /// The root the file was stored under, as `store` printed it.
+        root: ContentHash,
+    },
     /// Fetch a stored file from the nodes that hold it.
     Fetch {
         /// The root the file was stored under, as `store` printed it.
@@ -428,6 +434,11 @@ fn main() -> ExitCode {
             agent::start(&cli.dir, &cli.control, reachable).map(|()| ExitCode::SUCCESS)
         }
         Command::Store { file, days } => connect().and_then(|client| store(&client, &file, days)),
+        Command::Delete { root } => connect().and_then(|client| {
+            client.delete_blob(root)?;
+            println!("deleted {root}; its nodes drop it when they next ask for work");
+            Ok(ExitCode::SUCCESS)
+        }),
         Command::Fetch { root, output } => {
             connect().and_then(|client| fetch(&client, root, &output))
         }

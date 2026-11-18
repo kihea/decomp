@@ -377,6 +377,10 @@ fn answer(
             control.confirm_stored(root, signer, now)?;
             Json(json!({})).into_response()
         }
+        Call::DeleteBlob { root } => {
+            control.delete_blob(&root, &account.id)?;
+            Json(json!({})).into_response()
+        }
         Call::LocateBlob { root } => {
             let located = control.locate(&root).ok_or(StorageError::UnknownBlob)?;
             Json(located).into_response()
@@ -707,6 +711,7 @@ impl From<StorageError> for ApiError {
     fn from(error: StorageError) -> Self {
         let (status, code) = match error {
             StorageError::AlreadyStored => (StatusCode::CONFLICT, "already_stored"),
+            StorageError::NotOwner => (StatusCode::FORBIDDEN, "not_owner"),
             StorageError::BadDuration => (StatusCode::BAD_REQUEST, "bad_duration"),
             StorageError::NotEnoughNodes => (StatusCode::SERVICE_UNAVAILABLE, "not_enough_nodes"),
             StorageError::UnknownBlob => (StatusCode::NOT_FOUND, "unknown_blob"),

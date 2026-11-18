@@ -160,6 +160,10 @@ fn turn(
     worker.handle(&granted);
 
     store.delete_expired(now);
+    for root in &granted.drop {
+        store.drop_blob(root);
+        println!("dropped blob {root}: its owner deleted it");
+    }
     store.expect(&granted.store);
     for order in &granted.store {
         // The blob arrives at this node's server; say so once it is here.

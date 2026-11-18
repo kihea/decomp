@@ -57,6 +57,13 @@ impl Store {
         fs::read(self.path(root))
     }
 
+    /// Deletes a blob whose deal ended early. A blob that cannot be deleted
+    /// now goes when its paid time runs out.
+    pub fn drop_blob(&self, root: &ContentHash) {
+        let _ = fs::remove_file(self.path(root));
+        self.orders.lock().expect("store lock").remove(root);
+    }
+
     /// Deletes blobs whose paid time has run out.
     pub fn delete_expired(&self, now: u64) {
         let mut known = self.orders.lock().expect("store lock");

@@ -117,6 +117,8 @@ pub enum StorageEntry {
 pub enum StorageError {
     #[error("this blob is already stored")]
     AlreadyStored,
+    #[error("only the account that stored a blob can delete it")]
+    NotOwner,
     #[error("a blob is stored for between 1 and {MAX_DAYS} days")]
     BadDuration,
     #[error(
@@ -183,6 +185,7 @@ pub struct Located {
 }
 
 struct Deal {
+    owner: AccountId,
     size: u64,
     until: u64,
     holders: Vec<Holder>,
@@ -218,6 +221,9 @@ pub struct Storage {
     deals: HashMap<ContentHash, Deal>,
     /// The one challenge each node may have awaiting an answer.
     awaited: HashMap<PublicKey, Awaited>,
+    /// Blobs each node should drop, because their deal ended, until the node
+    /// is told.
+    drops: HashMap<PublicKey, Vec<ContentHash>>,
 }
 
 impl Storage {
@@ -228,10 +234,10 @@ impl Storage {
             StorageEntry::Placed {
                 root,
                 size,
+                owner,
                 replicas,
                 until,
                 addressed,
-                ..
             } => {
                 let holders = replicas
                     .iter()
@@ -241,6 +247,7 @@ impl Storage {
                     })
                     .collect();
                 let deal = Deal {
+                    owner: *owner,
                     size: *size,
                     until: *until,
                     holders,
@@ -282,9 +289,40 @@ impl Storage {
                 }
             }
             StorageEntry::Ended { root } => {
-                self.deals.remove(root);
+                if let Some(deal) = self.deals.remove(root) {
+                    for holder in deal.holders {
+                        self.drops
+                            .entry(holder.replica.node)
+                            .or_default()
+                            .push(*root);
+                    }
+                }
             }
         }
+    }
+
+    /// Ends a deal at its owner's request (spec, "Blobs": "The owner signs a
+    /// delete, the pointers are removed, and nodes drop the chunks"). Time
+    /// already paid stays paid; what is left of the fee returns to the owner.
+    /// The nodes are told to drop the blob when they next ask for work.
+    pub fn delete(
+        &self,
+        root: &ContentHash,
+        owner: &AccountId,
+    ) -> Result<(StorageEntry, LedgerEntry), StorageError> {
+        let deal = self.deals.get(root).ok_or(StorageError::UnknownBlob)?;
+        if deal.owner != *owner {
+            return Err(StorageError::NotOwner);
+        }
+        Ok((
+            StorageEntry::Ended { root: *root },
+            LedgerEntry::DataRefund { id: *root },
+        ))
+    }
+
+    /// The blobs `node` should drop, which it is now told of.
+    pub fn take_drops(&mut self, node: &PublicKey) -> Vec<ContentHash> {
+        self.drops.remove(node).unwrap_or_default()
     }
 
     /// Chooses which of the `online` hosts hold a blob. Returns the entry that

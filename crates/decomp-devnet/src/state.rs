@@ -653,6 +653,7 @@ impl ControlPlane {
             leases: granted.leases,
             reveal: granted.reveal,
             store: self.storage.orders_for(&node),
+            drop: self.storage.take_drops(&node),
             challenge: self
                 .storage
                 .challenge_for(node, now, interval, &mut rand::rng()),
@@ -1160,6 +1161,13 @@ impl ControlPlane {
     ) -> Result<(), StorageError> {
         let (outcome, payment) = self.storage.answer(node, challenge, chunk, proof, now)?;
         self.note_storage(outcome, payment);
+        Ok(())
+    }
+
+    /// Deletes a blob `owner` stored, returning what is left of its fee.
+    pub fn delete_blob(&mut self, root: &ContentHash, owner: &AccountId) -> Result<(), StoreError> {
+        let (ended, refund) = self.storage.delete(root, owner)?;
+        self.note_storage(ended, Some(refund));
         Ok(())
     }
 

@@ -171,6 +171,9 @@ pub enum Call {
     /// A node saying it has received a blob it was asked to hold. Answer: an empty
     /// object.
     ConfirmStored { root: ContentHash },
+    /// Deletes a stored blob the signer's account stored: its nodes drop it,
+    /// and what is left of its fee returns. Answer: an empty object.
+    DeleteBlob { root: ContentHash },
     /// Where a stored blob can be fetched from. Answer: `Located`.
     LocateBlob { root: ContentHash },
     /// A node answering a storage challenge with the chunk asked for and the
@@ -299,6 +302,9 @@ pub struct LeasesGranted {
     /// Blobs the node has been asked to hold and has not yet confirmed.
     #[serde(default)]
     pub store: Vec<StoreOrder>,
+    /// Blobs the node should drop: their deal ended early.
+    #[serde(default)]
+    pub drop: Vec<ContentHash>,
     /// A storage challenge to answer.
     #[serde(default)]
     pub challenge: Option<Challenge>,

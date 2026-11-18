@@ -323,6 +323,12 @@ impl Client {
         Ok(())
     }
 
+    /// Deletes a blob this account stored.
+    pub fn delete_blob(&self, root: ContentHash) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::DeleteBlob { root })?;
+        Ok(())
+    }
+
     /// Where a stored blob can be fetched from.
     pub fn locate(&self, root: ContentHash) -> Result<Located, ClientError> {
         self.call(Call::LocateBlob { root })

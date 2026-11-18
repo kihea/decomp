@@ -165,6 +165,7 @@ export type Call =
   | { type: 'list_incoming' }
   | { type: 'store_blob'; root: string; size: number; days: number; to?: string }
   | { type: 'locate_blob'; root: string }
+  | { type: 'delete_blob'; root: string }
   | { type: 'put_blob'; data: string }
   | { type: 'get_blob'; hash: string }
   | { type: 'submit_job'; manifest: Manifest }
