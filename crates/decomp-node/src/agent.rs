@@ -165,6 +165,18 @@ fn turn(
         println!("dropped blob {root}: its owner deleted it");
     }
     store.expect(&granted.store);
+    for order in granted.store.iter().filter(|order| order.repair) {
+        // A replacement replica copies the blob from the nodes that hold it.
+        if !store.holds(&order.root) {
+            match decomp_node::store::fetch(client, order.root) {
+                Ok(bytes) => {
+                    store.keep(&order.root, &bytes);
+                    println!("copied blob {} to replace a lost replica", order.root);
+                }
+                Err(reason) => eprintln!("could not copy blob {}: {reason}", order.root),
+            }
+        }
+    }
     for order in &granted.store {
         // The blob arrives at this node's server; say so once it is here.
         if store.holds(&order.root) {

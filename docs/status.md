@@ -57,7 +57,7 @@ Last updated 2026-11-18.
 | Part | Status | Notes |
 | --- | --- | --- |
 | Blobs: 1 MB chunks, three replicas on nodes of different accounts, storage challenges | Available | Placement is computed from the blob's name and the storage nodes' keys |
-| Repair of lost replicas | Not started | A lost replica is detected; nothing copies it to a new node yet |
+| Repair of lost replicas | Available | A holder that fails three challenges, or stops answering, is lost; the next node in the placement order copies the blob from the others |
 | Deletion by the owner | Available | `decomp-node delete`; nodes drop the blob when they next ask for work, and what is left of its fee returns |
 | Records with versioned writes | Available | `write_record`, `get_record`, `list_records` |
 | Relays | Available | |

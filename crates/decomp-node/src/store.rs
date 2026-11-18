@@ -78,6 +78,12 @@ impl Store {
         });
     }
 
+    /// Keeps a blob this node fetched itself, to replace a lost replica. It
+    /// must be one the node was asked to hold, and must match its root.
+    pub fn keep(&self, root: &ContentHash, bytes: &[u8]) {
+        let _ = self.accept(root, &mut &bytes[..]);
+    }
+
     /// Takes in a blob sent to this node. Returns why not if it is refused.
     fn accept(&self, root: &ContentHash, body: &mut dyn Read) -> Result<(), &'static str> {
         let order = self.orders.lock().expect("store lock").get(root).cloned();

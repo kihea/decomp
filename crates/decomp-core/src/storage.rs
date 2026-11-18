@@ -30,11 +30,13 @@ pub const TARGET_REPLICAS: usize = 3;
 /// The fewest nodes a blob may be placed on.
 pub const MIN_REPLICAS: usize = 2;
 
-/// What one node is paid, before the fee split, to hold one gibibyte for one day.
-/// A starting value. The spec prices compute, at 1.5 cents a slot-hour, and not
-/// storage; at that rate a credit is worth about 0.0004 cents, and cloud storage
-/// costs about 0.08 cents a gigabyte-day, which comes to this many credits.
-pub const CREDITS_PER_GIB_DAY: u64 = 180;
+/// What one node is paid, before the fee split, to hold one gibibyte for one
+/// day, in microcredits. A starting value: the spec rents storage by the
+/// gigabyte-month and leaves the rate to testing. A credit buys about one
+/// slot-hour, which the spec's economics put near 1.5 cents, and cloud storage
+/// costs about 0.08 cents a gigabyte-day, which comes to about 0.057 credits a
+/// gibibyte-day (1.7 credits a gibibyte-month).
+pub const MICROS_PER_GIB_DAY: u64 = 57_000;
 
 /// The longest a blob can be paid for at once.
 pub const MAX_DAYS: u32 = 365;
@@ -51,7 +53,7 @@ const BYTES_PER_GIB: u64 = 1 << 30;
 /// What one node is paid, before the fee split, to hold `size` bytes for `secs`
 /// seconds.
 pub fn storage_fee(size: u64, secs: u64) -> Credits {
-    let micros_per_gib_day = u128::from(Credits::whole(CREDITS_PER_GIB_DAY).micros());
+    let micros_per_gib_day = u128::from(MICROS_PER_GIB_DAY);
     let work = u128::from(size) * u128::from(secs);
     let span = u128::from(BYTES_PER_GIB) * u128::from(SECS_PER_DAY);
     Credits::from_micros((work * micros_per_gib_day).div_ceil(span) as u64)
@@ -109,8 +111,14 @@ pub enum StorageEntry {
         node: PublicKey,
         at: u64,
     },
-    /// The time paid for ran out. What was not paid to nodes returns to the owner.
+    /// The time paid for ran out, or the owner deleted the blob. What was not
+    /// paid to nodes returns to the owner.
     Ended { root: ContentHash },
+    /// A replica was lost, and another node is asked to copy the blob from a
+    /// node that still holds it (spec, "Blobs": "When a storage challenge
+    /// fails, a repair job copies the chunk to a new node"). It is paid from
+    /// what the lost replica no longer earns.
+    Repaired { root: ContentHash, replica: Host },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -168,6 +176,10 @@ pub struct StoreOrder {
     pub size: u64,
     /// When the node may delete the blob, in seconds since 1970.
     pub until: u64,
+    /// The node fetches the blob from the nodes that hold it, instead of
+    /// waiting for it to be uploaded: a lost replica is being replaced.
+    #[serde(default)]
+    pub repair: bool,
 }
 
 /// A demand that a node produce one chunk of a blob it holds.
@@ -195,6 +207,8 @@ struct Deal {
 struct Holder {
     replica: Host,
     state: Holding,
+    /// The holder replaces a lost replica, and copies the blob from the others.
+    repair: bool,
 }
 
 enum Holding {
@@ -244,6 +258,7 @@ impl Storage {
                     .map(|replica| Holder {
                         replica: replica.clone(),
                         state: Holding::Ordered,
+                        repair: false,
                     })
                     .collect();
                 let deal = Deal {
@@ -286,6 +301,15 @@ impl Storage {
                             failures: failures + 1,
                         }
                     };
+                }
+            }
+            StorageEntry::Repaired { root, replica } => {
+                if let Some(deal) = self.deals.get_mut(root) {
+                    deal.holders.push(Holder {
+                        replica: replica.clone(),
+                        state: Holding::Ordered,
+                        repair: true,
+                    });
                 }
             }
             StorageEntry::Ended { root } => {
@@ -413,8 +437,46 @@ impl Storage {
                 root: *root,
                 size: deal.size,
                 until: deal.until,
+                repair: deal
+                    .holders
+                    .iter()
+                    .any(|holder| holder.replica.node == *node && holder.repair),
             })
             .collect()
+    }
+
+    /// The repairs to make now: for each blob that has lost replicas and still
+    /// has a node holding it, the next node in its placement order that is
+    /// online and of an account not already holding it.
+    pub fn repairs(&self, online: &[Host]) -> Vec<StorageEntry> {
+        let mut repairs = Vec::new();
+        for (root, deal) in &self.deals {
+            let live = deal
+                .holders
+                .iter()
+                .filter(|holder| !matches!(holder.state, Holding::Lost));
+            let held = live
+                .clone()
+                .any(|holder| matches!(holder.state, Holding::Held { .. }));
+            if !held || live.count() >= TARGET_REPLICAS {
+                continue;
+            }
+            let taken = |host: &Host| {
+                deal.holders.iter().any(|holder| {
+                    holder.replica.account == host.account || holder.replica.node == host.node
+                })
+            };
+            let next = placement_order(root, online.to_vec())
+                .into_iter()
+                .find(|host| !taken(host));
+            if let Some(replica) = next {
+                repairs.push(StorageEntry::Repaired {
+                    root: *root,
+                    replica,
+                });
+            }
+        }
+        repairs
     }
 
     /// A node says it has received a blob it was asked to hold.
@@ -471,6 +533,34 @@ impl Storage {
         Some(challenge)
     }
 
+    /// Holders that have gone a whole interval, and the time to answer, without
+    /// being challenged: they stopped asking for work, so they could not be
+    /// asked. Each such stretch counts as a failed challenge, so a node that
+    /// left for good is counted as lost and its replica repaired.
+    pub fn overdue(&self, now: u64, interval: u64) -> Vec<StorageEntry> {
+        let mut failed = Vec::new();
+        for (root, deal) in &self.deals {
+            for holder in &deal.holders {
+                let Holding::Held {
+                    last_challenged, ..
+                } = holder.state
+                else {
+                    continue;
+                };
+                let silent =
+                    now.saturating_sub(last_challenged) >= interval + CHALLENGE_ANSWER_SECS;
+                if silent && !self.awaited.contains_key(&holder.replica.node) {
+                    failed.push(StorageEntry::Failed {
+                        root: *root,
+                        node: holder.replica.node,
+                        at: now,
+                    });
+                }
+            }
+        }
+        failed
+    }
+
     /// Checks a node's answer to its challenge. Returns the entry recording the
     /// outcome and, if it passed, the payment for the time since its last one.
     pub fn answer(
@@ -508,6 +598,7 @@ impl Storage {
             Some(Holder {
                 replica,
                 state: Holding::Held { paid_through, .. },
+                ..
             }) => {
                 let held_for = now.min(deal.until).saturating_sub(*paid_through);
                 let amount = storage_fee(deal.size, held_for);

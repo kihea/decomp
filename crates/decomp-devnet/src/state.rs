@@ -1316,6 +1316,12 @@ impl ControlPlane {
         for (entry, refund) in self.storage.sweep(now) {
             self.note_storage(entry, refund);
         }
+        for failed in self.storage.overdue(now, self.challenge_interval) {
+            self.note_storage(failed, None);
+        }
+        for repair in self.storage.repairs(&self.hosts.online(now)) {
+            self.note_storage(repair, None);
+        }
         for (entry, refund) in self.relays.sweep(now) {
             self.note_relay(entry, Some(refund));
         }
