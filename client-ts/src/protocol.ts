@@ -171,6 +171,9 @@ export type Call =
   | { type: 'get_receipt'; job_id: string }
   | { type: 'quote_job'; manifest: Manifest }
   | { type: 'get_state'; app: string; shard: string }
+  | { type: 'write_record'; key: string; version: number; value: string }
+  | { type: 'get_record'; owner?: string | null; key: string }
+  | { type: 'list_records'; owner?: string | null; prefix?: string; from?: string | null }
   | { type: 'get_work_preferences'; device: string }
   | { type: 'set_work_preferences'; device: string; preferences: WorkPreferences }
   | { type: 'place_bid'; bid: BidOrder }
@@ -252,7 +255,7 @@ export type Taken = { frames: Frame[] };
 export const FRAME_BYTES = 256 * 1024;
 
 /** The size of every chunk of a stored blob except, usually, its last (`CHUNK_BYTES`). */
-export const CHUNK_BYTES = 64 * 1024;
+export const CHUNK_BYTES = 1024 * 1024;
 
 /** The three kinds of job (`JobClass`). */
 export type JobClass = 'menial' | 'data' | 'inference';
@@ -371,6 +374,23 @@ export type Bid = BidOrder & { id: string; account: string; filled: number };
 
 /** What an account earned and spent, in microcredits (`Activity`). */
 export type Activity = { earned: number; spent: number };
+
+/**
+ * One record of an account (`Record`): a key pointing to the blob `value`.
+ * A write names the version it read, and loses to any write that landed first.
+ */
+export type AccountRecord = {
+  owner: string;
+  key: string;
+  /** 1 after the first write, rising by one with each. */
+  version: number;
+  value: string;
+  writer: string;
+  at: number;
+};
+
+/** The answer to `list_records`. */
+export type RecordList = { records: AccountRecord[] };
 
 /** A name and the app it points to (`NameRecord`). */
 export type NameRecord = {

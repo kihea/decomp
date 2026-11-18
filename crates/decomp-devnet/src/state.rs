@@ -9,6 +9,7 @@
 //! | Balances | Accounts | `ops.jsonl` (starter grants) and `ledger.jsonl` | Yes |
 //! | When each account appeared, and what it earned and spent | Accounts | `activity.jsonl` | Yes |
 //! | Names | Registry | `registry.jsonl` | Yes |
+//! | Records: the current version of each key | Records | `records.jsonl` | Yes |
 //! | Node scores | Job board | `scores.jsonl` | Yes |
 //! | Work preferences and standing bids | Job board | `market.jsonl` | Yes |
 //! | Receipts | Receipts | `receipts.jsonl` | Yes |
@@ -26,6 +27,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use decomp_core::Records as AccountRecords;
 use decomp_core::market::{BALANCED_LOOKBACK_SECS, fallback_rate};
 use decomp_core::{
     Account, AccountId, AccountStanding, AccountStatus, Accounts, Activity, Beacon, Bid, BidOrder,
@@ -35,11 +37,11 @@ use decomp_core::{
     LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES, MAX_READS,
     MAX_SHARD_NAME_BYTES, Manifest, Merge, NAME_DEPOSIT, NameError, NameRecord, OpError, Opening,
     Outcome, PROBATION_FORFEIT_PERCENT, Payout, Penalty, Placement, Posted, PrivacyError,
-    PublicKey, Quote, Receipt, Registry, RegistryEntry, RelayEntry, RelayError, Relays, Resolved,
-    Route, ScoreEvent, Scores, SealingKeys, SettlementLog, ShardRef, SigningKey, Splits,
-    SponsorError, Sponsored, Standing, Standings, StateEntry, States, Storage, StorageEntry,
-    StorageError, Storing, Through, WorkPreferences, channel_id, compute_fee, merkle, privacy,
-    settlement,
+    PublicKey, Quote, Receipt, Record, RecordError, Registry, RegistryEntry, RelayEntry,
+    RelayError, Relays, Resolved, Route, ScoreEvent, Scores, SealingKeys, SettlementLog, ShardRef,
+    SigningKey, Splits, SponsorError, Sponsored, Standing, Standings, StateEntry, States, Storage,
+    StorageEntry, StorageError, Storing, Through, WorkPreferences, channel_id, compute_fee, merkle,
+    privacy, settlement,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
@@ -217,6 +219,8 @@ pub struct ControlPlane {
     draws_log: Log,
     registry: Registry,
     registry_log: Log,
+    records: AccountRecords,
+    records_log: Log,
     reviewers: Vec<AccountId>,
     market_log: Log,
     activity_log: Log,
@@ -298,6 +302,12 @@ impl ControlPlane {
         }
         let registry_log = replay(&data_dir.join("registry.jsonl"), |entry: RegistryEntry| {
             registry.apply(&entry);
+            Ok(())
+        })?;
+
+        let mut records = AccountRecords::default();
+        let records_log = replay(&data_dir.join("records.jsonl"), |record: Record| {
+            records.apply(record);
             Ok(())
         })?;
 
@@ -398,6 +408,8 @@ impl ControlPlane {
             draws_log: Log::open(&data_dir.join("draws.jsonl"))?,
             registry,
             registry_log,
+            records,
+            records_log,
             reviewers,
             market_log,
             activity_log,
@@ -872,6 +884,35 @@ impl ControlPlane {
         self.registry_log.append(&entry);
     }
 
+    /// Writes a record of `owner`'s, if `version` is still current.
+    pub fn write_record(
+        &mut self,
+        owner: AccountId,
+        key: String,
+        version: u64,
+        value: ContentHash,
+        writer: PublicKey,
+        now: u64,
+    ) -> Result<Record, RecordError> {
+        let record = self
+            .records
+            .write(owner, key, version, value, writer, now)?;
+        self.records_log.append(&record);
+        self.records.apply(record.clone());
+        Ok(record)
+    }
+
+    pub fn get_record(&self, owner: &AccountId, key: &str) -> Result<Record, RecordError> {
+        self.records
+            .get(owner, key)
+            .cloned()
+            .ok_or(RecordError::UnknownRecord)
+    }
+
+    pub fn list_records(&self, owner: &AccountId, prefix: &str, from: Option<&str>) -> Vec<Record> {
+        self.records.list(owner, prefix, from)
+    }
+
     /// Commits a node's result: checks the blobs it names exist, then records
     /// the commitment.
     pub fn commit_result(
@@ -1083,7 +1124,7 @@ impl ControlPlane {
             return Err(StoreError::UnknownDevice);
         }
         let online = self.hosts.online(now);
-        let (placed, escrow) = self.storage.place(blob, online, now, &mut rand::rng())?;
+        let (placed, escrow) = self.storage.place(blob, online, now)?;
         self.record(escrow)?;
         let StorageEntry::Placed { replicas, .. } = &placed else {
             unreachable!("placing a blob yields a Placed entry");

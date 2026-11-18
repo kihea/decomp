@@ -4,5 +4,6 @@ export * from './controllers';
 export * from './deliver';
 export * from './jobs';
 export * from './protocol';
+export * from './records';
 export * from './state';
 export * from './webcrypto';

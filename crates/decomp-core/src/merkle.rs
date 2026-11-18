@@ -2,15 +2,16 @@
 //!
 //! A stored blob is cut into chunks and named by the root of a hash tree over
 //! them. Someone who knows only the root can then check one chunk, given the
-//! hashes that link it to the root. That is what lets the coordinator challenge a
-//! node to show it still holds a blob without holding the blob itself.
+//! hashes that link it to the root. That is what lets the control plane challenge
+//! a node to show it still holds a blob without holding the blob itself.
 
 use sha2::{Digest, Sha256};
 
 use crate::keys::ContentHash;
 
-/// The size of every chunk of a stored blob except, usually, its last.
-pub const CHUNK_BYTES: usize = 64 * 1024;
+/// The size of every chunk of a stored blob except, usually, its last (spec,
+/// "Blobs": "A blob is cut into 1 MB chunks (starting value)").
+pub const CHUNK_BYTES: usize = 1024 * 1024;
 
 // A chunk and a pair of hashes are hashed with different first bytes, so a pair
 // of hashes can never be passed off as a chunk.

@@ -17,6 +17,7 @@ mod ledger;
 pub mod market;
 pub mod merkle;
 pub mod privacy;
+pub mod records;
 pub mod registry;
 mod relay;
 mod request;
@@ -67,6 +68,7 @@ pub use market::{
 pub use privacy::{
     ENCRYPTED_COMPUTE_MAX_UNITS, NoPrivateRoute, Privacy, PrivacyError, PrivateRoute,
 };
+pub use records::{Record, RecordError, Records};
 pub use registry::{NAME_DEPOSIT, NameError, NameRecord, Registry, RegistryEntry};
 pub use relay::{
     CHANNEL_SECS, CREDITS_PER_GIB_RELAYED, Checked, FRAME_BYTES, Frame, FrameError, FrameHeader,
@@ -76,7 +78,7 @@ pub use relay::{
 pub use request::{
     AccountStatus, Activity, Bids, Blob, BlobData, BlobRef, Call, CashOutAsked, CashOuts,
     Directory, IncomingChannels, LeasesGranted, MAX_CLOCK_SKEW_SECS, MAX_MESSAGE_BYTES, Placement,
-    PublishedKey, Quote, Rates, Refusal, Request, Resolved, ShardNow, Submitted,
+    PublishedKey, Quote, Rates, RecordList, Refusal, Request, Resolved, ShardNow, Submitted,
 };
 pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
 pub use seal::{SEAL_OVERHEAD_BYTES, SealingKeys};
@@ -89,5 +91,5 @@ pub use splits::{Merge, Splits};
 pub use state::{MAX_SHARD_NAME_BYTES, ShardRef, StateEntry, States};
 pub use storage::{
     Addressed, Challenge, Located, Storage, StorageEntry, StorageError, StoreOrder, Storing,
-    Waiting, storage_fee,
+    Waiting, placement_order, storage_fee,
 };

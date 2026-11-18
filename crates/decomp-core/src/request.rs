@@ -13,6 +13,7 @@ use crate::job::{JobResult, Lease, Manifest};
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, SealingKey};
 use crate::ledger::{Balance, CashOut, Credits};
 use crate::market::{Bid, BidOrder, Rate, WorkPreferences};
+use crate::records::Record;
 use crate::registry::NameRecord;
 use crate::relay::{Incoming, RelayOrder};
 use crate::storage::{Challenge, StoreOrder, Waiting};
@@ -56,6 +57,32 @@ pub enum Call {
     /// The contents a shard of an app's state has now, to be fetched as a blob
     /// and read as records (see `state`). Answer: `ShardNow`.
     GetState { app: AccountId, shard: String },
+    /// Writes a record of the signer's account: `key` now points to the blob
+    /// `value`. `version` is the version the writer read, 0 for a new key; the
+    /// write is refused if another has landed since (spec, "Records").
+    /// Answer: `Record`.
+    WriteRecord {
+        key: String,
+        version: u64,
+        value: ContentHash,
+    },
+    /// One record of an account, the signer's own if `owner` is left out.
+    /// Answer: `Record`.
+    GetRecord {
+        #[serde(default)]
+        owner: Option<AccountId>,
+        key: String,
+    },
+    /// An account's records whose keys start with `prefix`, in order of key,
+    /// after `from`. Answer: `RecordList`.
+    ListRecords {
+        #[serde(default)]
+        owner: Option<AccountId>,
+        #[serde(default)]
+        prefix: String,
+        #[serde(default)]
+        from: Option<String>,
+    },
     /// Puts earned credits up as stake behind the account's nodes.
     /// Answer: `AccountStatus`.
     Stake { amount: Credits },
@@ -278,6 +305,11 @@ pub struct LeasesGranted {
     /// The open channels the node is asked to carry.
     #[serde(default)]
     pub relay: Vec<RelayOrder>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecordList {
+    pub records: Vec<Record>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

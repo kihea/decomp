@@ -2,9 +2,13 @@
 //! "Storage challenge").
 //!
 //! An account pays to have a blob held for a number of days. The blob goes to a
-//! few nodes that other devices can connect to, each from a different account.
+//! few nodes that other devices can connect to, each from a different account,
+//! chosen by hashing the blob's name against each node's key (spec, "Blobs":
+//! "Any client can compute where a chunk lives, so there is no central
+//! index"). Given the list of storage nodes, `placement_order` gives the same
+//! answer to everyone.
 //! Now and then each is challenged to produce one randomly chosen chunk, which is
-//! checked against the blob's hash-tree root, so the coordinator never needs the
+//! checked against the blob's hash-tree root, so the control plane never needs the
 //! data itself. A node is paid for the time up to each challenge it passes.
 //!
 //! What must last (who holds what, and what has been paid) changes only by
@@ -13,7 +17,6 @@
 
 use std::collections::HashMap;
 
-use rand::seq::SliceRandom;
 use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +55,25 @@ pub fn storage_fee(size: u64, secs: u64) -> Credits {
     let work = u128::from(size) * u128::from(secs);
     let span = u128::from(BYTES_PER_GIB) * u128::from(SECS_PER_DAY);
     Credits::from_micros((work * micros_per_gib_day).div_ceil(span) as u64)
+}
+
+/// The storage nodes in the order a blob named `root` is placed on them: by
+/// the hash of the blob's name and each node's key, highest first. Each node's
+/// place depends only on the two, so adding or losing a node moves few blobs,
+/// and anyone with the list of storage nodes works out the same order.
+pub fn placement_order(root: &ContentHash, hosts: Vec<Host>) -> Vec<Host> {
+    let score = |host: &Host| {
+        let mut bytes = b"decomp/place/v1
+"
+        .to_vec();
+        bytes.extend_from_slice(root.as_bytes());
+        bytes.extend_from_slice(host.node.as_bytes());
+        ContentHash::of(&bytes)
+    };
+    let mut scored: Vec<(ContentHash, Host)> =
+        hosts.into_iter().map(|host| (score(&host), host)).collect();
+    scored.sort_by(|a, b| b.0.as_bytes().cmp(a.0.as_bytes()));
+    scored.into_iter().map(|(_, host)| host).collect()
 }
 
 /// A change to what is stored where.
@@ -270,9 +292,8 @@ impl Storage {
     pub fn place(
         &self,
         blob: Storing,
-        mut online: Vec<Host>,
+        online: Vec<Host>,
         now: u64,
-        rng: &mut impl Rng,
     ) -> Result<(StorageEntry, LedgerEntry), StorageError> {
         let Storing {
             root,
@@ -287,9 +308,8 @@ impl Storage {
         if days == 0 || days > MAX_DAYS {
             return Err(StorageError::BadDuration);
         }
-        online.shuffle(rng);
         let mut replicas: Vec<Host> = Vec::new();
-        for host in online {
+        for host in placement_order(&root, online) {
             if replicas.len() < TARGET_REPLICAS
                 && replicas.iter().all(|chosen| chosen.account != host.account)
             {

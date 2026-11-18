@@ -20,8 +20,8 @@ use decomp_core::{
     Account, AccountStatus, Accounts, Addressed, BEACON_PERIOD_SECS, BidError, Bids, Blob,
     BlobData, BlobRef, Call, CashOutAsked, CashOuts, ContentHash, Envelope, EnvelopeError,
     JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS, MAX_MESSAGE_BYTES, NameError, OpError,
-    Outcome, PrivacyError, PublicKey, PublishedKey, Rates, Refusal, RelayError, Request, ShardNow,
-    ShardRef, SponsorError, StorageError, Storing, Submitted,
+    Outcome, PrivacyError, PublicKey, PublishedKey, Rates, RecordError, RecordList, Refusal,
+    RelayError, Request, ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted,
 };
 use decomp_node::beacon::Rounds;
 use decomp_sandbox::Sandbox;
@@ -238,6 +238,30 @@ fn answer(
             Json(control.job_status(job_id, account.id, now)?).into_response()
         }
         Call::QuoteJob { manifest } => Json(control.quote(&manifest)?).into_response(),
+        Call::WriteRecord {
+            key,
+            version,
+            value,
+        } => {
+            require_blob(control, &value)?;
+            let record = control.write_record(account.id, key, version, value, signer, now)?;
+            Json(record).into_response()
+        }
+        Call::GetRecord { owner, key } => {
+            let owner = owner.unwrap_or(account.id);
+            Json(control.get_record(&owner, &key)?).into_response()
+        }
+        Call::ListRecords {
+            owner,
+            prefix,
+            from,
+        } => {
+            let owner = owner.unwrap_or(account.id);
+            Json(RecordList {
+                records: control.list_records(&owner, &prefix, from.as_deref()),
+            })
+            .into_response()
+        }
         Call::GetState { app, shard } => Json(ShardNow {
             contents: control.shard_now(&ShardRef { app, shard }),
         })
@@ -733,6 +757,19 @@ impl From<StoreError> for ApiError {
                 Self::new(StatusCode::NOT_FOUND, "unknown_device", message)
             }
         }
+    }
+}
+
+impl From<RecordError> for ApiError {
+    fn from(error: RecordError) -> Self {
+        let message = error.to_string();
+        let (status, code) = match error {
+            RecordError::BadKey => (StatusCode::BAD_REQUEST, "bad_key"),
+            RecordError::StaleVersion { .. } => (StatusCode::CONFLICT, "stale_version"),
+            RecordError::TooMany => (StatusCode::CONFLICT, "too_many_records"),
+            RecordError::UnknownRecord => (StatusCode::NOT_FOUND, "unknown_record"),
+        };
+        Self::new(status, code, message)
     }
 }
 
