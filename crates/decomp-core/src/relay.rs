@@ -45,11 +45,12 @@ use crate::keys::{AccountId, ContentHash, PublicKey, SigningKey};
 use crate::ledger::{Credits, LedgerEntry};
 use crate::request::Blob;
 
-/// What a relay is paid, before the fee split, to carry one gibibyte. A starting
-/// value. The spec prices compute, at 1.5 cents a slot-hour, and not relaying; at
-/// that rate a credit is worth about 0.0004 cents, and bandwidth bought from a
-/// hosting company costs about a cent a gigabyte, which comes to this many credits.
-pub const CREDITS_PER_GIB_RELAYED: u64 = 2_500;
+/// What a relay is paid, before the fee split, to carry one gibibyte, in
+/// microcredits. A starting value: the spec leaves relay rates to testing. A
+/// credit buys about one slot-hour, which the spec's economics put near 1.5
+/// cents, and bandwidth bought from a hosting company costs about a cent a
+/// gigabyte, which comes to about 0.7 credits a gibibyte.
+pub const MICROS_PER_GIB_RELAYED: u64 = 715_000;
 
 /// The most one channel may carry. Also keeps the fee within what `Credits` holds.
 pub const MAX_CHANNEL_BYTES: u64 = 1 << 40;
@@ -71,7 +72,7 @@ const BYTES_PER_GIB: u64 = 1 << 30;
 
 /// What a relay is paid, before the fee split, to carry `bytes` bytes.
 pub fn relay_fee(bytes: u64) -> Credits {
-    let micros_per_gib = u128::from(Credits::whole(CREDITS_PER_GIB_RELAYED).micros());
+    let micros_per_gib = u128::from(MICROS_PER_GIB_RELAYED);
     let micros = (u128::from(bytes) * micros_per_gib).div_ceil(u128::from(BYTES_PER_GIB));
     Credits::from_micros(micros as u64)
 }

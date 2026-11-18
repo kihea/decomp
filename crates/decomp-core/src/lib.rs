@@ -71,9 +71,9 @@ pub use privacy::{
 pub use records::{Record, RecordError, Records};
 pub use registry::{NAME_DEPOSIT, NameError, NameRecord, Registry, RegistryEntry};
 pub use relay::{
-    CHANNEL_SECS, CREDITS_PER_GIB_RELAYED, Checked, FRAME_BYTES, Frame, FrameError, FrameHeader,
-    Incoming, LISTEN_WINDOW_SECS, MAX_CHANNEL_BYTES, Opening, REDEEM_GRACE_SECS, RelayEntry,
-    RelayError, RelayOrder, Relays, Route, Take, Taken, channel_id, relay_fee,
+    CHANNEL_SECS, Checked, FRAME_BYTES, Frame, FrameError, FrameHeader, Incoming,
+    LISTEN_WINDOW_SECS, MAX_CHANNEL_BYTES, MICROS_PER_GIB_RELAYED, Opening, REDEEM_GRACE_SECS,
+    RelayEntry, RelayError, RelayOrder, Relays, Route, Take, Taken, channel_id, relay_fee,
 };
 pub use request::{
     AccountStatus, Activity, Bids, Blob, BlobData, BlobRef, Call, CashOutAsked, CashOuts,

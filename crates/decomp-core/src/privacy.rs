@@ -34,13 +34,13 @@ use crate::job::Manifest;
 /// third route. The spec has the cap set from measurements: "Benchmark standard
 /// encrypted operations and set the size cap from the results."
 ///
-/// A starting value. Measured on one computer, a job spends 5.1 units getting
-/// its key ready, 1.25 units on each gate between two encrypted bits, and about
-/// two seconds on each unit. So this cap is a job of about 200 gates, which is
-/// one addition, or one comparison and a choice, of two 32-bit numbers worked
-/// out bit by bit, and about nine minutes on each node: the far end of the
-/// spec's "network jobs finish in seconds to minutes".
-pub const ENCRYPTED_COMPUTE_MAX_UNITS: u64 = 256;
+/// A starting value. Measured on a reference laptop core, a job spends about 51
+/// units getting its key ready and about 12.5 units on each gate between two
+/// encrypted bits, at about 0.2 seconds a unit. So this cap is a job of about
+/// 200 gates, which is one addition, or one comparison and a choice, of two
+/// 32-bit numbers worked out bit by bit, and about nine minutes on each node:
+/// the far end of the spec's "network jobs finish in seconds to minutes".
+pub const ENCRYPTED_COMPUTE_MAX_UNITS: u64 = 2_560;
 
 /// The way a private job was run (spec section 7, "How private mode runs a job").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
