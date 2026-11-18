@@ -1,7 +1,7 @@
 {
   "name": "@decomp/client",
   "version": "0.1.0",
-  "description": "TypeScript client for the DeComp coordinator: message shapes, signing, and calls.",
+  "description": "TypeScript client for the DeComp control plane: message shapes, signing, and calls.",
   "private": true,
   "main": "src/index.ts",
   "types": "src/index.ts"

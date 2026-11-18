@@ -14,8 +14,10 @@ mod job;
 mod jobs;
 mod keys;
 mod ledger;
+pub mod market;
 pub mod merkle;
 pub mod privacy;
+pub mod registry;
 mod relay;
 mod request;
 mod scores;
@@ -36,44 +38,51 @@ pub use controller::{
 };
 pub use draw::{
     BEACON_CHAIN, BEACON_MAX_LAG_ROUNDS, BEACON_PERIOD_SECS, Beacon, Draw, DrawError, Eligible,
-    SPOT_CHECK_RATE, round_at,
+    Pickup, SPOT_CHECK_RATE, is_audited, round_at,
 };
 pub use encrypted::{EncryptError, Encrypted, EncryptionKey};
 pub use envelope::{Envelope, EnvelopeError};
 pub use hosts::{Host, Hosts};
 pub use job::{
-    Assignment, Failure, JobResult, JobStatus, MAX_APART_FROM, MAX_KEPT_FROM, MAX_PIECES,
-    MAX_READS, MAX_SPAWNED, MAX_TIER, Manifest, Outcome, Receipt, Share, Spawn, Split,
-    UNPROVEN_REDUNDANCY, Verification,
+    Failure, Fallback, JobResult, JobStatus, Lease, MAX_APART_FROM, MAX_JOB_SLOTS, MAX_KEPT_FROM,
+    MAX_PIECES, MAX_READS, MAX_RUNS, MAX_SPAWNED, MAX_TIER, Manifest, Outcome, Receipt, Share,
+    Spawn, Split, Verification, Verify,
 };
-pub use jobs::{ClosedJob, Closure, Dispute, FollowUps, JobError, Jobs};
+pub use jobs::{
+    CONFIRMATION_WINDOW_SECS, ClosedJob, Closure, Dispute, FallBackJob, FollowUps, Granted,
+    JobError, Jobs, LEASE_SECS, REVEAL_WINDOW_SECS, Standings,
+};
 pub use keys::{
     AccountId, ContentHash, JobId, LedgerAddress, OpeningKey, PasskeyKey, PublicKey, SealingKey,
     ShareSet, Signature, SigningKey, WalletKey, WalletSignature,
 };
 pub use ledger::{
-    BASE_PRICE, Balance, CashOut, Credits, FeeSplit, Holder, Ledger, LedgerEntry, LedgerError,
-    MAX_PAYMENT_NAME_BYTES, PROBATION_FORFEIT_PERCENT, STARTER_GRANT, fee,
+    Balance, CashOut, Credits, FeeSplit, HOLDBACK_PERCENT, HOLDBACK_SECS, Holder, Ledger,
+    LedgerEntry, LedgerError, MAX_PAYMENT_NAME_BYTES, PROBATION_FORFEIT_PERCENT, Payout,
+    STARTER_GRANT, compute_fee,
+};
+pub use market::{
+    AccountStanding, Bid, BidError, BidOrder, JobClass, LeasePrice, Price, Rate, WorkPreferences,
 };
 pub use privacy::{
     ENCRYPTED_COMPUTE_MAX_UNITS, NoPrivateRoute, Privacy, PrivacyError, PrivateRoute,
 };
+pub use registry::{NAME_DEPOSIT, NameError, NameRecord, Registry, RegistryEntry};
 pub use relay::{
     CHANNEL_SECS, CREDITS_PER_GIB_RELAYED, Checked, FRAME_BYTES, Frame, FrameError, FrameHeader,
     Incoming, LISTEN_WINDOW_SECS, MAX_CHANNEL_BYTES, Opening, REDEEM_GRACE_SECS, RelayEntry,
     RelayError, RelayOrder, Relays, Route, Take, Taken, channel_id, relay_fee,
 };
 pub use request::{
-    AccountStatus, Blob, BlobData, BlobRef, Call, CashOutAsked, CashOuts, CheckedIn,
-    IncomingChannels, MAX_CLOCK_SKEW_SECS, MAX_MESSAGE_BYTES, Placement, PublishedKey, Refusal,
-    Request, ShardNow, Submitted,
+    AccountStatus, Activity, Bids, Blob, BlobData, BlobRef, Call, CashOutAsked, CashOuts,
+    Directory, IncomingChannels, LeasesGranted, MAX_CLOCK_SKEW_SECS, MAX_MESSAGE_BYTES, Placement,
+    PublishedKey, Quote, Rates, Refusal, Request, Resolved, ShardNow, Submitted,
 };
 pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
 pub use seal::{SEAL_OVERHEAD_BYTES, SealingKeys};
 pub use settlement::{
-    AuditError, Auditor, BATCH_PERIOD_SECS, Batch, BatchRecords, Change, DISPUTE_WINDOW_SECS,
-    Finding, Inclusion, LogEntry, LogError, LogPage, MAX_LOG_PAGE, Posted, SettlementLog, Through,
-    UpheldDispute,
+    BATCH_PERIOD_SECS, Batch, Change, Inclusion, LogEntry, LogError, LogPage, MAX_LOG_PAGE, Posted,
+    SettlementLog, Through, fingerprint,
 };
 pub use shares::{SHARES, ShareError};
 pub use splits::{Merge, Splits};

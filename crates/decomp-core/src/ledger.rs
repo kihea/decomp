@@ -24,9 +24,12 @@ const MICROS_PER_CREDIT: u64 = 1_000_000;
 /// What a new account is given so its owner can use apps at once.
 pub const STARTER_GRANT: Credits = Credits::whole(25);
 
-/// The price of one compute unit on one node. The spec lets this float with
-/// network load; until that exists it is fixed.
-pub const BASE_PRICE: Credits = Credits::whole(1);
+/// How long part of an unconfirmed result's pay is held back, so that a late
+/// spot check can still be enforced (spec section 5, "Stake and holdback").
+pub const HOLDBACK_SECS: u64 = 24 * 3600;
+
+/// The part of an unconfirmed result's pay that is held back.
+pub const HOLDBACK_PERCENT: u64 = 10;
 
 /// The part of a fee that goes to the nodes whose results matched, split equally.
 const NODE_SHARE_PERCENT: u64 = 85;
@@ -86,8 +89,12 @@ impl Sub for Credits {
 
 impl fmt::Display for Credits {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // At least two decimals, and as many more as it takes to show every
+        // microcredit: small fees are worth reading exactly.
         let (whole, micros) = (self.0 / MICROS_PER_CREDIT, self.0 % MICROS_PER_CREDIT);
-        write!(f, "{whole}.{:02}", micros / (MICROS_PER_CREDIT / 100))
+        let fraction = format!("{micros:06}");
+        let fraction = fraction.trim_end_matches('0');
+        write!(f, "{whole}.{fraction:0<2}")
     }
 }
 
@@ -111,56 +118,67 @@ impl FromStr for Credits {
     }
 }
 
-/// What `units` of compute cost on each of `nodes` nodes. With a job's compute
-/// cap for `units`, this is the most the job can cost.
-pub fn fee(units: u64, nodes: u32) -> Credits {
-    Credits(
-        units
-            .saturating_mul(BASE_PRICE.0)
-            .saturating_mul(u64::from(nodes)),
-    )
+/// What `units` metered units cost at `micros_per_unit`.
+pub fn compute_fee(units: u64, micros_per_unit: u64) -> Credits {
+    Credits(units.saturating_mul(micros_per_unit))
 }
 
-/// How one job's fee is divided (spec section 5, "Fee split").
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// How one job's fee is divided (spec section 5, "Fee split"). Each run is
+/// priced on its own (a filled bid or a tapered account is paid less than the
+/// posted rate), and each node receives 85% of its own run's fee.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeeSplit {
-    /// What the job's submitter pays.
+    /// What the job's payer pays.
     pub total: Credits,
-    /// What each paid node's account receives.
-    pub per_node: Credits,
+    /// What the nodes whose results stood receive, together.
+    pub nodes: Credits,
     pub verification_fund: Credits,
     pub treasury: Credits,
 }
 
 impl FeeSplit {
-    /// The split for a job where each of `nodes` nodes used `units` compute units.
-    /// The treasury takes whatever rounding leaves, so the parts always add up.
-    pub fn of(units: u64, nodes: u32) -> Self {
-        let total = fee(units, nodes);
-        let per_node = Credits(total.percent(NODE_SHARE_PERCENT).0 / u64::from(nodes.max(1)));
+    /// The split for a job whose paid runs cost `runs`, and what each run's
+    /// node receives, in the same order. The treasury takes whatever rounding
+    /// leaves, so the parts always add up.
+    pub fn of_runs(runs: &[Credits]) -> (Self, Vec<Credits>) {
+        let total = runs.iter().fold(Credits::ZERO, |sum, run| sum + *run);
+        let pay: Vec<Credits> = runs
+            .iter()
+            .map(|run| run.percent(NODE_SHARE_PERCENT))
+            .collect();
+        let nodes = pay.iter().fold(Credits::ZERO, |sum, paid| sum + *paid);
         let verification_fund = total.percent(VERIFICATION_SHARE_PERCENT);
-        let paid_to_nodes = Credits(per_node.0 * u64::from(nodes));
-        let treasury = total - paid_to_nodes - verification_fund;
-        Self {
+        let treasury = total - nodes - verification_fund;
+        let split = Self {
             total,
-            per_node,
+            nodes,
             verification_fund,
             treasury,
-        }
+        };
+        (split, pay)
     }
 }
 
 /// Adds splits up part by part, for a job made of several pieces.
 impl std::iter::Sum for FeeSplit {
     fn sum<I: Iterator<Item = Self>>(splits: I) -> Self {
-        let nothing = FeeSplit::of(0, 0);
-        splits.fold(nothing, |sum, split| FeeSplit {
+        splits.fold(FeeSplit::default(), |sum, split| FeeSplit {
             total: sum.total + split.total,
-            per_node: sum.per_node + split.per_node,
+            nodes: sum.nodes + split.nodes,
             verification_fund: sum.verification_fund + split.verification_fund,
             treasury: sum.treasury + split.treasury,
         })
     }
+}
+
+/// What one node's account is paid for a job, and how much of it is held back
+/// until a late spot check can no longer find it wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Payout {
+    pub account: AccountId,
+    pub amount: Credits,
+    #[serde(default)]
+    pub held: Credits,
 }
 
 /// An account's credits.
@@ -179,6 +197,9 @@ pub struct Balance {
     /// each is paid out or refused. They cannot be spent meanwhile.
     #[serde(default)]
     pub cashing_out: Credits,
+    /// Earnings held back for a day in case a spot check finds the result wrong.
+    #[serde(default)]
+    pub held: Credits,
 }
 
 impl Balance {
@@ -216,12 +237,19 @@ pub enum LedgerEntry {
         account: AccountId,
         amount: Credits,
     },
-    /// Pays for a verified job out of its escrow and returns what is left.
+    /// Pays for a job whose result stood out of its escrow and returns what is
+    /// left. Each payout's `held` part waits in the account until `Release`.
     Settle {
         job_id: JobId,
         split: FeeSplit,
-        node_accounts: Vec<AccountId>,
+        payouts: Vec<Payout>,
     },
+    /// Releases what was held back from a job's payouts: the time in which a
+    /// spot check could find the result wrong has passed.
+    Release { job_id: JobId },
+    /// Takes what was held back from one account's payout for a job, for the
+    /// treasury: a spot check found its node's result wrong.
+    ForfeitHeld { job_id: JobId, account: AccountId },
     /// Returns a job's whole escrow: it expired, was disputed, or was lost.
     Refund { job_id: JobId },
     /// Pays an account from the verification fund, for checking work: a spot
@@ -290,6 +318,8 @@ pub enum LedgerError {
     AlreadyEscrowed,
     #[error("the job has no credits set aside")]
     NothingEscrowed,
+    #[error("the payouts of a settlement do not add up to its nodes' share")]
+    PayoutsDoNotAddUp,
     #[error("the fee is more than was set aside for the job")]
     FeeExceedsEscrow,
     #[error("only earned credits can be cashed out, and the account has too few")]
@@ -341,6 +371,8 @@ pub struct Ledger {
     /// The names of the payments credits were bought with, so that none is
     /// credited twice.
     payments: HashSet<String>,
+    /// What is held back from each job's payouts, by account.
+    holdbacks: HashMap<JobId, Vec<(AccountId, Credits)>>,
     verification_fund: Credits,
     treasury: Credits,
 }
@@ -368,7 +400,7 @@ impl Ledger {
     pub fn holdings(&self) -> BTreeMap<Holder, Credits> {
         let mut holdings = BTreeMap::new();
         for (account, balance) in &self.balances {
-            let all = balance.spendable() + balance.staked + balance.cashing_out;
+            let all = balance.spendable() + balance.staked + balance.cashing_out + balance.held;
             holdings.insert(Holder::Account(*account), all);
         }
         for escrow in self.escrows.values().chain(self.data_escrows.values()) {
@@ -417,8 +449,12 @@ impl Ledger {
             LedgerEntry::Settle {
                 job_id,
                 split,
-                node_accounts,
+                payouts,
             } => {
+                let paid = payouts.iter().fold(Credits::ZERO, |sum, p| sum + p.amount);
+                if paid != split.nodes || payouts.iter().any(|p| p.held > p.amount) {
+                    return Err(LedgerError::PayoutsDoNotAddUp);
+                }
                 let escrow = self
                     .escrows
                     .get(job_id)
@@ -430,11 +466,38 @@ impl Ledger {
                     self.escrows.remove(job_id).expect("checked above");
                 held.take(split.total);
                 self.balances.entry(account).or_default().put_back(held);
-                for node_account in node_accounts {
-                    self.balances.entry(*node_account).or_default().earned += split.per_node;
+                let mut held_back = Vec::new();
+                for payout in payouts {
+                    let balance = self.balances.entry(payout.account).or_default();
+                    balance.earned += payout.amount - payout.held;
+                    balance.held += payout.held;
+                    if payout.held > Credits::ZERO {
+                        held_back.push((payout.account, payout.held));
+                    }
+                }
+                if !held_back.is_empty() {
+                    self.holdbacks.insert(*job_id, held_back);
                 }
                 self.verification_fund += split.verification_fund;
                 self.treasury += split.treasury;
+            }
+            LedgerEntry::Release { job_id } => {
+                for (account, amount) in self.holdbacks.remove(job_id).unwrap_or_default() {
+                    let balance = self.balances.entry(account).or_default();
+                    balance.held = balance.held - amount;
+                    balance.earned += amount;
+                }
+            }
+            LedgerEntry::ForfeitHeld { job_id, account } => {
+                let Some(held) = self.holdbacks.get_mut(job_id) else {
+                    return Ok(());
+                };
+                if let Some(place) = held.iter().position(|(owner, _)| owner == account) {
+                    let (_, amount) = held.remove(place);
+                    let balance = self.balances.entry(*account).or_default();
+                    balance.held = balance.held - amount;
+                    self.treasury += amount;
+                }
             }
             LedgerEntry::Refund { job_id } => {
                 let Escrow { account, held } = self

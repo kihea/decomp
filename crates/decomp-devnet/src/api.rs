@@ -1,5 +1,7 @@
-//! The coordinator's HTTP API. Every request body is a signed envelope; there are
-//! no sessions or tokens, so who is asking is always proven by the signature.
+//! The local network's HTTP API: the control plane's interface (spec,
+//! "Interfaces"). Every request body is a signed envelope; there are no
+//! sessions or tokens, so who is asking is always proven by the signature. On
+//! the Internet Computer the same calls are the canisters' methods.
 //!
 //! - `POST /v1/ops` takes an `AccountOp`: a change to an account, which is logged.
 //! - `POST /v1/request` takes a `Request`: everything else.
@@ -13,39 +15,46 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use decomp_core::registry::MAX_DIRECTORY_PAGE;
 use decomp_core::{
-    Account, AccountStatus, Accounts, Addressed, BEACON_PERIOD_SECS, Blob, BlobData, BlobRef, Call,
-    CashOutAsked, CashOuts, ContentHash, Envelope, EnvelopeError, JobError, LedgerEntry,
-    LedgerError, MAX_CLOCK_SKEW_SECS, MAX_MESSAGE_BYTES, OpError, Outcome, PrivacyError, PublicKey,
-    PublishedKey, Refusal, RelayError, Request, ShardNow, ShardRef, SponsorError, StorageError,
-    Storing, Submitted,
+    Account, AccountStatus, Accounts, Addressed, BEACON_PERIOD_SECS, BidError, Bids, Blob,
+    BlobData, BlobRef, Call, CashOutAsked, CashOuts, ContentHash, Envelope, EnvelopeError,
+    JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS, MAX_MESSAGE_BYTES, NameError, OpError,
+    Outcome, PrivacyError, PublicKey, PublishedKey, Rates, Refusal, RelayError, Request, ShardNow,
+    ShardRef, SponsorError, StorageError, Storing, Submitted,
 };
 use decomp_node::beacon::Rounds;
 use decomp_sandbox::Sandbox;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
 
-use crate::referee::referee;
+use crate::referee::{self, referee};
 use crate::state::{
-    Coordinator, DisputeError, InclusionError, OpenRelayError, StoreError, SubmitError,
+    ControlPlane, InclusionError, OpenRelayError, RegistryError, StoreError, SubmitError,
 };
 
 struct App {
-    coordinator: Mutex<Coordinator>,
-    /// For refereeing disputes, which means running the disputed job.
+    control: Mutex<ControlPlane>,
+    /// For refereeing disputes and running always-on fallbacks, which means
+    /// running the job.
     sandbox: Sandbox,
 }
 
-/// The coordinator's API, the clock that posts a batch to the settlement log
-/// every `batch_period`, and the one that fetches each round of public
-/// randomness.
-pub fn router(coordinator: Coordinator, batch_period: Duration) -> Router {
+/// How often time is let pass for jobs nobody is asking about: windows close,
+/// leases lapse, and holds are released.
+const TICK_SECS: u64 = 1;
+
+/// The control plane's API, the clock that posts a batch to the settlement log
+/// every `batch_period`, the one that fetches each round of public randomness,
+/// and the one that lets time pass.
+pub fn router(control: ControlPlane, batch_period: Duration) -> Router {
     let app = Arc::new(App {
-        coordinator: Mutex::new(coordinator),
+        control: Mutex::new(control),
         sandbox: Sandbox::new(),
     });
     tokio::spawn(post_batches(Arc::clone(&app), batch_period));
     tokio::spawn(follow_beacon(Arc::clone(&app)));
+    tokio::spawn(tick(Arc::clone(&app)));
     Router::new()
         .route("/v1/ops", post(submit_op))
         .route("/v1/request", post(request))
@@ -69,8 +78,8 @@ async fn follow_beacon(app: Arc<App>) {
         let fetched = tokio::task::spawn_blocking(move || beacon.latest()).await;
         match fetched.expect("fetching a round does not panic") {
             Ok(beacon) => {
-                let mut coordinator = app.coordinator.lock().expect("coordinator lock");
-                coordinator.set_beacon(beacon);
+                let mut control = app.control.lock().expect("control plane lock");
+                control.set_beacon(beacon);
                 reached = true;
             }
             // Said once each time the beacon is lost, not every three seconds.
@@ -87,8 +96,48 @@ async fn post_batches(app: Arc<App>, period: Duration) {
     let mut ticks = tokio::time::interval(period);
     loop {
         ticks.tick().await;
-        let mut coordinator = app.coordinator.lock().expect("coordinator lock");
-        coordinator.post_batch(unix_now());
+        let mut control = app.control.lock().expect("control plane lock");
+        control.post_batch(unix_now());
+    }
+}
+
+async fn tick(app: Arc<App>) {
+    let mut ticks = tokio::time::interval(Duration::from_secs(TICK_SECS));
+    loop {
+        ticks.tick().await;
+        let work = {
+            let mut control = app.control.lock().expect("control plane lock");
+            control.settle(unix_now());
+            (control.take_cases(), control.take_fall_backs())
+        };
+        run_aside(&app, work);
+    }
+}
+
+/// Refereeing and fallbacks run the job, which can take as long as the job
+/// did, so they happen off to the side and the control plane stays free.
+fn run_aside(
+    app: &Arc<App>,
+    (cases, fall_backs): (
+        Vec<referee::Case>,
+        Vec<(decomp_core::JobId, decomp_core::FallBackJob, referee::Case)>,
+    ),
+) {
+    for case in cases {
+        let app = Arc::clone(app);
+        tokio::task::spawn_blocking(move || {
+            let verdict = referee(&app.sandbox, &case);
+            let mut control = app.control.lock().expect("control plane lock");
+            control.resolve(&case, &verdict, unix_now());
+        });
+    }
+    for (job_id, _, case) in fall_backs {
+        let app = Arc::clone(app);
+        tokio::task::spawn_blocking(move || {
+            let (result, produced) = referee::run(&app.sandbox, &case, job_id);
+            let mut control = app.control.lock().expect("control plane lock");
+            control.fell_back(job_id, result, produced, unix_now());
+        });
     }
 }
 
@@ -104,9 +153,9 @@ async fn submit_op(
     Json(envelope): Json<Envelope>,
 ) -> Result<Json<AccountStatus>, ApiError> {
     let status = app
-        .coordinator
+        .control
         .lock()
-        .expect("coordinator lock")
+        .expect("control plane lock")
         .apply_op(&envelope, unix_now())?;
     Ok(Json(status))
 }
@@ -118,7 +167,7 @@ async fn request(
     let Request { issued_at, call } = envelope.open()?;
     let now = unix_now();
     if now.abs_diff(issued_at) > MAX_CLOCK_SKEW_SECS {
-        let message = "the request's issued_at is too far from the coordinator's clock";
+        let message = "the request's issued_at is too far from the control plane's clock";
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "stale_request",
@@ -126,36 +175,48 @@ async fn request(
         ));
     }
 
-    let (answer, cases) = {
-        let mut coordinator = app.coordinator.lock().expect("coordinator lock");
-        let account = member(&coordinator.accounts, &envelope.signer)?.clone();
-        let answer = answer(
-            &mut coordinator,
-            &app.sandbox,
-            call,
-            &account,
-            envelope,
-            now,
-        );
-        // Any call can find that a job's deadline has passed, so settle after each.
-        coordinator.settle(now);
-        (answer, coordinator.take_cases())
+    let (answer, work) = {
+        let mut control = app.control.lock().expect("control plane lock");
+        let answer = match call {
+            // Anyone may resolve a name, read the directory, or fetch a blob by its
+            // hash, signed in or not.
+            Call::ResolveName { name } => control
+                .resolve_name(&name)
+                .map(|resolved| Json(resolved).into_response())
+                .map_err(ApiError::from),
+            Call::ListDirectory {
+                verified_only,
+                query,
+                from,
+                limit,
+            } => {
+                let limit = limit.map_or(MAX_DIRECTORY_PAGE, |limit| limit as usize);
+                let page =
+                    control.directory(verified_only, query.as_deref(), from.as_deref(), limit);
+                Ok(Json(page).into_response())
+            }
+            Call::GetBlob { hash } => control
+                .blobs
+                .get(&hash)
+                .map_err(ApiError::from)
+                .and_then(|bytes| bytes.ok_or_else(|| unknown_blob(&hash)))
+                .map(|bytes| Json(BlobData { data: Blob(bytes) }).into_response()),
+            call => {
+                let account = member(&control.accounts, &envelope.signer)?.clone();
+                answer(&mut control, &app.sandbox, call, &account, envelope, now)
+            }
+        };
+        // Any call can find that a job's window or deadline has passed, so
+        // settle after each.
+        control.settle(now);
+        (answer, (control.take_cases(), control.take_fall_backs()))
     };
-    // Refereeing runs the disputed job, which can take as long as the job did, so
-    // it happens off to the side and the coordinator stays free meanwhile.
-    for case in cases {
-        let app = Arc::clone(&app);
-        tokio::task::spawn_blocking(move || {
-            let verdict = referee(&app.sandbox, &case);
-            let mut coordinator = app.coordinator.lock().expect("coordinator lock");
-            coordinator.resolve(&case, &verdict, unix_now());
-        });
-    }
+    run_aside(&app, work);
     answer
 }
 
 fn answer(
-    coordinator: &mut Coordinator,
+    control: &mut ControlPlane,
     sandbox: &Sandbox,
     call: Call,
     account: &Account,
@@ -164,61 +225,114 @@ fn answer(
 ) -> Result<Response, ApiError> {
     let signer = envelope.signer;
     Ok(match call {
-        Call::GetAccount => Json(coordinator.status(account.clone())).into_response(),
+        Call::GetAccount => Json(control.status(account.clone())).into_response(),
         Call::PutBlob { data } => Json(BlobRef {
-            hash: coordinator.blobs.put(&data.0)?,
+            hash: control.blobs.put(&data.0)?,
         })
         .into_response(),
-        Call::GetBlob { hash } => {
-            let bytes = coordinator
-                .blobs
-                .get(&hash)?
-                .ok_or_else(|| unknown_blob(&hash))?;
-            Json(BlobData { data: Blob(bytes) }).into_response()
-        }
         Call::SubmitJob { manifest } => {
-            let job_id = coordinator.submit_job(&envelope, account.id, manifest, now, sandbox)?;
+            let job_id = control.submit_job(&envelope, account.id, manifest, now, sandbox)?;
             Json(Submitted { job_id }).into_response()
         }
-        Call::GetJob { job_id } => {
-            Json(coordinator.job_status(job_id, account.id, now)?).into_response()
+        Call::GetReceipt { job_id } => {
+            Json(control.job_status(job_id, account.id, now)?).into_response()
         }
+        Call::QuoteJob { manifest } => Json(control.quote(&manifest)?).into_response(),
         Call::GetState { app, shard } => Json(ShardNow {
-            contents: coordinator.shard_now(&ShardRef { app, shard }),
+            contents: control.shard_now(&ShardRef { app, shard }),
         })
         .into_response(),
         Call::Stake { amount } => {
-            coordinator.record(LedgerEntry::Stake {
+            control.record(LedgerEntry::Stake {
                 account: account.id,
                 amount,
             })?;
-            Json(coordinator.status(account.clone())).into_response()
+            Json(control.status(account.clone())).into_response()
         }
         Call::Unstake { amount } => {
             // Stake must still be there when a job in progress turns out wrong.
-            if coordinator.jobs.is_working(&account.id) {
+            if control.jobs.is_working(&account.id) {
                 let message =
                     "stake cannot be taken back while one of the account's nodes is on a job";
                 return Err(ApiError::new(StatusCode::CONFLICT, "node_working", message));
             }
-            // And when a batch its operator posted turns out bad.
-            if coordinator.operator_account() == Some(account.id) && coordinator.has_open_batch(now)
-            {
-                let message = "stake cannot be taken back while a batch its operator posted can still be disputed";
-                return Err(ApiError::new(StatusCode::CONFLICT, "batch_open", message));
-            }
-            coordinator.record(LedgerEntry::Unstake {
+            control.record(LedgerEntry::Unstake {
                 account: account.id,
                 amount,
             })?;
-            Json(coordinator.status(account.clone())).into_response()
+            Json(control.status(account.clone())).into_response()
         }
-        Call::GetStanding => Json(coordinator.standing(&signer, &account.id)).into_response(),
-        Call::CheckIn { address } => {
+        Call::GetStanding => Json(control.standing(&signer, &account.id)).into_response(),
+        Call::RequestLease { address } => {
             if let Some(address) = &address {
                 check_address(address)?;
             }
-            Json(coordinator.check_in(signer, account.id, address, now)).into_response()
+            Json(control.request_lease(signer, account.id, address, now)).into_response()
+        }
+        Call::CommitResult { job_id, commitment } => {
+            control.commit_result(signer, job_id, commitment, now)?;
+            Json(json!({})).into_response()
+        }
+        Call::RevealResult { result, salt } => {
+            if let Outcome::Completed {
+                output,
+                blobs,
+                state,
+                spawned,
+            } = &result.outcome
+            {
+                let asked = spawned
+                    .iter()
+                    .flat_map(|spawn| [&spawn.module, &spawn.input]);
+                for hash in blobs.iter().chain([output]).chain(state).chain(asked) {
+                    require_blob(control, hash)?;
+                }
+            }
+            require_blob(control, &result.checkpoints)?;
+            control.reveal_result(signer, result, salt, envelope, now)?;
+            Json(json!({})).into_response()
+        }
+        Call::GetWorkPreferences { device } => {
+            Json(control.preferences(&account.id, &device)?).into_response()
+        }
+        Call::SetWorkPreferences {
+            device,
+            preferences,
+        } => Json(control.set_preferences(&account.id, device, preferences)?).into_response(),
+        Call::PlaceBid { bid } => {
+            Json(control.place_bid(account.id, bid, &envelope, now)?).into_response()
+        }
+        Call::CancelBid { id } => {
+            control.cancel_bid(account.id, id)?;
+            Json(json!({})).into_response()
+        }
+        Call::ListBids => Json(Bids {
+            bids: control.jobs.bids_of(&account.id, now),
+        })
+        .into_response(),
+        Call::GetRates => Json(Rates {
+            rates: control.jobs.rates(),
+        })
+        .into_response(),
+        Call::GetActivity { since } => Json(control.activity(&account.id, since)).into_response(),
+        Call::RegisterName { name } => {
+            Json(control.register_name(account, name, now)?).into_response()
+        }
+        Call::RenewName { name } => {
+            Json(control.renew_name(&account.id, name, now)?).into_response()
+        }
+        Call::ReleaseName { name } => {
+            control.release_name(&account.id, name)?;
+            Json(json!({})).into_response()
+        }
+        Call::SetVerified { name, verified } => {
+            Json(control.set_verified(&account.id, name, verified)?).into_response()
+        }
+        Call::AssignName { name, app } => {
+            Json(control.assign_name(&account.id, name, app, now)?).into_response()
+        }
+        Call::ResolveName { .. } | Call::ListDirectory { .. } | Call::GetBlob { .. } => {
+            unreachable!("answered before membership is checked")
         }
         Call::StoreBlob {
             root,
@@ -233,14 +347,14 @@ fn answer(
                 days,
                 addressed: to.map(|to| Addressed { from: signer, to }),
             };
-            Json(coordinator.store_blob(blob, now)?).into_response()
+            Json(control.store_blob(blob, now)?).into_response()
         }
         Call::ConfirmStored { root } => {
-            coordinator.confirm_stored(root, signer, now)?;
+            control.confirm_stored(root, signer, now)?;
             Json(json!({})).into_response()
         }
         Call::LocateBlob { root } => {
-            let located = coordinator.locate(&root).ok_or(StorageError::UnknownBlob)?;
+            let located = control.locate(&root).ok_or(StorageError::UnknownBlob)?;
             Json(located).into_response()
         }
         Call::AnswerChallenge {
@@ -248,47 +362,36 @@ fn answer(
             chunk,
             proof,
         } => {
-            coordinator.answer_challenge(signer, challenge, &chunk.0, &proof, now)?;
+            control.answer_challenge(signer, challenge, &chunk.0, &proof, now)?;
             Json(json!({})).into_response()
         }
         Call::PublishSealingKey { .. } => {
-            coordinator.publish_sealing_key(&envelope)?;
+            control.publish_sealing_key(&envelope)?;
             Json(json!({})).into_response()
         }
         Call::GetSealingKey { device } => Json(PublishedKey {
-            proof: coordinator.sealing_key_proof(&device),
+            proof: control.sealing_key_proof(&device),
         })
         .into_response(),
         Call::OpenRelay { to, bytes } => {
             let payload = &envelope.payload;
-            Json(coordinator.open_relay(signer, account.id, payload, to, bytes, now)?)
-                .into_response()
+            Json(control.open_relay(signer, account.id, payload, to, bytes, now)?).into_response()
         }
-        Call::ListIncoming => Json(coordinator.incoming(&signer, now)).into_response(),
+        Call::ListIncoming => Json(control.incoming(&signer, now)).into_response(),
         Call::RedeemRelay { header, receipt } => {
-            coordinator.redeem_relay(&signer, &header, &receipt)?;
+            control.redeem_relay(&signer, &header, &receipt)?;
             Json(json!({})).into_response()
         }
-        Call::GetLog { from } => Json(coordinator.log_page(from)?).into_response(),
-        Call::GetInclusion { job_id } => Json(coordinator.inclusion(&job_id)?).into_response(),
-        Call::GetDraws { from } => Json(coordinator.draws_page(from)?).into_response(),
-        Call::GetRecords { from } => Json(coordinator.records(&account.id, from)?).into_response(),
-        Call::DisputeBatch {
-            batch,
-            fingerprint,
-            changes,
-        } => {
-            let found = (fingerprint, changes.as_slice());
-            coordinator.dispute(&envelope, &account.id, batch, found, now)?;
-            Json(json!({})).into_response()
-        }
+        Call::GetLog { from } => Json(control.log_page(from)?).into_response(),
+        Call::GetInclusion { job_id } => Json(control.inclusion(&job_id)?).into_response(),
+        Call::GetDraws { from } => Json(control.draws_page(from)?).into_response(),
         Call::CreditPurchase {
             account: buyer,
             amount,
             payment,
         } => {
-            operator_only(coordinator, &signer)?;
-            coordinator.record(LedgerEntry::Buy {
+            treasury_only(control, &signer)?;
+            control.record(LedgerEntry::Buy {
                 account: buyer,
                 amount,
                 payment,
@@ -307,7 +410,7 @@ fn answer(
             // The request's signature names the cash-out, so the same request
             // sent twice asks for one cash-out.
             let id = ContentHash::of(envelope.signature.as_bytes());
-            coordinator.record(LedgerEntry::CashOut {
+            control.record(LedgerEntry::CashOut {
                 id,
                 account: account.id,
                 amount,
@@ -315,39 +418,18 @@ fn answer(
             Json(CashOutAsked { id }).into_response()
         }
         Call::GetCashOuts => {
-            operator_only(coordinator, &signer)?;
-            let waiting = coordinator.cash_outs();
+            treasury_only(control, &signer)?;
+            let waiting = control.cash_outs();
             Json(CashOuts { waiting }).into_response()
         }
         Call::PayCashOut { id, payout } => {
-            operator_only(coordinator, &signer)?;
-            coordinator.record(LedgerEntry::CashOutPaid { id, payout })?;
+            treasury_only(control, &signer)?;
+            control.record(LedgerEntry::CashOutPaid { id, payout })?;
             Json(json!({})).into_response()
         }
         Call::RefuseCashOut { id } => {
-            operator_only(coordinator, &signer)?;
-            coordinator.record(LedgerEntry::CashOutRefused { id })?;
-            Json(json!({})).into_response()
-        }
-        Call::SubmitResult { result } => {
-            if let Outcome::Completed {
-                output,
-                blobs,
-                state,
-                spawned,
-            } = &result.outcome
-            {
-                let asked = spawned
-                    .iter()
-                    .flat_map(|spawn| [&spawn.module, &spawn.input]);
-                for hash in blobs.iter().chain([output]).chain(state).chain(asked) {
-                    require_blob(coordinator, hash)?;
-                }
-            }
-            require_blob(coordinator, &result.checkpoints)?;
-            coordinator
-                .jobs
-                .report(signer, result, envelope, now, &mut rand::rng())?;
+            treasury_only(control, &signer)?;
+            control.record(LedgerEntry::CashOutRefused { id })?;
             Json(json!({})).into_response()
         }
     })
@@ -379,18 +461,16 @@ fn member<'a>(accounts: &'a Accounts, signer: &PublicKey) -> Result<&'a Account,
     Ok(account)
 }
 
-/// Refuses a request that only this coordinator's operator may make: saying
-/// that credits were paid for, and paying or refusing a cash-out. The operator
-/// is the one party the coordinator can take that from, until payments are
-/// checked some other way.
-fn operator_only(coordinator: &Coordinator, signer: &PublicKey) -> Result<(), ApiError> {
-    if *signer == coordinator.operator() {
+/// Refuses a request that only the treasury may make: saying that credits were
+/// paid for, and paying or refusing a cash-out.
+fn treasury_only(control: &ControlPlane, signer: &PublicKey) -> Result<(), ApiError> {
+    if *signer == control.control_key() {
         return Ok(());
     }
-    let message = "only the coordinator's operator may do this";
+    let message = "only the treasury may do this";
     Err(ApiError::new(
         StatusCode::FORBIDDEN,
-        "not_operator",
+        "not_treasury",
         message,
     ))
 }
@@ -412,8 +492,8 @@ fn check_address(address: &str) -> Result<(), ApiError> {
     ))
 }
 
-fn require_blob(coordinator: &Coordinator, hash: &ContentHash) -> Result<(), ApiError> {
-    if coordinator.blobs.contains(hash) {
+fn require_blob(control: &ControlPlane, hash: &ContentHash) -> Result<(), ApiError> {
+    if control.blobs.contains(hash) {
         Ok(())
     } else {
         Err(unknown_blob(hash))
@@ -488,18 +568,29 @@ impl From<OpError> for ApiError {
 
 impl From<JobError> for ApiError {
     fn from(error: JobError) -> Self {
-        let (status, code) = match error {
+        let message = error.to_string();
+        let (status, code) = match &error {
             JobError::JobExists => (StatusCode::CONFLICT, "job_exists"),
-            JobError::NoNodes => (StatusCode::BAD_REQUEST, "no_nodes"),
             JobError::DeadlinePassed => (StatusCode::BAD_REQUEST, "deadline_passed"),
             JobError::NoComputeCap => (StatusCode::BAD_REQUEST, "no_compute_cap"),
+            JobError::BadSlots => (StatusCode::BAD_REQUEST, "bad_slots"),
             JobError::UnknownJob => (StatusCode::NOT_FOUND, "unknown_job"),
-            JobError::JobClosed => (StatusCode::CONFLICT, "job_closed"),
-            JobError::NotAssigned => (StatusCode::FORBIDDEN, "not_assigned"),
-            JobError::AlreadyReported => (StatusCode::CONFLICT, "already_reported"),
+            JobError::NotTakingResults => (StatusCode::CONFLICT, "not_taking_results"),
+            JobError::NotLeased => (StatusCode::FORBIDDEN, "not_leased"),
+            JobError::AlreadyCommitted => (StatusCode::CONFLICT, "already_committed"),
+            JobError::NotTheCommitment => (StatusCode::BAD_REQUEST, "not_the_commitment"),
             JobError::UnitsOverCap => (StatusCode::BAD_REQUEST, "units_over_cap"),
+            JobError::BadPreferences(_) => (StatusCode::BAD_REQUEST, "bad_preferences"),
+            JobError::Bid(inner) => {
+                let code = match inner {
+                    BidError::UnknownBid => "unknown_bid",
+                    BidError::TooManyBids => "too_many_bids",
+                    _ => "bad_bid",
+                };
+                (StatusCode::BAD_REQUEST, code)
+            }
         };
-        Self::new(status, code, error.to_string())
+        Self::new(status, code, message)
     }
 }
 
@@ -523,7 +614,9 @@ impl From<LedgerError> for ApiError {
             LedgerError::BadPaymentName => (StatusCode::BAD_REQUEST, "bad_payment_name"),
             LedgerError::CashOutExists => (StatusCode::CONFLICT, "cash_out_exists"),
             LedgerError::UnknownCashOut => (StatusCode::NOT_FOUND, "unknown_cash_out"),
-            LedgerError::NothingEscrowed | LedgerError::FeeExceedsEscrow => {
+            LedgerError::NothingEscrowed
+            | LedgerError::FeeExceedsEscrow
+            | LedgerError::PayoutsDoNotAddUp => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "ledger_failed")
             }
         };
@@ -643,18 +736,22 @@ impl From<StoreError> for ApiError {
     }
 }
 
-impl From<DisputeError> for ApiError {
-    fn from(error: DisputeError) -> Self {
+impl From<RegistryError> for ApiError {
+    fn from(error: RegistryError) -> Self {
         let message = error.to_string();
         let (status, code) = match error {
-            DisputeError::NotAnOperator => (StatusCode::FORBIDDEN, "not_an_operator"),
-            DisputeError::OwnBatch => (StatusCode::FORBIDDEN, "own_batch"),
-            DisputeError::NoSuchBatch => (StatusCode::NOT_FOUND, "unknown_batch"),
-            DisputeError::AlreadyDisputed => (StatusCode::CONFLICT, "already_disputed"),
-            DisputeError::WindowClosed => (StatusCode::CONFLICT, "window_closed"),
-            DisputeError::BatchHolds => (StatusCode::CONFLICT, "batch_holds"),
-            DisputeError::Differs => (StatusCode::CONFLICT, "dispute_differs"),
-            DisputeError::Storage(inner) => return inner.into(),
+            RegistryError::Ledger(inner) => return inner.into(),
+            RegistryError::NoApp => (StatusCode::BAD_REQUEST, "no_app"),
+            RegistryError::NotReviewer => (StatusCode::FORBIDDEN, "not_reviewer"),
+            RegistryError::Name(inner) => match inner {
+                NameError::BadName => (StatusCode::BAD_REQUEST, "bad_name"),
+                NameError::Taken => (StatusCode::CONFLICT, "name_taken"),
+                NameError::LookAlike(_) => (StatusCode::CONFLICT, "look_alike_name"),
+                NameError::Reserved => (StatusCode::CONFLICT, "reserved_name"),
+                NameError::UnknownName => (StatusCode::NOT_FOUND, "unknown_name"),
+                NameError::NotOwner => (StatusCode::FORBIDDEN, "not_owner"),
+                NameError::AlreadyNamed => (StatusCode::CONFLICT, "already_named"),
+            },
         };
         Self::new(status, code, message)
     }

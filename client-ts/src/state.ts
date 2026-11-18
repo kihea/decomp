@@ -3,7 +3,7 @@
  * the same in Rust). Anyone can read a shard; only a job changes one.
  */
 
-import type { Coordinator } from './client';
+import type { ControlPlane } from './client';
 import { getBlob } from './jobs';
 import type { ShardNow, Signer } from './protocol';
 
@@ -18,14 +18,14 @@ export type Records = Map<string, Uint8Array>;
  * to holds none.
  */
 export async function readShard(
-  coordinator: Coordinator,
+  control: ControlPlane,
   signer: Signer,
   app: string,
   shard: string,
 ): Promise<Records> {
-  const now = await coordinator.request<ShardNow>(signer, { type: 'get_state', app, shard });
+  const now = await control.request<ShardNow>(signer, { type: 'get_state', app, shard });
   if (now.contents === null) return new Map();
-  return decodeRecords(await getBlob(coordinator, signer, now.contents));
+  return decodeRecords(await getBlob(control, signer, now.contents));
 }
 
 /**

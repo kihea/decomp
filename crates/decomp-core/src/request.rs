@@ -1,17 +1,20 @@
-//! Requests a device sends to the coordinator and the shapes of its answers.
-//! Changes to an account are not here: those are `AccountOp`s, which are logged.
+//! Requests a device sends to the control plane and the shapes of its answers
+//! (spec, "Interfaces"). Changes to an account are not here: those are
+//! `AccountOp`s, which are logged.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::account::Account;
+use crate::app::AppManifest;
 use crate::envelope::Envelope;
-use crate::job::{Assignment, JobResult, Manifest};
+use crate::job::{JobResult, Lease, Manifest};
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, SealingKey};
 use crate::ledger::{Balance, CashOut, Credits};
+use crate::market::{Bid, BidOrder, Rate, WorkPreferences};
+use crate::registry::NameRecord;
 use crate::relay::{Incoming, RelayOrder};
-use crate::settlement::{Change, Through};
 use crate::storage::{Challenge, StoreOrder, Waiting};
 
 /// The largest request or answer either side accepts. A blob travels inside one
@@ -23,7 +26,8 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
 
 /// A signed request. `issued_at` (seconds since 1970) must be close to the
-/// coordinator's clock, which bounds how long a captured request can be replayed.
+/// control plane's clock, which bounds how long a captured request can be
+/// replayed.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -39,12 +43,16 @@ pub enum Call {
     GetAccount,
     /// Stores bytes and names them by their hash. Answer: `BlobRef`.
     PutBlob { data: Blob },
+    /// The bytes stored under a hash. Anyone who knows the hash may ask.
     /// Answer: `BlobData`.
     GetBlob { hash: ContentHash },
     /// Submits a job, billed to the signer's account. Answer: `Submitted`.
     SubmitJob { manifest: Manifest },
-    /// Answer: `JobStatus`.
-    GetJob { job_id: JobId },
+    /// Where a job stands, and its receipt once it has one. Answer: `JobStatus`.
+    GetReceipt { job_id: JobId },
+    /// What a job would cost if submitted now: the posted rate for its class
+    /// and tier, and the most it can cost. Answer: `Quote`.
+    QuoteJob { manifest: Manifest },
     /// The contents a shard of an app's state has now, to be fetched as a blob
     /// and read as records (see `state`). Answer: `ShardNow`.
     GetState { app: AccountId, shard: String },
@@ -56,13 +64,72 @@ pub enum Call {
     Unstake { amount: Credits },
     /// How far the signing node is trusted. Answer: `Standing`.
     GetStanding,
-    /// A node reporting that it is online and asking for its work. `address` is
-    /// where other devices can connect to it, if they can; a node that gives one
-    /// may be asked to hold data. Answer: `CheckedIn`.
-    CheckIn {
+    /// A node asking for work. It is granted leases at random among the nodes
+    /// asking, within its owner's work preferences. `address` is where other
+    /// devices can connect to it, if they can; a node that gives one may be
+    /// asked to hold data and carry relays. Answer: `LeasesGranted`.
+    RequestLease {
         #[serde(default)]
         address: Option<String>,
     },
+    /// A node committing the hash of its result for a job it holds a lease on
+    /// (see `JobResult::commitment`). Answer: an empty object.
+    CommitResult {
+        job_id: JobId,
+        commitment: ContentHash,
+    },
+    /// A node revealing the result it committed to, with the salt it committed
+    /// with. Answer: an empty object.
+    RevealResult {
+        result: JobResult,
+        salt: ContentHash,
+    },
+    /// A device's work preferences. Any device of the same account may ask.
+    /// Answer: `WorkPreferences`.
+    GetWorkPreferences { device: PublicKey },
+    /// Sets a device's work preferences. Any device of the same account may set
+    /// them. Answer: `WorkPreferences`.
+    SetWorkPreferences {
+        device: PublicKey,
+        preferences: WorkPreferences,
+    },
+    /// Places a standing bid for the signer's account. Answer: `Bid`.
+    PlaceBid { bid: BidOrder },
+    /// Withdraws one of the account's bids. Answer: an empty object.
+    CancelBid { id: ContentHash },
+    /// The account's live bids. Answer: `Bids`.
+    ListBids,
+    /// Every posted rate. Answer: `Rates`.
+    GetRates,
+    /// What the account earned and spent since `since`. Answer: `Activity`.
+    GetActivity { since: u64 },
+    /// Registers a name for the signer's app (see `registry`). The deposit is
+    /// set aside from the account. Answer: `NameRecord`.
+    RegisterName { name: String },
+    /// Starts a name's term again. Answer: `NameRecord`.
+    RenewName { name: String },
+    /// Returns a name to the pool and its deposit to the account. Answer: an
+    /// empty object.
+    ReleaseName { name: String },
+    /// What a name points to. Anyone may ask. Answer: `Resolved`.
+    ResolveName { name: String },
+    /// Names in order, after `from`; with `query`, only names that contain it.
+    /// Anyone may ask. Answer: `Directory`.
+    ListDirectory {
+        #[serde(default)]
+        verified_only: bool,
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        from: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    /// A reviewer marking an app reviewed or not. Answer: `NameRecord`.
+    SetVerified { name: String, verified: bool },
+    /// A reviewer assigning a held brand name to the app whose owner proved
+    /// they own the brand. Answer: `NameRecord`.
+    AssignName { name: String, app: AccountId },
     /// Pays to have a blob held by nodes for `days` days. The blob is named by its
     /// hash-tree root (see `merkle`) and is then uploaded to the nodes in the
     /// answer. With `to`, the blob is left for that device, which is told it is
@@ -103,12 +170,10 @@ pub enum Call {
     /// a `Take` in which the receiver signed for that frame. Answer: an empty
     /// object.
     RedeemRelay { header: Envelope, receipt: Envelope },
-    /// A node reporting what a job produced. Answer: an empty object.
-    SubmitResult { result: JobResult },
-    /// The coordinator's operator recording that `account` bought `amount`
-    /// credits with the payment named `payment` (spec section 5: "Credits can
-    /// be bought and cashed out for money"). Only the operator's own key is
-    /// answered. Answer: an empty object.
+    /// The treasury recording that `account` bought `amount` credits with the
+    /// payment named `payment` (spec section 5: "Credits can be bought and
+    /// cashed out for money"). Only the treasury's key is answered. Answer: an
+    /// empty object.
     CreditPurchase {
         account: AccountId,
         amount: Credits,
@@ -118,13 +183,13 @@ pub enum Call {
     /// by the account key itself, not a device (spec section 1: the account
     /// key signs "cash-outs"). Answer: `CashOutAsked`.
     CashOut { amount: Credits },
-    /// The cash-outs that wait to be paid or refused. Only the operator's own
-    /// key is answered. Answer: `CashOuts`.
+    /// The cash-outs that wait to be paid or refused. Only the treasury's key
+    /// is answered. Answer: `CashOuts`.
     GetCashOuts,
-    /// The operator recording that a cash-out was paid, by the payment named
+    /// The treasury recording that a cash-out was paid, by the payment named
     /// `payout`: its credits are gone for good. Answer: an empty object.
     PayCashOut { id: ContentHash, payout: String },
-    /// The operator refusing a cash-out: its credits go back to the account.
+    /// The treasury refusing a cash-out: its credits go back to the account.
     /// Answer: an empty object.
     RefuseCashOut { id: ContentHash },
     /// The settlement log from entry number `from` on, counting from zero, at
@@ -133,25 +198,10 @@ pub enum Call {
     /// Proof that the receipt of a job is in a batch. Whoever knows a job's ID
     /// may ask: its submitter and the nodes that ran it. Answer: `Inclusion`.
     GetInclusion { job_id: JobId },
-    /// The draws the operator has published, from number `from` on, counting
+    /// The draws the job board has published, from number `from` on, counting
     /// from zero, at most `MAX_LOG_PAGE` of them. Each is a `Draw` signed by
-    /// the operator (see `draw`). Answer: `LogPage`.
+    /// the control plane (see `draw`). Answer: `LogPage`.
     GetDraws { from: u64 },
-    /// An operator asking for the records behind another operator's batches,
-    /// from the places `from` gives, at most `MAX_LOG_PAGE` of each kind.
-    /// Account records are not public, so only an operator is answered: a
-    /// device of an account that has stake. Answer: `BatchRecords`.
-    GetRecords { from: Through },
-    /// An operator disputing a batch it has audited: `fingerprint` and
-    /// `changes` are what the records behind batch number `batch` give. If the
-    /// keeper of the log finds the same, the signed request goes into the log
-    /// and the operator that posted the batch forfeits its stake. Answer: an
-    /// empty object.
-    DisputeBatch {
-        batch: u64,
-        fingerprint: ContentHash,
-        changes: Vec<Change>,
-    },
 }
 
 /// An account record together with its credits. Changing an account answers
@@ -161,6 +211,12 @@ pub struct AccountStatus {
     #[serde(flatten)]
     pub account: Account,
     pub balance: Balance,
+    /// The combined reliability of the account's devices, from 0 to 1.
+    #[serde(default)]
+    pub reputation: f64,
+    /// When the account first appeared, in seconds since 1970.
+    #[serde(default)]
+    pub created: u64,
 }
 
 /// The name a cash-out was given, to pay or refuse it by.
@@ -195,10 +251,24 @@ pub struct Submitted {
     pub job_id: JobId,
 }
 
+/// What a job would cost if submitted now.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CheckedIn {
-    /// The job the node should be running, if any.
-    pub assignment: Option<Assignment>,
+pub struct Quote {
+    pub rate: Rate,
+    /// What the fallback runs at, per unit, if the job asks for one.
+    pub fallback_micros_per_unit: u64,
+    /// The most the job (all its pieces, if it is split) can cost: what must
+    /// be set aside as `max_fee`.
+    pub highest_fee: Credits,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LeasesGranted {
+    /// Every lease the node holds and has not committed a result for.
+    pub leases: Vec<Lease>,
+    /// Jobs whose results the node committed and should reveal now.
+    #[serde(default)]
+    pub reveal: Vec<JobId>,
     /// Blobs the node has been asked to hold and has not yet confirmed.
     #[serde(default)]
     pub store: Vec<StoreOrder>,
@@ -208,6 +278,39 @@ pub struct CheckedIn {
     /// The open channels the node is asked to carry.
     #[serde(default)]
     pub relay: Vec<RelayOrder>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Bids {
+    pub bids: Vec<Bid>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Rates {
+    pub rates: Vec<Rate>,
+}
+
+/// What an account earned and spent over a stretch of time.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Activity {
+    /// Paid to the account for its nodes' work and checks.
+    pub earned: Credits,
+    /// Paid by the account for jobs and data services.
+    pub spent: Credits,
+}
+
+/// A name, the app it points to, and that app's manifest.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Resolved {
+    #[serde(flatten)]
+    pub record: NameRecord,
+    pub manifest: AppManifest,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Directory {
+    pub entries: Vec<Resolved>,
+    pub next: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

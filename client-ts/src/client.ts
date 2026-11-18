@@ -1,9 +1,12 @@
-/** Talks to a coordinator's HTTP API (crates/decomp-coordinator/src/api.rs). */
+/**
+ * Talks to the control plane: a local devnet (`crates/decomp-devnet`) or a
+ * gateway to the network's canisters. Both take the same signed calls.
+ */
 
 import { type Account, type AccountOp, type Call, type Envelope, now, seal, type Signer } from './protocol';
 
-/** A request the coordinator refused or that never reached it. */
-export class CoordinatorError extends Error {
+/** A request the control plane refused or that never reached it. */
+export class ControlPlaneError extends Error {
   /** The API's error code, `unreachable` if no response came, or `unexpected`. */
   readonly code: string;
 
@@ -13,8 +16,8 @@ export class CoordinatorError extends Error {
   }
 }
 
-/** One coordinator, as a device sees it. Every call is signed by the device. */
-export type Coordinator = {
+/** The control plane, as a device sees it. Every call is signed by the device. */
+export type ControlPlane = {
   /** Signs and submits a change to an account; resolves with the changed account. */
   submitOp(signer: Signer, op: AccountOp): Promise<Account>;
   /** Fetches the account `signer` belongs to. */
@@ -23,8 +26,8 @@ export type Coordinator = {
   request<Answer>(signer: Signer, call: Call): Promise<Answer>;
 };
 
-/** Makes a client for the coordinator at `url`, such as `http://127.0.0.1:8787`. */
-export function connect(url: string): Coordinator {
+/** Makes a client for the control plane at `url`, such as `http://127.0.0.1:8787`. */
+export function connect(url: string): ControlPlane {
   async function post<Answer>(path: string, envelope: Envelope): Promise<Answer> {
     let response: Response;
     try {
@@ -34,13 +37,13 @@ export function connect(url: string): Coordinator {
         body: JSON.stringify(envelope),
       });
     } catch {
-      throw new CoordinatorError('unreachable', 'The coordinator could not be reached.');
+      throw new ControlPlaneError('unreachable', 'The network could not be reached.');
     }
     const body = await response.json().catch(() => null);
     if (!response.ok) {
-      throw new CoordinatorError(
+      throw new ControlPlaneError(
         body?.error ?? 'unexpected',
-        body?.message ?? `The coordinator answered with status ${response.status}.`,
+        body?.message ?? `The network answered with status ${response.status}.`,
       );
     }
     return body;

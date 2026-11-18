@@ -1,14 +1,15 @@
-//! Client for the coordinator's request endpoint, signing as this device.
+//! Client for the control plane's request endpoint, signing as this device.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decomp_core::LogError;
 use decomp_core::{
-    AccountId, AccountOp, AccountStatus, AppManifest, Approval, BatchRecords, Blob, BlobData,
-    BlobRef, Call, CashOut, CashOuts, Challenge, Change, CheckedIn, ContentHash, Credits, Envelope,
-    Inclusion, IncomingChannels, JobId, JobResult, JobStatus, Located, LogPage, MAX_LOG_PAGE,
-    MAX_MESSAGE_BYTES, Manifest, Placement, PublicKey, PublishedKey, Refusal, Request, Route,
-    SealingKey, SettlementLog, ShardNow, SigningKey, Standing, Submitted, Through, seal,
+    AccountId, AccountOp, AccountStatus, Activity, AppManifest, Approval, Bid, BidOrder, Bids,
+    Blob, BlobData, BlobRef, Call, CashOut, CashOuts, Challenge, ContentHash, Credits, Directory,
+    Envelope, Inclusion, IncomingChannels, JobId, JobResult, JobStatus, LeasesGranted, Located,
+    LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES, Manifest, NameRecord, Placement, PublicKey,
+    PublishedKey, Quote, Rates, Refusal, Request, Resolved, Route, SealingKey, SettlementLog,
+    ShardNow, SigningKey, Standing, Submitted, WorkPreferences, seal,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -17,14 +18,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    /// The coordinator understood the request and said no.
+    /// The control plane understood the request and said no.
     #[error("{message}")]
     Refused { code: String, message: String },
-    #[error("could not reach the coordinator: {0}")]
+    #[error("could not reach the control plane: {0}")]
     Unreachable(String),
-    #[error("the coordinator sent a blob that does not match its hash")]
+    #[error("the control plane sent a blob that does not match its hash")]
     CorruptBlob,
-    #[error("entry {0} of the coordinator's settlement log does not hold: {1}")]
+    #[error("entry {0} of the settlement log does not hold: {1}")]
     BadLog(u64, LogError),
 }
 
@@ -86,6 +87,14 @@ impl Client {
         self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
     }
 
+    /// Creates an account whose account key is this client's key, with `device`
+    /// as its first device. The account key then signs only rarely: approving
+    /// and revoking devices, changing controllers, and cash-outs.
+    pub fn create_account(&self, device: PublicKey) -> Result<AccountStatus, ClientError> {
+        let op = AccountOp::CreateAccount { device_key: device };
+        self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
+    }
+
     /// Starts the recovery of this device into the account `account_id`, with
     /// what the account's controllers signed to approve it.
     pub fn recover(
@@ -121,7 +130,7 @@ impl Client {
         self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
     }
 
-    /// As the coordinator's operator: records that `account` bought `amount`
+    /// As the treasury: records that `account` bought `amount`
     /// credits with the payment named `payment`.
     pub fn credit_purchase(
         &self,
@@ -144,7 +153,7 @@ impl Client {
         Ok(waiting)
     }
 
-    /// As the coordinator's operator: records that a cash-out was paid by the
+    /// As the treasury: records that a cash-out was paid by the
     /// payment named `payout`.
     pub fn pay_cash_out(&self, id: ContentHash, payout: String) -> Result<(), ClientError> {
         self.call::<IgnoredAny>(Call::PayCashOut { id, payout })?;
@@ -197,16 +206,99 @@ impl Client {
         Ok(submitted.job_id)
     }
 
+    /// Where a job stands, with its receipt once it has one.
     pub fn job(&self, job_id: JobId) -> Result<JobStatus, ClientError> {
-        self.call(Call::GetJob { job_id })
+        self.call(Call::GetReceipt { job_id })
     }
 
-    /// Reports that this node is online and learns what it should be doing.
-    /// `address` is where other devices can connect to it, if they can.
-    pub fn check_in(&self, address: Option<&str>) -> Result<CheckedIn, ClientError> {
-        self.call(Call::CheckIn {
+    /// What a job would cost if submitted now.
+    pub fn quote(&self, manifest: Manifest) -> Result<Quote, ClientError> {
+        self.call(Call::QuoteJob { manifest })
+    }
+
+    /// Asks for work and learns what this node should be doing: its leases,
+    /// results to reveal, blobs to take in, a storage challenge, and channels
+    /// to carry. `address` is where other devices can connect to it, if they
+    /// can.
+    pub fn request_lease(&self, address: Option<&str>) -> Result<LeasesGranted, ClientError> {
+        self.call(Call::RequestLease {
             address: address.map(String::from),
         })
+    }
+
+    /// Commits to a result for a leased job.
+    pub fn commit_result(&self, job_id: JobId, commitment: ContentHash) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::CommitResult { job_id, commitment })?;
+        Ok(())
+    }
+
+    /// Reveals a committed result.
+    pub fn reveal_result(&self, result: JobResult, salt: ContentHash) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::RevealResult { result, salt })?;
+        Ok(())
+    }
+
+    /// A device's work preferences. Any device of the same account may ask.
+    pub fn work_preferences(&self, device: PublicKey) -> Result<WorkPreferences, ClientError> {
+        self.call(Call::GetWorkPreferences { device })
+    }
+
+    pub fn set_work_preferences(
+        &self,
+        device: PublicKey,
+        preferences: WorkPreferences,
+    ) -> Result<WorkPreferences, ClientError> {
+        self.call(Call::SetWorkPreferences {
+            device,
+            preferences,
+        })
+    }
+
+    pub fn place_bid(&self, bid: BidOrder) -> Result<Bid, ClientError> {
+        self.call(Call::PlaceBid { bid })
+    }
+
+    pub fn cancel_bid(&self, id: ContentHash) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::CancelBid { id })?;
+        Ok(())
+    }
+
+    pub fn bids(&self) -> Result<Vec<Bid>, ClientError> {
+        let bids: Bids = self.call(Call::ListBids)?;
+        Ok(bids.bids)
+    }
+
+    pub fn rates(&self) -> Result<Rates, ClientError> {
+        self.call(Call::GetRates)
+    }
+
+    pub fn activity(&self, since: u64) -> Result<Activity, ClientError> {
+        self.call(Call::GetActivity { since })
+    }
+
+    pub fn register_name(&self, name: String) -> Result<NameRecord, ClientError> {
+        self.call(Call::RegisterName { name })
+    }
+
+    pub fn resolve_name(&self, name: String) -> Result<Resolved, ClientError> {
+        self.call(Call::ResolveName { name })
+    }
+
+    pub fn directory(
+        &self,
+        verified_only: bool,
+        from: Option<String>,
+    ) -> Result<Directory, ClientError> {
+        self.call(Call::ListDirectory {
+            verified_only,
+            query: None,
+            from,
+            limit: None,
+        })
+    }
+
+    pub fn set_verified(&self, name: String, verified: bool) -> Result<NameRecord, ClientError> {
+        self.call(Call::SetVerified { name, verified })
     }
 
     /// Pays to have a blob held for `days` days; answers with where to upload it.
@@ -284,13 +376,8 @@ impl Client {
         Ok(())
     }
 
-    pub fn submit_result(&self, result: JobResult) -> Result<(), ClientError> {
-        self.call::<IgnoredAny>(Call::SubmitResult { result })?;
-        Ok(())
-    }
-
-    /// The coordinator's settlement log, checked from its first entry: every
-    /// entry is signed by the one operator and follows the entry before it.
+    /// The settlement log, checked from its first entry: every entry is signed
+    /// by the one control-plane key and follows the entry before it.
     pub fn settlement_log(&self) -> Result<SettlementLog, ClientError> {
         let mut log = SettlementLog::default();
         let mut from = 0;
@@ -307,35 +394,12 @@ impl Client {
         }
     }
 
-    /// A page of the coordinator's settlement log, from entry `from` on.
+    /// A page of the settlement log, from entry `from` on.
     pub fn log_page(&self, from: u64) -> Result<LogPage, ClientError> {
         self.call(Call::GetLog { from })
     }
 
-    /// A page of the records behind the coordinator's batches, from the places
-    /// `from` gives. Only an operator is answered.
-    pub fn records(&self, from: Through) -> Result<BatchRecords, ClientError> {
-        self.call(Call::GetRecords { from })
-    }
-
-    /// Disputes batch number `batch`: `fingerprint` and `changes` are what the
-    /// records behind it give.
-    pub fn dispute(
-        &self,
-        batch: u64,
-        fingerprint: ContentHash,
-        changes: Vec<Change>,
-    ) -> Result<(), ClientError> {
-        let call = Call::DisputeBatch {
-            batch,
-            fingerprint,
-            changes,
-        };
-        self.call::<IgnoredAny>(call)?;
-        Ok(())
-    }
-
-    /// A page of the draws the operator has published, from number `from` on.
+    /// A page of the draws the job board has published, from number `from` on.
     pub fn draws(&self, from: u64) -> Result<LogPage, ClientError> {
         self.call(Call::GetDraws { from })
     }

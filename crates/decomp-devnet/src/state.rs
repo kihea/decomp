@@ -1,52 +1,55 @@
-//! Everything the coordinator knows, and where each part is kept.
+//! Everything the local network's control plane knows, and where each part
+//! is kept. On the Internet Computer each part lives in the stable memory of
+//! the canister that owns it (spec, "Planes and components"); here each is a
+//! log file in the data directory.
 //!
-//! | Part | Kept in | Survives a restart |
-//! | --- | --- | --- |
-//! | Account records | `ops.jsonl`, replayed at startup | Yes |
-//! | Balances | `ops.jsonl` (starter grants) and `ledger.jsonl`, replayed at startup | Yes |
-//! | Node scores | `scores.jsonl`, replayed at startup | Yes |
-//! | Blobs | `blobs/`, one file per hash | Yes |
-//! | Receipts | `receipts.jsonl` | Yes |
-//! | The settlement log: batches, signed by the operator | `settlement.jsonl`, checked from its first entry at startup | Yes |
-//! | The operator's key | `operator.key` | Yes |
-//! | The draws of closed jobs, signed by the operator | `draws.jsonl` | Yes |
-//! | Disputes of batches that were upheld | `settlement.jsonl`, with the batches | Yes |
-//! | Which nodes hold which blobs | `storage.jsonl`, replayed at startup | Yes |
-//! | Relay channels | `relays.jsonl`, replayed at startup | Yes |
-//! | The sealing key each device published | `sealing.jsonl`, replayed at startup | Yes |
-//! | What each shard of app state holds now | `state.jsonl`, replayed at startup | Yes |
-//! | Open jobs, online nodes, and unanswered challenges | Memory | No, by design (spec section 6) |
-//!
-//! `settlement.jsonl` is the "local signed log" that stands in for the ledger
-//! during development (spec section 6). The other files are the coordinator's
-//! own records, which the batches in it are made from.
+//! | Part | Canister | Kept in | Survives a restart |
+//! | --- | --- | --- | --- |
+//! | Account records | Accounts | `ops.jsonl` | Yes |
+//! | Balances | Accounts | `ops.jsonl` (starter grants) and `ledger.jsonl` | Yes |
+//! | When each account appeared, and what it earned and spent | Accounts | `activity.jsonl` | Yes |
+//! | Names | Registry | `registry.jsonl` | Yes |
+//! | Node scores | Job board | `scores.jsonl` | Yes |
+//! | Work preferences and standing bids | Job board | `market.jsonl` | Yes |
+//! | Receipts | Receipts | `receipts.jsonl` | Yes |
+//! | The settlement log: batches, signed by the control plane | Receipts | `settlement.jsonl` | Yes |
+//! | The draws of closed jobs, signed by the control plane | Job board | `draws.jsonl` | Yes |
+//! | Which nodes hold which blobs | Storage placement | `storage.jsonl` | Yes |
+//! | Relay channels | Relay placement | `relays.jsonl` | Yes |
+//! | The sealing key each device published | Accounts | `sealing.jsonl` | Yes |
+//! | What each shard of app state holds now | Records | `state.jsonl` | Yes |
+//! | Blobs | Storage nodes; this process holds a copy of job inputs and outputs | `blobs/` | Yes |
+//! | Open jobs, leases, commitments, nodes asking, unanswered challenges | Job board | Memory | No, by design (spec, "Data management") |
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
 
+use decomp_core::market::{BALANCED_LOOKBACK_SECS, fallback_rate};
 use decomp_core::{
-    Account, AccountId, AccountStatus, Accounts, Assignment, Auditor, BatchRecords, Beacon,
-    CashOut, Challenge, Change, CheckedIn, Closure, Conduct, ContentHash, Credits, Envelope,
-    EnvelopeError, Finding, FollowUps, Hosts, Inclusion, IncomingChannels, JobError, JobId,
-    JobStatus, Jobs, Ledger, LedgerAddress, LedgerEntry, LedgerError, Located, LogPage,
-    MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES, MAX_READS, MAX_SHARD_NAME_BYTES,
-    Manifest, Merge, OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT, Penalty, Placement,
-    Posted, PrivacyError, PublicKey, Receipt, RelayEntry, RelayError, Relays, Route, ScoreEvent,
-    Scores, SealingKeys, SettlementLog, ShardRef, SigningKey, Splits, SponsorError, Sponsored,
-    Standing, StateEntry, States, Storage, StorageEntry, StorageError, Storing, Through,
-    UpheldDispute, channel_id, fee, merkle, privacy, settlement,
+    Account, AccountId, AccountStanding, AccountStatus, Accounts, Activity, Beacon, Bid, BidOrder,
+    CashOut, Challenge, Closure, Conduct, ContentHash, Credits, Directory, Envelope, EnvelopeError,
+    FallBackJob, FollowUps, Hosts, Inclusion, IncomingChannels, JobError, JobId, JobResult,
+    JobStatus, Jobs, LeasesGranted, Ledger, LedgerAddress, LedgerEntry, LedgerError, Located,
+    LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES, MAX_READS,
+    MAX_SHARD_NAME_BYTES, Manifest, Merge, NAME_DEPOSIT, NameError, NameRecord, OpError, Opening,
+    Outcome, PROBATION_FORFEIT_PERCENT, Payout, Penalty, Placement, Posted, PrivacyError,
+    PublicKey, Quote, Receipt, Registry, RegistryEntry, RelayEntry, RelayError, Relays, Resolved,
+    Route, ScoreEvent, Scores, SealingKeys, SettlementLog, ShardRef, SigningKey, Splits,
+    SponsorError, Sponsored, Standing, Standings, StateEntry, States, Storage, StorageEntry,
+    StorageError, Storing, Through, WorkPreferences, channel_id, compute_fee, merkle, privacy,
+    settlement,
 };
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
 use decomp_schema::{Mismatch, Signature};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::blobs::Blobs;
+use crate::key;
 use crate::log::Log;
-use crate::operator;
 use crate::referee::{Case, Verdict};
 
 /// Why a blob was not accepted for storage.
@@ -82,26 +85,17 @@ pub enum InclusionError {
     Storage(#[from] io::Error),
 }
 
-/// Why an operator was not handed records, or its dispute of a batch was not
-/// upheld.
+/// Why a name was not registered or changed.
 #[derive(Debug, thiserror::Error)]
-pub enum DisputeError {
-    #[error("only an operator is answered: a device of an account that has stake")]
-    NotAnOperator,
-    #[error("an operator cannot dispute its own batch")]
-    OwnBatch,
-    #[error("there is no batch with that number")]
-    NoSuchBatch,
-    #[error("the batch was already disputed")]
-    AlreadyDisputed,
-    #[error("the batch's dispute window has closed")]
-    WindowClosed,
-    #[error("the batch holds: the records give what was posted")]
-    BatchHolds,
-    #[error("the batch does not hold, and the records do not give what the dispute says either")]
-    Differs,
+pub enum RegistryError {
     #[error(transparent)]
-    Storage(#[from] io::Error),
+    Name(#[from] NameError),
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
+    #[error("only an account that has published an app can hold a name")]
+    NoApp,
+    #[error("only a reviewer may do this")]
+    NotReviewer,
 }
 
 /// Why a job was not accepted.
@@ -141,17 +135,60 @@ pub enum SubmitError {
     Privacy(#[from] PrivacyError),
 }
 
-/// The waiting times a coordinator is started with, each in seconds.
-pub struct Waits {
-    /// How long a stored blob goes between challenges.
+/// The settings a local network is started with.
+pub struct Settings {
+    /// How long a stored blob goes between challenges, in seconds.
     pub challenge_interval: u64,
-    /// How long after a batch is posted it may be disputed.
-    pub dispute_window: u64,
-    /// How long a recovery waits before it takes effect.
+    /// How long a recovery waits before it takes effect, in seconds.
     pub recovery_wait: u64,
+    /// The accounts allowed to review apps and assign held names.
+    pub reviewers: Vec<AccountId>,
+    /// Brand names held until a reviewer assigns them.
+    pub reserved_names: Vec<String>,
 }
 
-pub struct Coordinator {
+/// What `market.jsonl` records: changes to work preferences and bids.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MarketEntry {
+    Preferences {
+        device: PublicKey,
+        preferences: WorkPreferences,
+    },
+    Bid {
+        account: AccountId,
+        id: ContentHash,
+        order: BidOrder,
+        at: u64,
+    },
+    Cancel {
+        account: AccountId,
+        id: ContentHash,
+    },
+}
+
+/// What `activity.jsonl` records: when each account appeared, and credits it
+/// earned and spent, with the time.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ActivityEntry {
+    Created {
+        account: AccountId,
+        at: u64,
+    },
+    Earned {
+        account: AccountId,
+        amount: Credits,
+        at: u64,
+    },
+    Spent {
+        account: AccountId,
+        amount: Credits,
+        at: u64,
+    },
+}
+
+pub struct ControlPlane {
     pub accounts: Accounts,
     ops: Log,
     ledger: Ledger,
@@ -171,12 +208,26 @@ pub struct Coordinator {
     /// and each job's place in that order. Batches are made from these.
     receipt_hashes: Vec<ContentHash>,
     receipt_of: HashMap<JobId, u64>,
-    /// The key the operator of this coordinator signs the settlement log with.
-    operator: SigningKey,
+    /// The key the settlement log and draws are signed with, which is also the
+    /// treasury's.
+    control: SigningKey,
     settlement: SettlementLog,
     settlement_log: Log,
-    /// The draws of jobs that have closed, each signed by the operator.
+    /// The draws of jobs that have closed, each signed by the control plane.
     draws_log: Log,
+    registry: Registry,
+    registry_log: Log,
+    reviewers: Vec<AccountId>,
+    market_log: Log,
+    activity_log: Log,
+    /// When each account appeared.
+    created: HashMap<AccountId, u64>,
+    /// Who set aside each open job's fee.
+    escrow_payer: HashMap<JobId, AccountId>,
+    /// Jobs to run as an always-on fallback.
+    fall_backs: Vec<(JobId, FallBackJob)>,
+    /// Credits each account earned and spent, with the time, oldest first.
+    activity: Vec<ActivityEntry>,
     /// The nodes other devices can connect to, which hold and relay data.
     hosts: Hosts,
     storage: Storage,
@@ -189,19 +240,16 @@ pub struct Coordinator {
     sealing_log: Log,
     /// How long a stored blob goes between challenges, in seconds.
     challenge_interval: u64,
-    /// How long after a batch is posted it may be disputed, in seconds.
-    dispute_window: u64,
-    /// How long a recovery waits before it takes effect, in seconds.
-    recovery_wait: u64,
 }
 
-impl Coordinator {
-    pub fn open(data_dir: &Path, waits: Waits) -> io::Result<Self> {
-        let Waits {
+impl ControlPlane {
+    pub fn open(data_dir: &Path, settings: Settings) -> io::Result<Self> {
+        let Settings {
             challenge_interval,
-            dispute_window,
             recovery_wait,
-        } = waits;
+            reviewers,
+            reserved_names,
+        } = settings;
         fs::create_dir_all(data_dir)?;
 
         let mut accounts = Accounts::waiting(recovery_wait);
@@ -244,6 +292,52 @@ impl Coordinator {
             Ok(())
         })?;
 
+        let mut registry = Registry::default();
+        for name in reserved_names {
+            registry.apply(&RegistryEntry::Reserve { name });
+        }
+        let registry_log = replay(&data_dir.join("registry.jsonl"), |entry: RegistryEntry| {
+            registry.apply(&entry);
+            Ok(())
+        })?;
+
+        let mut jobs = Jobs::default();
+        let market_log = replay(&data_dir.join("market.jsonl"), |entry: MarketEntry| {
+            match entry {
+                MarketEntry::Preferences {
+                    device,
+                    preferences,
+                } => jobs
+                    .set_preferences(device, preferences)
+                    .map_err(|e| e.to_string()),
+                MarketEntry::Bid {
+                    account,
+                    id,
+                    order,
+                    at,
+                } => {
+                    // A bid that has lapsed since is refused here, and that is fine.
+                    let _ = jobs.place_bid(account, order, id, at);
+                    Ok(())
+                }
+                MarketEntry::Cancel { account, id } => {
+                    let _ = jobs.cancel_bid(&account, &id);
+                    Ok(())
+                }
+            }
+        })?;
+
+        let mut created = HashMap::new();
+        let mut activity = Vec::new();
+        let activity_log = replay(&data_dir.join("activity.jsonl"), |entry: ActivityEntry| {
+            if let ActivityEntry::Created { account, at } = entry {
+                created.insert(account, at);
+            } else {
+                activity.push(entry);
+            }
+            Ok(())
+        })?;
+
         let receipts = Log::open(&data_dir.join("receipts.jsonl"))?;
         let mut receipt_hashes = Vec::new();
         let mut receipt_of = HashMap::new();
@@ -274,7 +368,7 @@ impl Coordinator {
         }
 
         // Open jobs do not survive a restart, so hand back what was set aside for
-        // any job that was still open when the coordinator last stopped.
+        // any job that was still open when the network last stopped.
         for job_id in ledger.escrowed_jobs() {
             let refund = LedgerEntry::Refund { job_id };
             ledger
@@ -291,17 +385,26 @@ impl Coordinator {
             scores,
             scores_log,
             blobs: Blobs::open(data_dir.join("blobs"))?,
-            jobs: Jobs::default(),
+            jobs,
             sponsored: Sponsored::default(),
             splits: Splits::default(),
             signatures: HashMap::new(),
             receipts,
             receipt_hashes,
             receipt_of,
-            operator: operator::key(data_dir)?,
+            control: key::control_key(data_dir)?,
             settlement,
             settlement_log,
             draws_log: Log::open(&data_dir.join("draws.jsonl"))?,
+            registry,
+            registry_log,
+            reviewers,
+            market_log,
+            activity_log,
+            created,
+            escrow_payer: HashMap::new(),
+            fall_backs: Vec::new(),
+            activity,
             hosts: Hosts::default(),
             storage,
             storage_log,
@@ -312,19 +415,18 @@ impl Coordinator {
             sealing_keys,
             sealing_log,
             challenge_interval,
-            dispute_window,
-            recovery_wait,
         })
     }
 
-    /// The key that signs this coordinator's settlement log.
-    pub fn operator(&self) -> PublicKey {
-        self.operator.public_key()
+    /// The key that signs the settlement log and draws, which is also the
+    /// treasury's.
+    pub fn control_key(&self) -> PublicKey {
+        self.control.public_key()
     }
 
     /// Posts a batch to the settlement log (spec section 6: "Every 10 minutes
-    /// (starting value) the coordinator combines the new receipts into one
-    /// fingerprint and posts it with the net balance change per account").
+    /// (starting value) the receipts canister combines the new receipts into
+    /// one fingerprint and posts it with the net balance change per account").
     /// Nothing is posted when there is no new receipt and no balance changed.
     pub fn post_batch(&mut self, now: u64) {
         let through = Through {
@@ -343,122 +445,11 @@ impl Coordinator {
     /// Signs an entry and adds it to the settlement log.
     fn post(&mut self, now: u64, posted: Posted) {
         let entry = self.settlement.entry(now, posted);
-        let entry = Envelope::seal(&self.operator, &entry);
+        let entry = Envelope::seal(&self.control, &entry);
         self.settlement
             .apply(&entry)
-            .expect("the coordinator's own entry follows the log's rules");
+            .expect("the control plane's own entry follows the log's rules");
         self.settlement_log.append(&entry);
-    }
-
-    /// The account the operator's key is a device of, if it has been approved
-    /// into one. That account's stake is the operator's stake.
-    pub fn operator_account(&self) -> Option<AccountId> {
-        let account = self.accounts.account_of(&self.operator.public_key());
-        account.map(|account| account.id)
-    }
-
-    /// Whether the last batch this operator posted can still be disputed.
-    pub fn has_open_batch(&self, now: u64) -> bool {
-        let last = self.settlement.batches().len().checked_sub(1);
-        let posted_at = last.and_then(|last| self.settlement.posted_at(last as u64));
-        posted_at.is_some_and(|at| now <= at + self.dispute_window)
-    }
-
-    /// Whether `account` is an operator's: one with stake (spec section 6:
-    /// "Several staked operators run coordinators").
-    fn is_operator(&self, account: &AccountId) -> bool {
-        self.ledger.balance(account).staked > Credits::ZERO
-    }
-
-    /// Hands another operator a page of the records behind this one's batches,
-    /// from the places `from` gives, so that it can audit them.
-    pub fn records(&self, asker: &AccountId, from: Through) -> Result<BatchRecords, DisputeError> {
-        if !self.is_operator(asker) {
-            return Err(DisputeError::NotAnOperator);
-        }
-        Ok(BatchRecords {
-            ops: read(self.ops.range(from.ops, MAX_LOG_PAGE)?)?,
-            entries: read(self.ledger_log.range(from.entries, MAX_LOG_PAGE)?)?,
-            receipts: self.receipts.range(from.receipts, MAX_LOG_PAGE)?,
-        })
-    }
-
-    /// Judges another operator's dispute of a batch, as the ledger would: the
-    /// batch is worked out again from the records behind it. If it does not
-    /// hold, and the records give what the dispute says, the dispute goes into
-    /// the log and this operator's whole stake is forfeited (spec section 6:
-    /// "An operator that posts a bad batch forfeits stake").
-    pub fn dispute(
-        &mut self,
-        request: &Envelope,
-        asker: &AccountId,
-        batch: u64,
-        found: (ContentHash, &[Change]),
-        now: u64,
-    ) -> Result<(), DisputeError> {
-        if !self.is_operator(asker) {
-            return Err(DisputeError::NotAnOperator);
-        }
-        if Some(*asker) == self.operator_account() {
-            return Err(DisputeError::OwnBatch);
-        }
-        let posted_at = self.settlement.posted_at(batch);
-        let posted_at = posted_at.ok_or(DisputeError::NoSuchBatch)?;
-        if self.settlement.is_disputed(batch) {
-            return Err(DisputeError::AlreadyDisputed);
-        }
-        if now > posted_at + self.dispute_window {
-            return Err(DisputeError::WindowClosed);
-        }
-        let finding = self.audit_own(batch)?.ok_or(DisputeError::BatchHolds)?;
-        if (finding.fingerprint, finding.changes.as_slice()) != found {
-            return Err(DisputeError::Differs);
-        }
-
-        let upheld = UpheldDispute {
-            request: request.clone(),
-        };
-        self.post(now, Posted::Dispute(upheld));
-        if let Some(account) = self.operator_account() {
-            let amount = self.ledger.balance(&account).staked;
-            self.record(LedgerEntry::Forfeit { account, amount })
-                .expect("a forfeit takes only what is staked");
-        }
-        // The next batch puts right what the bad one got wrong, and carries
-        // the forfeit. Post it now rather than at the end of the period.
-        self.post_batch(now);
-        Ok(())
-    }
-
-    /// Audits one of this coordinator's own batches from its own records, the
-    /// way another operator does, and answers with what it should have been
-    /// if it does not hold.
-    fn audit_own(&self, batch: u64) -> io::Result<Option<Finding>> {
-        let invalid = |error: String| io::Error::new(io::ErrorKind::InvalidData, error);
-        let ops: Vec<Envelope> = read(self.ops.range(0, usize::MAX)?)?;
-        let entries: Vec<LedgerEntry> = read(self.ledger_log.range(0, usize::MAX)?)?;
-        let receipts = self.receipts.range(0, usize::MAX)?;
-
-        let mut auditor = Auditor::waiting(self.recovery_wait);
-        let log: Vec<Envelope> = read(self.settlement_log.range(0, usize::MAX)?)?;
-        for entry in &log {
-            let reach = Auditor::reach(entry).map_err(|error| invalid(error.to_string()))?;
-            let from = auditor.log().through();
-            let records = match reach {
-                Some(to) => BatchRecords {
-                    ops: span(&ops, from.ops, to.ops),
-                    entries: span(&entries, from.entries, to.entries),
-                    receipts: span(&receipts, from.receipts, to.receipts),
-                },
-                None => BatchRecords::default(),
-            };
-            let finding = auditor.audit(entry, &records);
-            let finding = finding.map_err(|error| invalid(error.to_string()))?;
-            if reach.is_some() && auditor.log().batches().len() as u64 == batch + 1 {
-                return Ok(finding);
-            }
-        }
-        Ok(None)
     }
 
     /// Takes in the newest round of public randomness. Nodes are drawn for
@@ -527,12 +518,87 @@ impl Coordinator {
         let account = self.accounts.apply_at(envelope, now)?.clone();
         self.ledger.open(account.id);
         self.ops.append(envelope);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.created.entry(account.id) {
+            entry.insert(now);
+            self.activity_log.append(&ActivityEntry::Created {
+                account: account.id,
+                at: now,
+            });
+        }
         Ok(self.status(account))
     }
 
+    /// An account record with its balance, reputation, and when it appeared:
+    /// the six fields of spec section 1, "Accounts and identity".
     pub fn status(&self, account: Account) -> AccountStatus {
         let balance = self.ledger.balance(&account.id);
-        AccountStatus { account, balance }
+        let reputation = self.reputation(&account);
+        let created = self.created.get(&account.id).copied().unwrap_or(0);
+        AccountStatus {
+            account,
+            balance,
+            reputation,
+            created,
+        }
+    }
+
+    /// The combined reliability of an account's devices: their average.
+    fn reputation(&self, account: &Account) -> f64 {
+        let staked = self.ledger.balance(&account.id).staked;
+        let scores: Vec<f64> = account
+            .devices
+            .iter()
+            .filter(|device| !device.revoked)
+            .map(|device| self.scores.standing(&device.key, staked).reliability)
+            .collect();
+        if scores.is_empty() {
+            return 0.0;
+        }
+        scores.iter().sum::<f64>() / scores.len() as f64
+    }
+
+    /// What the share caps and lease order need to know about an account.
+    fn account_standing(&self, account: &AccountId, now: u64) -> AccountStanding {
+        let record = self.accounts.get(account);
+        let spent_lately = self.activity.iter().rev().any(|entry| {
+            matches!(entry, ActivityEntry::Spent { account: spender, at, .. }
+                if spender == account && now.saturating_sub(*at) <= BALANCED_LOOKBACK_SECS)
+        });
+        AccountStanding {
+            reliability: record.map_or(0.0, |record| self.reputation(record)),
+            created: self.created.get(account).copied().unwrap_or(now),
+            balanced: spent_lately,
+        }
+    }
+
+    /// What an account earned and spent since `since`.
+    pub fn activity(&self, account: &AccountId, since: u64) -> Activity {
+        let mut activity = Activity::default();
+        for entry in &self.activity {
+            match entry {
+                ActivityEntry::Earned {
+                    account: who,
+                    amount,
+                    at,
+                } if who == account && *at >= since => {
+                    activity.earned += *amount;
+                }
+                ActivityEntry::Spent {
+                    account: who,
+                    amount,
+                    at,
+                } if who == account && *at >= since => {
+                    activity.spent += *amount;
+                }
+                _ => {}
+            }
+        }
+        activity
+    }
+
+    fn note_activity(&mut self, entry: ActivityEntry) {
+        self.activity_log.append(&entry);
+        self.activity.push(entry);
     }
 
     /// How far a node is trusted, given its scores and its account's stake.
@@ -541,20 +607,39 @@ impl Coordinator {
             .standing(node, self.ledger.balance(account).staked)
     }
 
-    /// Records that a node is online and returns what it should be doing: the
-    /// job it should be running, blobs to take in, a storage challenge, and
-    /// channels to carry.
-    pub fn check_in(
+    /// Records that a node is asking for work and returns what it should be
+    /// doing: the leases it holds, results to reveal, blobs to take in, a
+    /// storage challenge, and channels to carry.
+    pub fn request_lease(
         &mut self,
         node: PublicKey,
         account: AccountId,
         address: Option<String>,
         now: u64,
-    ) -> CheckedIn {
+    ) -> LeasesGranted {
         self.hosts.seen(node, account, address, now);
         let interval = self.challenge_interval;
-        CheckedIn {
-            assignment: self.assignment_for(node, account, now),
+        let mut jobs = std::mem::take(&mut self.jobs);
+        let granted = {
+            let node_standing = |node: &PublicKey, account: &AccountId| {
+                self.scores
+                    .standing(node, self.ledger.balance(account).staked)
+            };
+            let account_standing = |account: &AccountId| self.account_standing(account, now);
+            let standings = Standings {
+                node: &node_standing,
+                account: &account_standing,
+            };
+            // `settle` runs after every request, so the contents read here
+            // already include what every settled job left behind.
+            let states = &self.states;
+            let contents = |shard: &ShardRef| states.contents(shard);
+            jobs.request_lease(node, account, now, &mut rand::rng(), &standings, &contents)
+        };
+        self.jobs = jobs;
+        LeasesGranted {
+            leases: granted.leases,
+            reveal: granted.reveal,
             store: self.storage.orders_for(&node),
             challenge: self
                 .storage
@@ -563,26 +648,253 @@ impl Coordinator {
         }
     }
 
-    fn assignment_for(
+    /// What a job would cost if it were submitted now.
+    pub fn quote(&self, manifest: &Manifest) -> Result<Quote, SubmitError> {
+        let pieces = match manifest.split {
+            Some(split) => {
+                let input = self.blobs.get(&manifest.input)?.unwrap_or_default();
+                split.pieces(input.len() as u64)
+            }
+            None => 1,
+        };
+        let per_piece = self.jobs.highest_fee(manifest);
+        Ok(Quote {
+            rate: self.jobs.posted(manifest),
+            fallback_micros_per_unit: fallback_rate(manifest.class),
+            highest_fee: Credits::from_micros(per_piece.micros().saturating_mul(pieces)),
+        })
+    }
+
+    /// A device's work preferences, for any device of the same account.
+    pub fn preferences(
+        &self,
+        asker: &AccountId,
+        device: &PublicKey,
+    ) -> Result<WorkPreferences, JobError> {
+        self.same_account(asker, device)?;
+        Ok(self.jobs.preferences(device))
+    }
+
+    /// Sets a device's work preferences, for any device of the same account.
+    pub fn set_preferences(
+        &mut self,
+        asker: &AccountId,
+        device: PublicKey,
+        preferences: WorkPreferences,
+    ) -> Result<WorkPreferences, JobError> {
+        self.same_account(asker, &device)?;
+        self.jobs.set_preferences(device, preferences.clone())?;
+        self.market_log.append(&MarketEntry::Preferences {
+            device,
+            preferences: preferences.clone(),
+        });
+        Ok(preferences)
+    }
+
+    fn same_account(&self, asker: &AccountId, device: &PublicKey) -> Result<(), JobError> {
+        match self.accounts.account_of(device) {
+            Some(account) if account.id == *asker => Ok(()),
+            _ => Err(JobError::NotLeased),
+        }
+    }
+
+    /// Places a bid for `account`. The signed request names the bid.
+    pub fn place_bid(
+        &mut self,
+        account: AccountId,
+        order: BidOrder,
+        request: &Envelope,
+        now: u64,
+    ) -> Result<Bid, JobError> {
+        let id = ContentHash::of(request.signature.as_bytes());
+        let bid = self.jobs.place_bid(account, order.clone(), id, now)?;
+        self.market_log.append(&MarketEntry::Bid {
+            account,
+            id,
+            order,
+            at: now,
+        });
+        Ok(bid)
+    }
+
+    pub fn cancel_bid(&mut self, account: AccountId, id: ContentHash) -> Result<(), JobError> {
+        self.jobs.cancel_bid(&account, &id)?;
+        self.market_log.append(&MarketEntry::Cancel { account, id });
+        Ok(())
+    }
+
+    /// Registers a name for the app `account` published, setting the deposit
+    /// aside.
+    pub fn register_name(
+        &mut self,
+        account: &Account,
+        name: String,
+        now: u64,
+    ) -> Result<NameRecord, RegistryError> {
+        if account.app.is_none() {
+            return Err(RegistryError::NoApp);
+        }
+        self.registry.check(&name, &account.id)?;
+        self.record(LedgerEntry::DataEscrow {
+            id: name_deposit_id(&name),
+            account: account.id,
+            amount: NAME_DEPOSIT,
+        })?;
+        let entry = RegistryEntry::Register {
+            name: name.clone(),
+            app: account.id,
+            at: now,
+        };
+        self.note_registry(entry);
+        Ok(self
+            .registry
+            .resolve(&name)
+            .cloned()
+            .expect("just registered"))
+    }
+
+    pub fn renew_name(
+        &mut self,
+        account: &AccountId,
+        name: String,
+        now: u64,
+    ) -> Result<NameRecord, RegistryError> {
+        self.registry.owned(&name, account)?;
+        self.note_registry(RegistryEntry::Renew {
+            name: name.clone(),
+            at: now,
+        });
+        Ok(self.registry.resolve(&name).cloned().expect("still held"))
+    }
+
+    pub fn release_name(&mut self, account: &AccountId, name: String) -> Result<(), RegistryError> {
+        self.registry.owned(&name, account)?;
+        self.release(name);
+        Ok(())
+    }
+
+    fn release(&mut self, name: String) {
+        // A name assigned by a reviewer was never paid a deposit for.
+        let _ = self.record(LedgerEntry::DataRefund {
+            id: name_deposit_id(&name),
+        });
+        self.note_registry(RegistryEntry::Release { name });
+    }
+
+    /// What a name points to.
+    pub fn resolve_name(&self, name: &str) -> Result<Resolved, RegistryError> {
+        let record = self.registry.resolve(name).ok_or(NameError::UnknownName)?;
+        Ok(self.resolved(record))
+    }
+
+    fn resolved(&self, record: &NameRecord) -> Resolved {
+        let manifest = self
+            .accounts
+            .get(&record.app)
+            .and_then(|account| account.app.clone())
+            .expect("a named app has a manifest");
+        Resolved {
+            record: record.clone(),
+            manifest,
+        }
+    }
+
+    pub fn directory(
+        &self,
+        verified_only: bool,
+        query: Option<&str>,
+        from: Option<&str>,
+        limit: usize,
+    ) -> Directory {
+        let (records, next) = self.registry.page(verified_only, query, from, limit);
+        Directory {
+            entries: records.iter().map(|record| self.resolved(record)).collect(),
+            next,
+        }
+    }
+
+    pub fn set_verified(
+        &mut self,
+        reviewer: &AccountId,
+        name: String,
+        verified: bool,
+    ) -> Result<NameRecord, RegistryError> {
+        self.reviewer_only(reviewer)?;
+        self.registry.resolve(&name).ok_or(NameError::UnknownName)?;
+        self.note_registry(RegistryEntry::SetVerified {
+            name: name.clone(),
+            verified,
+        });
+        Ok(self.registry.resolve(&name).cloned().expect("still held"))
+    }
+
+    pub fn assign_name(
+        &mut self,
+        reviewer: &AccountId,
+        name: String,
+        app: AccountId,
+        now: u64,
+    ) -> Result<NameRecord, RegistryError> {
+        self.reviewer_only(reviewer)?;
+        decomp_core::registry::check_syntax(&name)?;
+        if self.registry.resolve(&name).is_some() {
+            return Err(NameError::Taken.into());
+        }
+        if self
+            .accounts
+            .get(&app)
+            .is_none_or(|account| account.app.is_none())
+        {
+            return Err(RegistryError::NoApp);
+        }
+        self.note_registry(RegistryEntry::Register {
+            name: name.clone(),
+            app,
+            at: now,
+        });
+        Ok(self
+            .registry
+            .resolve(&name)
+            .cloned()
+            .expect("just assigned"))
+    }
+
+    fn reviewer_only(&self, account: &AccountId) -> Result<(), RegistryError> {
+        if self.reviewers.contains(account) {
+            Ok(())
+        } else {
+            Err(RegistryError::NotReviewer)
+        }
+    }
+
+    fn note_registry(&mut self, entry: RegistryEntry) {
+        self.registry.apply(&entry);
+        self.registry_log.append(&entry);
+    }
+
+    /// Commits a node's result: checks the blobs it names exist, then records
+    /// the commitment.
+    pub fn commit_result(
         &mut self,
         node: PublicKey,
-        account: AccountId,
+        job_id: JobId,
+        commitment: ContentHash,
         now: u64,
-    ) -> Option<Assignment> {
-        let Self {
-            jobs,
-            scores,
-            ledger,
-            states,
-            ..
-        } = self;
-        let standing = |node: &PublicKey, account: &AccountId| {
-            scores.standing(node, ledger.balance(account).staked)
-        };
-        // `settle` runs after every request, so the contents read here already
-        // include what every verified job left behind.
-        let contents = |shard: &ShardRef| states.contents(shard);
-        jobs.check_in(node, account, now, &mut rand::rng(), &standing, &contents)
+    ) -> Result<(), JobError> {
+        self.jobs
+            .commit_result(node, job_id, commitment, now, &mut rand::rng())
+    }
+
+    /// Takes a node's revealed result.
+    pub fn reveal_result(
+        &mut self,
+        node: PublicKey,
+        result: JobResult,
+        salt: ContentHash,
+        envelope: Envelope,
+        now: u64,
+    ) -> Result<(), JobError> {
+        self.jobs.reveal_result(node, result, salt, envelope, now)
     }
 
     /// Accepts a job: checks it, sets its highest possible fee aside, and queues
@@ -649,25 +961,25 @@ impl Coordinator {
                 let piece = Manifest {
                     input: self.blobs.put(chunk)?,
                     split: None,
-                    max_fee: manifest.highest_fee(),
+                    max_fee: self.jobs.highest_fee(&manifest),
                     ..manifest.clone()
                 };
                 runs.push((JobId::piece(&job_id, index as u64), piece));
             }
         }
 
-        let total = |amount: fn(&Manifest) -> Credits| {
+        let total = |amount: &dyn Fn(&Manifest) -> Credits| {
             runs.iter()
                 .fold(Credits::ZERO, |sum, (_, run)| sum + amount(run))
         };
-        let highest = total(Manifest::highest_fee);
+        let highest = total(&|run| self.jobs.highest_fee(run));
         if manifest.max_fee < highest {
             return Err(SubmitError::FeeCapTooLow(highest));
         }
         for (id, run) in &runs {
             self.jobs.check(id, run, now)?;
         }
-        let to_set_aside = total(|run| run.max_fee);
+        let to_set_aside = total(&|run| run.max_fee);
         let payer = manifest.sponsor.unwrap_or(account);
         if let Some(app) = manifest.sponsor {
             let published = self.accounts.get(&app).and_then(|owner| owner.app.as_ref());
@@ -685,6 +997,7 @@ impl Coordinator {
                 account: payer,
                 amount: run.max_fee,
             })?;
+            self.escrow_payer.insert(*id, payer);
             let kept_from = self.kept_from(run);
             self.jobs
                 .submit(*id, account, run.clone(), kept_from, now)?;
@@ -947,6 +1260,10 @@ impl Coordinator {
     /// whose result stood, and returns the credits set aside for jobs that have
     /// none. Call after anything that can change a job.
     pub fn settle(&mut self, now: u64) {
+        self.jobs.tick(now);
+        for name in self.registry.lapsed(now) {
+            self.release(name.name);
+        }
         for (entry, refund) in self.storage.sweep(now) {
             self.note_storage(entry, refund);
         }
@@ -961,10 +1278,10 @@ impl Coordinator {
                 self.forfeit(&event.node, lost);
             }
         }
-        // A job's draw is published once the job has closed (spec section 6:
-        // "Each operator publishes its draws").
+        // A job's draws are published once the job has closed (spec section 4:
+        // "Each draw is published").
         for draw in self.jobs.take_draws() {
-            let signed = Envelope::seal(&self.operator, &draw);
+            let signed = Envelope::seal(&self.control, &draw);
             self.draws_log.append(&signed);
         }
         for closed in self.jobs.take_closed() {
@@ -977,10 +1294,10 @@ impl Coordinator {
             // above the compute cap are refused, and the other entries here cannot
             // fail for an account that exists.
             let entries = match closed.how {
-                Closure::Verified {
+                Closure::Settled {
                     receipt,
-                    node_accounts,
-                    checker,
+                    split,
+                    payouts,
                     follow_ups,
                 } => {
                     asked = follow_ups;
@@ -1002,28 +1319,56 @@ impl Coordinator {
                         self.states_log.append(&entry);
                     }
                     self.keep_receipt(&receipt);
-                    let amount = receipt.fee.per_node;
-                    let settle = LedgerEntry::Settle {
+                    if let Some(payer) = self.payer_of(&job_id) {
+                        self.note_activity(ActivityEntry::Spent {
+                            account: payer,
+                            amount: split.total,
+                            at: now,
+                        });
+                    }
+                    for Payout {
+                        account, amount, ..
+                    } in &payouts
+                    {
+                        self.note_activity(ActivityEntry::Earned {
+                            account: *account,
+                            amount: *amount,
+                            at: now,
+                        });
+                    }
+                    vec![Some(LedgerEntry::Settle {
                         job_id,
-                        split: receipt.fee,
-                        node_accounts,
-                    };
-                    let pay = checker.map(|account| LedgerEntry::PayChecker { account, amount });
-                    vec![Some(settle), pay]
+                        split,
+                        payouts,
+                    })]
                 }
-                Closure::Disputed | Closure::Expired => {
+                Closure::Rejected | Closure::Expired => {
                     vec![Some(LedgerEntry::Refund { job_id })]
                 }
-                Closure::KnownAnswerPassed { account, reward } => {
+                Closure::FallBack(job) => {
+                    self.fall_backs.push((job_id, *job));
+                    vec![]
+                }
+                Closure::CheckPassed { account, reward } => {
+                    self.note_activity(ActivityEntry::Earned {
+                        account,
+                        amount: reward,
+                        at: now,
+                    });
                     vec![Some(LedgerEntry::PayChecker {
                         account,
                         amount: reward,
                     })]
                 }
+                Closure::Release => vec![Some(LedgerEntry::Release { job_id })],
+                Closure::AuditFailed { account } => {
+                    vec![Some(LedgerEntry::ForfeitHeld { job_id, account })]
+                }
             };
             for entry in entries.into_iter().flatten() {
                 self.record(entry).expect("a closed job can be settled");
             }
+            self.escrow_payer.remove(&job_id);
             // The job has been paid for and the rest of its fee cap returned,
             // which is what its follow-ups are paid from.
             if let Some(follow_ups) = asked {
@@ -1056,6 +1401,7 @@ impl Coordinator {
             if self.record(escrow).is_err() {
                 break;
             }
+            self.escrow_payer.insert(id, account);
             spare = spare - amount;
             let kept_from = self.kept_from(&manifest);
             self.jobs
@@ -1105,10 +1451,64 @@ impl Coordinator {
     /// their accounts' stake.
     pub fn resolve(&mut self, case: &Case, verdict: &Verdict, now: u64) {
         self.jobs.resolve(case.job_id, &verdict.right, now);
+        let cost = compute_fee(verdict.units, decomp_core::market::BASE_MICROS_PER_UNIT);
         for node in &verdict.wrong {
-            self.forfeit(node, |_| fee(verdict.units, 1));
+            self.forfeit(node, |_| cost);
         }
         self.settle(now);
+    }
+
+    /// The jobs to run as an always-on fallback, each with what it needs.
+    pub fn take_fall_backs(&mut self) -> Vec<(JobId, FallBackJob, Case)> {
+        let fall_backs = std::mem::take(&mut self.fall_backs);
+        let blob = |hash: &ContentHash| -> Vec<u8> {
+            self.blobs.get(hash).ok().flatten().unwrap_or_default()
+        };
+        fall_backs
+            .into_iter()
+            .map(|(job_id, job)| {
+                let case = Case {
+                    job_id: job.seed,
+                    module: blob(&job.manifest.module),
+                    input: blob(&job.manifest.input),
+                    blobs: job
+                        .manifest
+                        .reads
+                        .iter()
+                        .map(|hash| (*hash, blob(hash)))
+                        .collect(),
+                    shard: job.manifest.state.as_ref().map(|_| match job.shard {
+                        Some(contents) => blob(&contents),
+                        None => records::encode(&Records::new()),
+                    }),
+                    compute_cap: job.manifest.compute_cap,
+                    checkpoint_lists: Vec::new(),
+                    reports: Vec::new(),
+                };
+                (job_id, job, case)
+            })
+            .collect()
+    }
+
+    /// Settles a job that ran as an always-on fallback. The blobs it produced
+    /// are stored first.
+    pub fn fell_back(
+        &mut self,
+        job_id: JobId,
+        result: JobResult,
+        produced: Vec<Vec<u8>>,
+        now: u64,
+    ) {
+        for blob in produced {
+            let _ = self.blobs.put(&blob);
+        }
+        self.jobs.fall_back(job_id, result, now);
+        self.settle(now);
+    }
+
+    /// The account that pays for a job: the sponsor or the submitter.
+    fn payer_of(&self, job_id: &JobId) -> Option<AccountId> {
+        self.escrow_payer.get(job_id).copied()
     }
 
     /// Takes stake from the account a node belongs to.
@@ -1126,13 +1526,6 @@ impl Coordinator {
 fn read<T: DeserializeOwned>(lines: Vec<String>) -> io::Result<Vec<T>> {
     let entries = lines.iter().map(|line| serde_json::from_str(line));
     Ok(entries.collect::<Result<_, _>>()?)
-}
-
-/// The part of `all` from place `from` up to place `to`, as far as it goes.
-fn span<T: Clone>(all: &[T], from: u64, to: u64) -> Vec<T> {
-    let to = usize::try_from(to).unwrap_or(usize::MAX).min(all.len());
-    let from = usize::try_from(from).unwrap_or(usize::MAX).min(to);
-    all[from..to].to_vec()
 }
 
 /// What a line of `receipts.jsonl` is read for at startup: the job it is the
@@ -1158,4 +1551,9 @@ fn replay<T: DeserializeOwned>(
         })?;
     }
     Ok(log)
+}
+
+/// What a name's deposit is set aside under in the ledger.
+fn name_deposit_id(name: &str) -> ContentHash {
+    ContentHash::of(format!("decomp/name-deposit/v1\n{name}").as_bytes())
 }

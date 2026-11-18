@@ -7,13 +7,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::envelope::Envelope;
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, ShareSet};
-use crate::ledger::{Credits, FeeSplit, fee};
+use crate::ledger::{Credits, FeeSplit};
+use crate::market::{JobClass, LeasePrice};
 use crate::privacy::{Privacy, PrivateRoute};
 use crate::state::ShardRef;
 
-/// How many nodes run a job when the first node drawn for it is still on
-/// probation and the submitter has not asked for a number.
-pub const UNPROVEN_REDUNDANCY: u32 = 2;
+/// The most runs a job's fee is set aside for: the first pickup and a
+/// confirming second pickup.
+pub const MAX_RUNS: u64 = 2;
+
+/// The most slots one job may need at once on one machine.
+pub const MAX_JOB_SLOTS: u32 = 64;
 
 /// The most blobs a job may be given to read, besides its input.
 pub const MAX_READS: usize = 64;
@@ -30,9 +34,7 @@ pub const MAX_KEPT_FROM: usize = 64;
 /// The most earlier jobs a job may name whose nodes' accounts it is kept from.
 pub const MAX_APART_FROM: usize = 8;
 
-/// What to run and within what limits (spec section 2, "Manifest fields"). Fields
-/// the spec lists but that nothing reads yet are added with the features that
-/// read them.
+/// What to run and within what limits (spec section 2, "Manifest fields").
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -42,11 +44,19 @@ pub struct Manifest {
     pub compute_cap: u64,
     /// Latest acceptable finish time, in seconds since 1970.
     pub deadline: u64,
-    /// How many nodes, each from a different account, must run the job. Left out,
-    /// the coordinator decides: one proven node, spot-checked now and then, or
-    /// two nodes when the first one drawn is on probation.
+    /// The job's class: menial, data, or inference. Left out, menial.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub class: JobClass,
+    /// Slots the job needs at once on one machine. Left out, one.
+    #[serde(default = "one_slot", skip_serializing_if = "is_one_slot")]
+    pub slots: u32,
+    /// How the result is confirmed (see [`Verify`]). Left out, opportunistic.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub verify: Verify,
+    /// What happens if no node finishes the job before its deadline. Left out,
+    /// the job expires and its escrow is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub redundancy: Option<u32>,
+    pub fallback: Option<Fallback>,
     /// How to cut the job into pieces that run independently. Each piece is a job
     /// of its own, with this manifest's limits, on its own part of the input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,6 +103,42 @@ pub struct Manifest {
     pub apart_from: Vec<JobId>,
 }
 
+/// How a job's result is confirmed (spec, "Verification follows supply").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verify {
+    /// Accepted after one result; confirmed if a second node picks it up within
+    /// the confirmation window.
+    #[default]
+    Opportunistic,
+    /// Not accepted until a second node confirms; waits for one until the
+    /// deadline. For results that change balances or other high-value state.
+    Required,
+    /// One result, and no confirmation is offered. For work the app can check
+    /// for itself.
+    None,
+}
+
+/// What runs a job that no node finished in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fallback {
+    /// The same module runs in the control plane, at the fallback rate.
+    AlwaysOn,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+fn one_slot() -> u32 {
+    1
+}
+
+fn is_one_slot(slots: &u32) -> bool {
+    *slots == 1
+}
+
 /// Which share of which private job a job is (see `shares`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,12 +176,23 @@ impl Split {
 
 impl Manifest {
     /// The most the job, or each of its pieces if it is split, can cost its
-    /// submitter.
-    pub fn highest_fee(&self) -> Credits {
-        fee(
-            self.compute_cap,
-            self.redundancy.unwrap_or(UNPROVEN_REDUNDANCY),
-        )
+    /// payer at a posted rate of `micros_per_unit` and a fallback rate of
+    /// `fallback_micros_per_unit`: two runs at the whole compute cap (one if it
+    /// asks for no confirmation), or the fallback if that costs more.
+    pub fn highest_fee(&self, micros_per_unit: u64, fallback_micros_per_unit: u64) -> Credits {
+        let runs = match self.verify {
+            Verify::None => 1,
+            Verify::Opportunistic | Verify::Required => MAX_RUNS,
+        };
+        let on_nodes = self
+            .compute_cap
+            .saturating_mul(micros_per_unit)
+            .saturating_mul(runs);
+        let fallback = match self.fallback {
+            Some(Fallback::AlwaysOn) => self.compute_cap.saturating_mul(fallback_micros_per_unit),
+            None => 0,
+        };
+        Credits::from_micros(on_nodes.max(fallback))
     }
 
     /// The job's size tier: how many times its compute cap doubles the smallest
@@ -168,6 +225,22 @@ pub struct JobResult {
     /// another. If nodes disagree, the first checkpoint where their lists differ
     /// shows how far the job must be re-run to find out which is right.
     pub checkpoints: ContentHash,
+}
+
+impl JobResult {
+    /// What a node commits before it reveals this result: a hash of the result,
+    /// the node's key, and a secret salt of the node's choosing. Commitments
+    /// can be seen by anyone who reads the job board, and the salt keeps a
+    /// second node from matching a commitment it did not compute (spec, "Why a
+    /// second pickup can be trusted").
+    pub fn commitment(&self, node: &PublicKey, salt: &ContentHash) -> ContentHash {
+        let result = serde_json::to_vec(self).expect("a result serializes");
+        let mut bytes = b"decomp/commit/v1\n".to_vec();
+        bytes.extend_from_slice(ContentHash::of(&result).as_bytes());
+        bytes.extend_from_slice(node.as_bytes());
+        bytes.extend_from_slice(salt.as_bytes());
+        ContentHash::of(&bytes)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,10 +298,15 @@ impl fmt::Display for Failure {
     }
 }
 
-/// A job handed to a node to run.
+/// A job leased to a node to run (spec, "Job states": Leased).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Assignment {
+pub struct Lease {
     pub job_id: JobId,
+    /// The latest the node may commit its result, in seconds since 1970. After
+    /// that the lease reopens for another node.
+    pub expires_at: u64,
+    /// What the node is paid for the run, before any taper.
+    pub price: LeasePrice,
     pub manifest: Manifest,
     /// What the job draws its randomness from: the ID the job was first submitted
     /// under. It differs from `job_id` only when a verified job is being reissued
@@ -240,22 +318,22 @@ pub struct Assignment {
     pub shard: Option<ContentHash>,
 }
 
-/// How a job's result came to stand. The first of these that is true of any
-/// piece of a split job is what is said of the whole job.
+/// The verification level a result got; every receipt states it. The first of
+/// these that is true of any piece of a split job is what is said of the
+/// whole job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verification {
-    /// One node ran the job and no other was asked to. Nothing was compared.
-    /// This is how a proven node runs most jobs (spec section 4, "Earning spot
-    /// checks"): the result rests on the node's record, and on its not knowing
-    /// which of its jobs are checked. It is also what a submitter gets who asks
-    /// for one node.
-    Unchecked,
-    /// The nodes that ran the job disagreed, and the referee ran it to find
-    /// which of them were right.
+    /// One node's result, accepted on its reputation. A random share of these
+    /// is audited later by a spot check.
+    Unconfirmed,
+    /// Run as an always-on fallback in the control plane, after no node
+    /// finished in time.
+    AlwaysOn,
+    /// Two results differed, and a checkpoint dispute named the right one.
     Refereed,
-    /// Every node that ran the job, two or more, reported the same result.
-    Agreed,
+    /// A second node's result matched.
+    Confirmed,
 }
 
 /// Proof of a finished job (spec section 6, "Receipts"). `results` holds the signed
@@ -290,6 +368,8 @@ pub struct Receipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<PrivateRoute>,
     pub verified: Verification,
+    /// How many paid runs the fee covers: 1 unconfirmed, 2 confirmed.
+    pub runs: u32,
     /// Seconds from when the job was submitted to when its result stood.
     pub seconds: u64,
     /// Whether the job ran inside a hardware enclave. No node can yet show that
@@ -297,18 +377,25 @@ pub struct Receipt {
     pub enclave: bool,
 }
 
-/// Where a job stands, as its submitter sees it.
+/// Where a job stands, as its submitter sees it (spec, "Job states").
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum JobStatus {
-    /// Not yet handed to nodes.
-    Waiting,
-    /// Handed to nodes; not all have reported, or their results are being refereed.
-    Running,
-    /// A result stood: every node agreed, or a referee found which was right.
-    Verified { receipt: Box<Receipt> },
-    /// The nodes disagreed and the referee found none of them right.
+    /// Accepted with its escrow; no node holds a lease on it.
+    Submitted,
+    /// A node holds a lease and has not committed a result.
+    Leased,
+    /// A node has committed the hash of its result. A second pickup may still
+    /// come, or the commitments are being revealed.
+    Committed,
+    /// Two results differ, and the checkpoint dispute is running.
     Disputed,
-    /// The deadline passed before the job was verified.
+    /// A result stood and was paid for. The receipt says how it was verified.
+    Settled { receipt: Box<Receipt> },
+    /// The nodes disagreed and the dispute found none of them right. The
+    /// escrow is returned.
+    Rejected,
+    /// No node finished before the deadline and no fallback was set. The
+    /// escrow is returned.
     Expired,
 }

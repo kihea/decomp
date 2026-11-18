@@ -68,17 +68,17 @@ use wasmtime::{
 
 use crate::meter::{COUNTER_EXPORT, HOST_MODULE, METER_IMPORT, add_metering};
 
-/// WebAssembly instructions in one compute unit, the unit jobs are priced in.
-/// The spec fixes that a unit is a count of instructions but not the count; the
-/// owner set this one. A desktop core measured about 9 billion a second on a tight
-/// loop, so ten billion makes a unit roughly one core-second. That fits the tiers
-/// in the spec, where tier 0 (one unit) is a job of under a second.
-pub const INSTRUCTIONS_PER_UNIT: u64 = 10_000_000_000;
+/// WebAssembly instructions in one compute unit, the unit jobs are priced in
+/// (spec section 5: "one unit is 1 billion WebAssembly instructions"). At the
+/// base rate one credit buys 4,000 units, about one hour of one slot on a
+/// reference core.
+pub const INSTRUCTIONS_PER_UNIT: u64 = 1_000_000_000;
 
-/// How often a running job's state is hashed into a checkpoint. A starting value:
-/// the spec suggests 10 million, but each checkpoint hashes the module's whole
-/// memory, and at that interval the hashing would cost more than the job.
-pub const INSTRUCTIONS_PER_CHECKPOINT: u64 = 1_000_000_000;
+/// How often a running job's state is hashed into a checkpoint. The spec's
+/// starting value is 10 million instructions; each checkpoint hashes the
+/// module's whole memory, and at that interval the hashing costs more than the
+/// job, so a checkpoint is taken once per compute unit instead.
+pub const INSTRUCTIONS_PER_CHECKPOINT: u64 = INSTRUCTIONS_PER_UNIT;
 
 /// Memory available to one job: a slot's 512 MB (spec section 1, "Slots").
 pub const SLOT_MEMORY_BYTES: usize = 512 * 1024 * 1024;

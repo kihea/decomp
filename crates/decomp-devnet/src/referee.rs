@@ -12,6 +12,7 @@
 //! not offer, so the job is re-run from its start up to the checkpoint instead.
 
 use decomp_core::{ContentHash, JobId, JobResult, Outcome, PublicKey, Spawn};
+use decomp_sandbox::Finding;
 use decomp_sandbox::{
     Blobs, Checkpoint, INSTRUCTIONS_PER_CHECKPOINT, INSTRUCTIONS_PER_UNIT, Job, Sandbox,
 };
@@ -83,23 +84,7 @@ pub fn referee(sandbox: &Sandbox, case: &Case) -> Verdict {
         .any(|&node| result_of(node) != result_of(standing[0]));
     if disagree {
         let finding = sandbox.find(&job);
-        let outcome = match &finding.produced {
-            Ok(produced) => Outcome::Completed {
-                output: ContentHash::of(&produced.output),
-                blobs: produced.blobs.iter().map(|b| ContentHash::of(b)).collect(),
-                state: produced.state.as_ref().map(|left| ContentHash::of(left)),
-                spawned: produced
-                    .spawned
-                    .iter()
-                    .map(|asked| Spawn {
-                        module: asked.module,
-                        input: ContentHash::of(&asked.input),
-                        compute_cap: asked.compute_cap,
-                    })
-                    .collect(),
-            },
-            Err(failure) => Outcome::Failed { failure: *failure },
-        };
+        let outcome = outcome_of(&finding);
         let checkpoints = ContentHash::of(&finding.checkpoints);
         standing.retain(|&node| {
             let reported = result_of(node);
@@ -118,5 +103,57 @@ pub fn referee(sandbox: &Sandbox, case: &Case) -> Verdict {
             .map(node_key)
             .collect(),
         units,
+    }
+}
+
+/// Runs a job whole, as the control plane does for an always-on fallback, and
+/// returns its result and every blob it produced (output, stored blobs, the
+/// shard it left, and the inputs of the follow-ups it asked for).
+pub fn run(sandbox: &Sandbox, case: &Case, job_id: JobId) -> (JobResult, Vec<Vec<u8>>) {
+    let job = Job {
+        module: &case.module,
+        input: &case.input,
+        compute_cap: case.compute_cap,
+        seed: *case.job_id.as_bytes(),
+        blobs: &case.blobs,
+        state: case.shard.as_deref(),
+        opening_key: None,
+    };
+    let finding = sandbox.find(&job);
+    let outcome = outcome_of(&finding);
+    let mut produced = vec![finding.checkpoints.clone()];
+    if let Ok(made) = &finding.produced {
+        produced.push(made.output.clone());
+        produced.extend(made.blobs.iter().cloned());
+        produced.extend(made.state.iter().cloned());
+        produced.extend(made.spawned.iter().map(|asked| asked.input.clone()));
+    }
+    let result = JobResult {
+        job_id,
+        units: finding.units,
+        outcome,
+        checkpoints: ContentHash::of(&finding.checkpoints),
+    };
+    (result, produced)
+}
+
+/// What a run found, in the form a node reports it.
+fn outcome_of(finding: &Finding) -> Outcome {
+    match &finding.produced {
+        Ok(produced) => Outcome::Completed {
+            output: ContentHash::of(&produced.output),
+            blobs: produced.blobs.iter().map(|b| ContentHash::of(b)).collect(),
+            state: produced.state.as_ref().map(|left| ContentHash::of(left)),
+            spawned: produced
+                .spawned
+                .iter()
+                .map(|asked| Spawn {
+                    module: asked.module,
+                    input: ContentHash::of(&asked.input),
+                    compute_cap: asked.compute_cap,
+                })
+                .collect(),
+        },
+        Err(failure) => Outcome::Failed { failure: *failure },
     }
 }

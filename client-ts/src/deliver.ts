@@ -8,7 +8,7 @@
  */
 
 import { concat, equal, fromBase64, fromHex, toBase64, toHex, utf8 } from './bytes';
-import { type Coordinator, CoordinatorError } from './client';
+import { type ControlPlane, ControlPlaneError } from './client';
 import { root as merkleRoot } from './merkle';
 import {
   type Envelope,
@@ -38,7 +38,7 @@ export class TransferError extends Error {}
 
 /** What a device needs to send and receive. */
 export type Transfers = {
-  coordinator: Coordinator;
+  control: ControlPlane;
   primitives: Primitives;
   /** This device's key for signing. */
   signer: Signer;
@@ -56,7 +56,7 @@ const SENDER_PURPOSE = utf8('decomp/v1 sealed from\n');
 /**
  * How long to wait before offering a frame or a blob again to a node that is not
  * ready for it, and how many times to offer. A node is not ready until it has
- * heard from the coordinator, at its next check-in, what it is to carry or hold.
+ * heard from the control, at its next check-in, what it is to carry or hold.
  */
 const RETRY_MS = 500;
 const SEND_ATTEMPTS = 120;
@@ -70,8 +70,8 @@ const TAKE_ATTEMPTS = 120;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Publishes the key that data for this device should be sealed to. */
-export async function publishSealingKey({ coordinator, signer, opener }: Transfers): Promise<void> {
-  await coordinator.request(signer, { type: 'publish_sealing_key', key: opener.sealingKey });
+export async function publishSealingKey({ control, signer, opener }: Transfers): Promise<void> {
+  await control.request(signer, { type: 'publish_sealing_key', key: opener.sealingKey });
 }
 
 /**
@@ -80,9 +80,9 @@ export async function publishSealingKey({ coordinator, signer, opener }: Transfe
  * published none.
  */
 async function sealingKeyOf(transfers: Transfers, device: string): Promise<string | null> {
-  const { coordinator, primitives, signer } = transfers;
+  const { control, primitives, signer } = transfers;
   const call = { type: 'get_sealing_key', device } as const;
-  const { proof } = await coordinator.request<PublishedKey>(signer, call);
+  const { proof } = await control.request<PublishedKey>(signer, call);
   if (!proof || proof.signer !== device || !(await signedBy(primitives, proof))) return null;
   const request = JSON.parse(proof.payload) as Request;
   return request.call.type === 'publish_sealing_key' ? request.call.key : null;
@@ -116,10 +116,10 @@ export async function deliver(
   try {
     return { how: 'sent', route: await sendOverChannel(transfers, to, sealingKey, data) };
   } catch (error) {
-    if (!(error instanceof CoordinatorError && error.code === 'receiver_away')) throw error;
+    if (!(error instanceof ControlPlaneError && error.code === 'receiver_away')) throw error;
   }
 
-  const { coordinator, primitives, signer } = transfers;
+  const { control, primitives, signer } = transfers;
   // Stored data has no channel to say who it is from, so the sender signs it
   // inside the seal. The signature covers the receiving device.
   const signature = await signer.sign(concat(SENDER_PURPOSE, fromHex(to), data));
@@ -127,7 +127,7 @@ export async function deliver(
   const sealed = await primitives.sealTo(sealingKey, signed);
   const root = toHex(await merkleRoot(sealed, primitives.sha256));
   const call = { type: 'store_blob', root, size: sealed.length, days: keepDays, to } as const;
-  const placement = await coordinator.request<Placement>(signer, call);
+  const placement = await control.request<Placement>(signer, call);
 
   let nodes = 0;
   for (const address of placement.addresses) {
@@ -138,7 +138,7 @@ export async function deliver(
 }
 
 async function sendOverChannel(
-  { coordinator, primitives, signer }: Transfers,
+  { control, primitives, signer }: Transfers,
   to: string,
   sealingKey: string,
   data: Uint8Array,
@@ -150,7 +150,7 @@ async function sendOverChannel(
     pieces.push(data.subarray(start, start + pieceBytes));
   }
   const bytes = data.length + pieces.length * SEAL_OVERHEAD_BYTES;
-  const route = await coordinator.request<Route>(signer, { type: 'open_relay', to, bytes });
+  const route = await control.request<Route>(signer, { type: 'open_relay', to, bytes });
   const address = `${route.address}${CHANNEL_PATH}${route.channel}/frames`;
 
   let sent = 0;
@@ -224,8 +224,8 @@ export async function collect(
   skip: Set<string>,
   accepts: (from: string) => boolean = () => true,
 ): Promise<Collected | null> {
-  const { coordinator, primitives, signer, opener } = transfers;
-  const waiting = await coordinator.request<IncomingChannels>(signer, { type: 'list_incoming' });
+  const { control, primitives, signer, opener } = transfers;
+  const waiting = await control.request<IncomingChannels>(signer, { type: 'list_incoming' });
   for (const incoming of waiting.channels) {
     if (skip.has(incoming.channel) || !accepts(incoming.from)) continue;
     try {
@@ -239,7 +239,7 @@ export async function collect(
   for (const stored of waiting.stored) {
     if (skip.has(stored.root) || !accepts(stored.from)) continue;
     skip.add(stored.root);
-    const located = await coordinator.request<Located>(signer, { type: 'locate_blob', root: stored.root });
+    const located = await control.request<Located>(signer, { type: 'locate_blob', root: stored.root });
     const sealed = await fetchStored(primitives, stored.root, located);
     const opened = await opener.open(sealed);
     if (!opened || opened.length < 96) throw new TransferError('What was stored was not sealed to this device.');

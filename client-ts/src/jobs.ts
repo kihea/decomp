@@ -4,14 +4,14 @@
  */
 
 import { fromBase64, toBase64 } from './bytes';
-import type { Coordinator } from './client';
+import type { ControlPlane } from './client';
 import {
   type BlobData,
   type BlobRef,
   type Failure,
-  highestFee,
   type JobStatus,
   type Manifest,
+  type Quote,
   now,
   type Signer,
   type Submitted,
@@ -40,13 +40,13 @@ export type JobResult = {
   fee: number;
 };
 
-/** Stores bytes with the coordinator; resolves with their hash. */
+/** Stores bytes with the control; resolves with their hash. */
 export async function putBlob(
-  coordinator: Coordinator,
+  control: ControlPlane,
   signer: Signer,
   data: Uint8Array,
 ): Promise<string> {
-  const stored = await coordinator.request<BlobRef>(signer, {
+  const stored = await control.request<BlobRef>(signer, {
     type: 'put_blob',
     data: toBase64(data),
   });
@@ -54,47 +54,52 @@ export async function putBlob(
 }
 
 export async function getBlob(
-  coordinator: Coordinator,
+  control: ControlPlane,
   signer: Signer,
   hash: string,
 ): Promise<Uint8Array> {
-  const blob = await coordinator.request<BlobData>(signer, { type: 'get_blob', hash });
+  const blob = await control.request<BlobData>(signer, { type: 'get_blob', hash });
   return fromBase64(blob.data);
 }
 
 /**
- * Submits a job, billed to the signer's account, and waits for a verified
+ * Submits a job, billed to the signer's account, and waits for its settled
  * result. The most it can cost is set aside when it is submitted, and what it
  * does not use comes back.
  */
 export async function runJob(
-  coordinator: Coordinator,
+  control: ControlPlane,
   signer: Signer,
   order: JobOrder,
 ): Promise<JobResult> {
   const manifest: Manifest = {
     module: order.module,
-    input: await putBlob(coordinator, signer, order.input),
+    input: await putBlob(control, signer, order.input),
     compute_cap: order.computeCap,
     deadline: now() + order.deadlineSecs,
-    max_fee: highestFee(order.computeCap),
+    max_fee: 0,
   };
-  const { job_id } = await coordinator.request<Submitted>(signer, { type: 'submit_job', manifest });
+  // Set aside the most the job can cost at the rate posted now.
+  const quote = await control.request<Quote>(signer, { type: 'quote_job', manifest });
+  manifest.max_fee = quote.highest_fee;
+  const { job_id } = await control.request<Submitted>(signer, { type: 'submit_job', manifest });
   for (;;) {
-    const status = await coordinator.request<JobStatus>(signer, { type: 'get_job', job_id });
+    const status = await control.request<JobStatus>(signer, { type: 'get_receipt', job_id });
     switch (status.state) {
-      case 'waiting':
-      case 'running':
+      case 'submitted':
+      case 'leased':
+      case 'committed':
+      case 'disputed':
         await new Promise((resolve) => setTimeout(resolve, JOB_POLL_MS));
         continue;
-      case 'disputed':
+      case 'rejected':
         throw new JobError('The nodes disagreed and none was right.');
       case 'expired':
         throw new JobError('The deadline passed before the job had a result.');
-      case 'verified': {
+      case 'settled': {
         const { outcome, fee } = status.receipt;
         if (outcome.status === 'failed') throw new JobError(FAILURES[outcome.failure]);
-        return { output: await getBlob(coordinator, signer, outcome.output), fee: fee.total };
+        return { output: await getBlob(control, signer, outcome.output), fee: fee.total };
       }
     }
   }

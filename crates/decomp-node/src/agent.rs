@@ -4,35 +4,40 @@ use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
-use std::sync::mpsc::{self, Sender};
-use std::thread::{self, sleep};
-use std::time::Duration;
+use std::sync::Arc;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
-use decomp_core::{Assignment, Blob, Challenge, CheckedIn, JobId, merkle};
+use decomp_core::{Blob, Challenge, JobId, LeasesGranted, WorkPreferences, merkle};
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::relay::Relay;
+use decomp_node::schedule::{Conditions, Event, Worker, may_work};
 use decomp_node::store::Store;
-use decomp_node::{IDLE_POLL, RETRY_DELAY, server, work};
+use decomp_node::{IDLE_POLL, RETRY_DELAY, server};
 use decomp_sandbox::Sandbox;
 
 use crate::device;
 
 /// The file, in this device's directory, listing the jobs this node has
-/// reported a result for, one ID to a line. `decomp-node receipts` reads it to
-/// check that their receipts are in the coordinator's batches.
+/// revealed a result for, one ID to a line. `decomp-node receipts` reads it to
+/// check that their receipts are in the settlement log's batches.
 pub const REPORTED_FILE: &str = "reported";
 
 /// How often a device waiting to be approved asks whether it has been.
 const LINK_POLL: Duration = Duration::from_secs(3);
 
+/// How often the node reads its owner's work preferences again, so that a
+/// change made from another device takes effect.
+const PREFERENCES_REFRESH: Duration = Duration::from_secs(60);
+
 /// Makes this device's key if it has none, shows its code, and waits until a
 /// device in an account approves it.
-pub fn link(dir: &Path, coordinator_url: &str) -> Result<(), Box<dyn Error>> {
+pub fn link(dir: &Path, control_url: &str) -> Result<(), Box<dyn Error>> {
     let key = match device::load(dir)? {
         Some(key) => key,
         None => device::create(dir)?,
     };
-    let client = Client::new(coordinator_url, key);
+    let client = Client::new(control_url, key);
     println!("device code: {}", client.device_key());
 
     let mut waiting = false;
@@ -65,18 +70,23 @@ pub struct Reachable<'a> {
     pub public_url: &'a str,
 }
 
-/// Works as a node until stopped. It checks in every couple of seconds, whether
-/// or not it is on a job, because blobs to take in, storage challenges, and
-/// channels to carry do not wait for a job to finish; the job runs alongside.
-/// A node holds and relays data only if it is given an address other devices can
+/// Works as a node until stopped. It asks for work every couple of seconds,
+/// whether or not jobs are running, because blobs to take in, storage
+/// challenges, channels to carry, and results to reveal do not wait for a job
+/// to finish; jobs run alongside, up to the slots the owner offers. A node
+/// holds and relays data only if it is given an address other devices can
 /// reach it at.
+///
+/// The command-line node runs on machines its owner points it at, so it takes
+/// the device to be on mains power and an unmetered network; the desktop app
+/// reads both from the system.
 pub fn start(
     dir: &Path,
-    coordinator_url: &str,
+    control_url: &str,
     reachable: Option<Reachable<'_>>,
 ) -> Result<(), Box<dyn Error>> {
     let key = device::load(dir)?.ok_or(crate::NO_KEY)?;
-    let client = &Client::new(coordinator_url, key);
+    let client = Arc::new(Client::new(control_url, key));
     let account = client.account()?.account;
     println!(
         "node {} of account {} is online",
@@ -98,20 +108,28 @@ pub fn start(
         None => None,
     };
 
-    let sandbox = &Sandbox::new();
-    // A job tells this loop when it is over, so the node asks for its next at once.
-    let (job_over, job_is_over) = mpsc::channel();
-    let mut on_a_job = false;
-    thread::scope(|jobs| {
-        loop {
-            let pause = match turn(client, &store, &relay, address) {
-                Ok(Some(assignment)) if !on_a_job => {
-                    let job_over = job_over.clone();
-                    jobs.spawn(move || run(client, sandbox, dir, &assignment, &job_over));
-                    on_a_job = true;
-                    IDLE_POLL
-                }
-                Ok(_) => IDLE_POLL,
+    let worker = Worker::new(Arc::clone(&client), Arc::new(Sandbox::new()));
+    let mut preferences: Option<(Instant, WorkPreferences)> = None;
+    loop {
+        let stale = preferences
+            .as_ref()
+            .is_none_or(|(read, _)| read.elapsed() >= PREFERENCES_REFRESH);
+        if stale {
+            match client.work_preferences(client.device_key()) {
+                Ok(read) => preferences = Some((Instant::now(), read)),
+                Err(error) => eprintln!("could not read work preferences: {error}"),
+            }
+        }
+        let allowed = preferences
+            .as_ref()
+            .is_none_or(|(_, preferences)| may_work(preferences, Conditions::default()));
+        // Outside the owner's rules the node stops asking, once every result
+        // it committed to has been revealed.
+        let pause = if !allowed && !worker.has_unrevealed() && worker.running() == 0 {
+            IDLE_POLL
+        } else {
+            match turn(&client, &worker, &store, &relay, address) {
+                Ok(()) => IDLE_POLL,
                 // Removed from its account: there is no more work for this key.
                 Err(error) if error.is("device_revoked") || error.is("not_linked") => {
                     return Err(error.into());
@@ -120,49 +138,46 @@ pub fn start(
                     eprintln!("{error}; retrying");
                     RETRY_DELAY
                 }
-            };
-            if job_is_over.recv_timeout(pause).is_ok() {
-                on_a_job = false;
             }
+        };
+        for event in worker.take_events() {
+            report(dir, &event);
         }
-    })
+        sleep(pause);
+    }
 }
 
-/// One check-in and the data work it asks for. Returns the job the node should
-/// be running, if any.
+/// One request for work, and the data work it asks for.
 fn turn(
     client: &Client,
+    worker: &Worker,
     store: &Store,
     relay: &Relay,
     address: Option<&str>,
-) -> Result<Option<Assignment>, ClientError> {
-    let CheckedIn {
-        assignment,
-        store: orders,
-        challenge,
-        relay: channels,
-    } = client.check_in(address)?;
+) -> Result<(), ClientError> {
+    let granted: LeasesGranted = client.request_lease(address)?;
     let now = unix_now();
+    worker.handle(&granted);
 
     store.delete_expired(now);
-    store.expect(&orders);
-    for order in &orders {
+    store.expect(&granted.store);
+    for order in &granted.store {
         // The blob arrives at this node's server; say so once it is here.
         if store.holds(&order.root) {
             client.confirm_stored(order.root)?;
             println!("holding blob {}", order.root);
         }
     }
-    if let Some(challenge) = challenge {
+    if let Some(challenge) = granted.challenge {
         answer_challenge(client, store, challenge)?;
     }
 
-    relay.expect(&channels, now);
+    relay.expect(&granted.relay, now);
     for claim in relay.claims() {
         match client.redeem_relay(claim.header.clone(), claim.receipt.clone()) {
             Ok(()) => println!("relayed {} bytes on channel {}", claim.bytes, claim.channel),
-            // The coordinator will not pay this claim, and asking again would not
-            // change its answer.
+            // The control plane will not pay this claim, and asking again
+            // would not change its answer.
             Err(error @ ClientError::Refused { .. }) => {
                 eprintln!("not paid for channel {}: {error}", claim.channel);
             }
@@ -170,33 +185,27 @@ fn turn(
         }
         relay.claimed(&claim);
     }
-    Ok(assignment)
+    Ok(())
 }
 
-/// Runs one job and says when it is over. A job that could not be run or
-/// reported is handed back at a later check-in, so wait before saying so.
-fn run(client: &Client, sandbox: &Sandbox, dir: &Path, assignment: &Assignment, over: &Sender<()>) {
-    match work(client, sandbox, assignment) {
-        Ok(result) => {
-            println!(
-                "job {} reported, units used: {}",
-                result.job_id, result.units
-            );
-            if let Err(error) = remember(dir, &result.job_id) {
-                eprintln!("could not note job {}: {error}", result.job_id);
+/// Logs what the worker did, and notes each revealed job so that its receipt
+/// can be looked for in a batch later.
+fn report(dir: &Path, event: &Event) {
+    match event {
+        Event::Committed { job_id, units } => {
+            println!("job {job_id} committed, units used: {units}");
+        }
+        Event::Revealed { job_id } => {
+            println!("job {job_id} revealed");
+            if let Err(error) = remember(dir, job_id) {
+                eprintln!("could not note job {job_id}: {error}");
             }
         }
-        Err(error) => {
-            eprintln!("job {}: {error}; retrying", assignment.job_id);
-            sleep(RETRY_DELAY);
-        }
+        Event::Failed { job_id, error } => eprintln!("job {job_id}: {error}"),
     }
-    // The loop this reports to runs for as long as the program does.
-    let _ = over.send(());
 }
 
-/// Notes a job this node has reported, so that its receipt can be looked for
-/// in a batch later.
+/// Notes a job this node has revealed a result for.
 fn remember(dir: &Path, job_id: &JobId) -> std::io::Result<()> {
     let mut reported = OpenOptions::new()
         .create(true)
@@ -205,8 +214,8 @@ fn remember(dir: &Path, job_id: &JobId) -> std::io::Result<()> {
     writeln!(reported, "{job_id}")
 }
 
-/// Shows the coordinator the chunk it asked for. A node that no longer has the
-/// blob stays silent, which the coordinator counts as a failed challenge.
+/// Shows the control plane the chunk it asked for. A node that no longer has
+/// the blob stays silent, which counts as a failed challenge.
 fn answer_challenge(
     client: &Client,
     store: &Store,

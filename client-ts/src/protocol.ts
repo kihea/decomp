@@ -102,6 +102,10 @@ export type AppManifest = {
     /** The most the app sets aside in a day for one account's jobs, in millionths. */
     per_account_daily: number;
   };
+  /** The hash of the app's client files, which a gateway serves at its name. */
+  client?: string;
+  /** The hash of a blob of metadata the application layer defines. */
+  metadata?: string;
 };
 
 export type Account = {
@@ -109,7 +113,7 @@ export type Account = {
   account_key: string;
   /**
    * Where the account's balance sits on the ledger. Only the account's own
-   * devices are shown it; what the coordinator posts names this, never `id`.
+   * devices are shown it; what the control posts names this, never `id`.
    */
   ledger_address: string;
   /** Number of changes so far. The next change must carry this value. */
@@ -124,6 +128,10 @@ export type Account = {
   /** The app this account has published, if any. */
   app?: AppManifest;
   balance: Balance;
+  /** The combined reliability of the account's devices, from 0 to 1. */
+  reputation: number;
+  /** When the account first appeared, in seconds since 1970. */
+  created: number;
 };
 
 export type AccountOp =
@@ -160,8 +168,28 @@ export type Call =
   | { type: 'put_blob'; data: string }
   | { type: 'get_blob'; hash: string }
   | { type: 'submit_job'; manifest: Manifest }
-  | { type: 'get_job'; job_id: string }
-  | { type: 'get_state'; app: string; shard: string };
+  | { type: 'get_receipt'; job_id: string }
+  | { type: 'quote_job'; manifest: Manifest }
+  | { type: 'get_state'; app: string; shard: string }
+  | { type: 'get_work_preferences'; device: string }
+  | { type: 'set_work_preferences'; device: string; preferences: WorkPreferences }
+  | { type: 'place_bid'; bid: BidOrder }
+  | { type: 'cancel_bid'; id: string }
+  | { type: 'list_bids' }
+  | { type: 'get_rates' }
+  | { type: 'get_activity'; since: number }
+  | { type: 'register_name'; name: string }
+  | { type: 'renew_name'; name: string }
+  | { type: 'release_name'; name: string }
+  | { type: 'resolve_name'; name: string }
+  | {
+      type: 'list_directory';
+      verified_only?: boolean;
+      /** Only names that contain this text. */
+      query?: string | null;
+      from?: string | null;
+      limit?: number;
+    };
 
 /** A signed request for anything other than changing an account. */
 export type Request = { issued_at: number; call: Call };
@@ -226,6 +254,16 @@ export const FRAME_BYTES = 256 * 1024;
 /** The size of every chunk of a stored blob except, usually, its last (`CHUNK_BYTES`). */
 export const CHUNK_BYTES = 64 * 1024;
 
+/** The three kinds of job (`JobClass`). */
+export type JobClass = 'menial' | 'data' | 'inference';
+
+/**
+ * How a job's result is confirmed (`Verify`): accepted after one result and
+ * confirmed if a second node picks it up in time; not accepted until a second
+ * node confirms; or one result with no confirmation.
+ */
+export type Verify = 'opportunistic' | 'required' | 'none';
+
 /**
  * A job as its submitter describes it (`Manifest`). Of its fields, these are
  * the ones this client sets; the rest are left to their defaults.
@@ -237,8 +275,16 @@ export type Manifest = {
   compute_cap: number;
   /** Latest acceptable finish time, in seconds since 1970. */
   deadline: number;
-  /** Credits set aside for the job, in millionths. */
+  /** Credits set aside for the job, in millionths. Ask `quote_job` for the least that is accepted. */
   max_fee: number;
+  /** Left out, menial. */
+  class?: JobClass;
+  /** Slots needed at once on one machine. Left out, one. */
+  slots?: number;
+  /** Left out, opportunistic. */
+  verify?: Verify;
+  /** Run the job in the control plane if no node finishes it in time. */
+  fallback?: 'always_on';
   /** Left out, open. It must be what the job's module declares. */
   privacy?: Privacy;
   /** Set when the job is one share of a private job. */
@@ -269,16 +315,75 @@ export type Share = {
 /** The mode a job runs in (`Privacy`). The nodes that run an open job can read its data. */
 export type Privacy = 'open' | 'private';
 
-/** The price of one compute unit on one node, in millionths of a credit (`BASE_PRICE`). */
-export const BASE_PRICE_MICROS = MICROS_PER_CREDIT;
+/** The base rate for compute, in microcredits per compute unit (`BASE_MICROS_PER_UNIT`). */
+export const BASE_MICROS_PER_UNIT = 250;
 
-/** How many nodes run a job when its first node is on probation (`UNPROVEN_REDUNDANCY`). */
-export const UNPROVEN_REDUNDANCY = 2;
+/** The rate posted for one class and tier (`Rate`). */
+export type Rate = {
+  class: JobClass;
+  tier: number;
+  micros_per_unit: number;
+  /** The tier's premium, in thousandths. */
+  premium: number;
+  waiting: number;
+  asking: number;
+};
 
-/** The most a job with this compute cap can cost (`Manifest::highest_fee`). */
-export function highestFee(computeCap: number): number {
-  return computeCap * BASE_PRICE_MICROS * UNPROVEN_REDUNDANCY;
-}
+/** The answer to `quote_job`. `highest_fee` is the least `max_fee` that is accepted. */
+export type Quote = { rate: Rate; fallback_micros_per_unit: number; highest_fee: number };
+
+/** What a device's owner lets it be offered (`WorkPreferences`). */
+export type WorkPreferences = {
+  contributing: boolean;
+  classes: JobClass[];
+  min_tier: number;
+  max_tier: number;
+  /** The lowest posted rate worked for, in microcredits per unit. 0 takes any. */
+  floor_micros_per_unit: number;
+  slots: number;
+  /** Local hours of the day, start inclusive, end exclusive. Null is any hour. */
+  hours: [number, number] | null;
+  on_battery: boolean;
+  on_metered: boolean;
+  /** Take work in tiers 3 and 4 only through the account's bids. */
+  market_only: boolean;
+};
+
+/** What a bid asks to be paid, in microcredits (`Price`). */
+export type Price = { per_unit: number } | { per_job: number };
+
+/** A standing order to run jobs at a price (`BidOrder`). */
+export type BidOrder = {
+  class: JobClass;
+  min_tier: number;
+  max_tier: number;
+  quantity: number;
+  price: Price;
+  /** When the bid lapses, in seconds since 1970. */
+  expires_at: number;
+};
+
+/** A bid as the job board holds it (`Bid`). */
+export type Bid = BidOrder & { id: string; account: string; filled: number };
+
+/** What an account earned and spent, in microcredits (`Activity`). */
+export type Activity = { earned: number; spent: number };
+
+/** A name and the app it points to (`NameRecord`). */
+export type NameRecord = {
+  name: string;
+  app: string;
+  registered_at: number;
+  expires_at: number;
+  /** The app was reviewed and may be listed in a directory. */
+  verified: boolean;
+};
+
+/** The answer to `resolve_name`, and one entry of a directory (`Resolved`). */
+export type Resolved = NameRecord & { manifest: AppManifest };
+
+/** The answer to `list_directory` (`Directory`). */
+export type Directory = { entries: Resolved[]; next: string | null };
 
 /** The answer to `put_blob`. */
 export type BlobRef = { hash: string };
@@ -309,11 +414,12 @@ export type Outcome =
 export type PrivateRoute = 'local' | 'private_totals' | 'encrypted_compute';
 
 /**
- * How a job's result came to stand (`Verification`): two or more nodes agreed,
- * a referee settled a disagreement, or one node ran it and nothing was
- * compared.
+ * The verification level a result got (`Verification`): a second node's
+ * result matched; a checkpoint dispute named the right one; the control plane
+ * ran it as an always-on fallback; or one node's result was accepted on its
+ * reputation.
  */
-export type Verification = 'agreed' | 'refereed' | 'unchecked';
+export type Verification = 'confirmed' | 'refereed' | 'always_on' | 'unconfirmed';
 
 /**
  * The parts of a job's receipt this client reads (`Receipt`). With the fee,
@@ -326,6 +432,8 @@ export type Receipt = {
   /** Left out for an open job. */
   route?: PrivateRoute;
   verified: Verification;
+  /** How many paid runs the fee covers: 1 unconfirmed, 2 confirmed. */
+  runs: number;
   /** Seconds from when the job was submitted to when its result stood. */
   seconds: number;
   /** Whether the job ran inside a hardware enclave. Always false so far. */
@@ -334,8 +442,8 @@ export type Receipt = {
 
 /** Where a job stands, as its submitter sees it (`JobStatus`). */
 export type JobStatus =
-  | { state: 'waiting' | 'running' | 'disputed' | 'expired' }
-  | { state: 'verified'; receipt: Receipt };
+  | { state: 'submitted' | 'leased' | 'committed' | 'disputed' | 'rejected' | 'expired' }
+  | { state: 'settled'; receipt: Receipt };
 
 /** Whether `text` has the form of a public key: 64 lowercase hex characters. */
 export function isPublicKey(text: string): boolean {

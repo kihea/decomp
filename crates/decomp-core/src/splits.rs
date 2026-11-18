@@ -19,9 +19,10 @@ enum PieceEnd {
         fee: FeeSplit,
         outcome: Outcome,
         verified: Verification,
+        runs: u32,
         seconds: u64,
     },
-    Disputed,
+    Rejected,
     Expired,
 }
 
@@ -58,7 +59,7 @@ impl Splits {
             submitter,
             manifest,
             pieces: pieces.into_iter().map(|piece| (piece, None)).collect(),
-            status: JobStatus::Running,
+            status: JobStatus::Leased,
             closed_at: None,
         };
         self.jobs.insert(id, job);
@@ -69,16 +70,20 @@ impl Splits {
     /// outputs still have to be joined, and this returns what to join.
     pub fn piece_closed(&mut self, closed: &ClosedJob, now: u64) -> Option<Merge> {
         let end = match &closed.how {
-            Closure::Verified { receipt, .. } => PieceEnd::Verified {
+            Closure::Settled { receipt, .. } => PieceEnd::Verified {
                 units: receipt.units,
                 fee: receipt.fee,
                 outcome: receipt.outcome.clone(),
                 verified: receipt.verified,
+                runs: receipt.runs,
                 seconds: receipt.seconds,
             },
-            Closure::Disputed => PieceEnd::Disputed,
+            Closure::Rejected => PieceEnd::Rejected,
             Closure::Expired => PieceEnd::Expired,
-            Closure::KnownAnswerPassed { .. } => return None,
+            Closure::FallBack(_)
+            | Closure::CheckPassed { .. }
+            | Closure::Release
+            | Closure::AuditFailed { .. } => return None,
         };
         let job_id = self.parent_of.remove(&closed.job_id)?;
         let job = self.jobs.get_mut(&job_id)?;
@@ -91,12 +96,12 @@ impl Splits {
         for end in &ends {
             let failed = match end {
                 PieceEnd::Expired => Some(JobStatus::Expired),
-                PieceEnd::Disputed => Some(JobStatus::Disputed),
+                PieceEnd::Rejected => Some(JobStatus::Rejected),
                 // A piece that failed the same way on every node fails the job.
                 PieceEnd::Verified {
                     outcome: failure @ Outcome::Failed { .. },
                     ..
-                } => Some(JobStatus::Verified {
+                } => Some(JobStatus::Settled {
                     receipt: Box::new(job.receipt(job_id, failure.clone())),
                 }),
                 PieceEnd::Verified {
@@ -128,7 +133,7 @@ impl Splits {
                     spawned: Vec::new(),
                 },
             ));
-            job.status = JobStatus::Verified { receipt };
+            job.status = JobStatus::Settled { receipt };
             job.closed_at = Some(now);
         }
     }
@@ -148,7 +153,7 @@ impl Splits {
 impl SplitJob {
     /// The receipt for the whole job: the totals of its pieces' receipts. The
     /// pieces are submitted together, so the job took as long as its slowest
-    /// piece. A job is given a receipt only once a piece of it is verified.
+    /// piece. A job is given a receipt only once a piece of it is settled.
     fn receipt(&self, id: JobId, outcome: Outcome) -> Receipt {
         let pieces = || {
             self.pieces.iter().filter_map(|(_, end)| match end {
@@ -156,13 +161,14 @@ impl SplitJob {
                     units,
                     fee,
                     verified,
+                    runs,
                     seconds,
                     ..
-                }) => Some((*units, *fee, *verified, *seconds)),
+                }) => Some((*units, *fee, *verified, *runs, *seconds)),
                 _ => None,
             })
         };
-        let weakest = pieces().map(|(_, _, verified, _)| verified).min();
+        let weakest = pieces().map(|(_, _, verified, ..)| verified).min();
         Receipt {
             job_id: id,
             module: self.manifest.module,
@@ -176,7 +182,8 @@ impl SplitJob {
             pieces: self.pieces.iter().map(|(id, _)| *id).collect(),
             // A job that is split is never private.
             route: None,
-            verified: weakest.unwrap_or(Verification::Unchecked),
+            verified: weakest.unwrap_or(Verification::Unconfirmed),
+            runs: pieces().map(|(_, _, _, runs, _)| runs).min().unwrap_or(0),
             seconds: pieces().map(|(.., seconds)| seconds).max().unwrap_or(0),
             enclave: false,
         }

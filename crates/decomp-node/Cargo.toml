@@ -9,6 +9,10 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 decomp-core = { version = "0.1.0", path = "../decomp-core" }
 decomp-sandbox = { version = "0.1.0", path = "../decomp-sandbox" }
 decomp-schema = { version = "0.1.0", path = "../decomp-schema" }
+# For the local hour of the day, which a node owner's working hours are in.
+jiff = "0.2.46"
+# For the salt a node commits to a result with.
+rand = "0.10.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"

@@ -25,8 +25,9 @@ pub const MAX_APP_MODULES: usize = 64;
 
 const SECS_PER_DAY: u64 = 24 * 3600;
 
-/// What an app is made of, as registered with the coordinator. Parts the spec
-/// lists but that nothing reads yet are added with the features that read them.
+/// What an app is made of, as registered with the control plane (spec section
+/// 7, "App manifest": modules, schemas, permissions, and sponsorship policy).
+/// Module schemas travel inside each module (see `decomp-schema`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppManifest {
@@ -37,6 +38,15 @@ pub struct AppManifest {
     /// Which jobs the app pays for. Left out, it pays for none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sponsorship: Option<Sponsorship>,
+    /// The hash of the app's client files, which a gateway serves at the app's
+    /// name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ContentHash>,
+    /// The hash of a blob of metadata the application layer defines (for
+    /// instance, how the app presents itself in a launcher). The protocol
+    /// stores the hash and never reads the blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ContentHash>,
 }
 
 /// An app's rule for paying for its users' jobs.

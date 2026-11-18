@@ -16,10 +16,11 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
-    AccountId, AccountStatus, AppManifest, Approval, Call, ContentHash, Controller, Credits,
-    Encrypted, Inclusion, JobId, JobStatus, MAX_LOG_PAGE, Manifest, OpeningKey, Outcome, Privacy,
-    PrivateRoute, PublicKey, Receipt, Request, SHARES, ShardRef, Share, ShareSet, Split,
-    Sponsorship, Verification, controller, encrypted, merkle, privacy, shares,
+    AccountId, AccountStatus, AppManifest, Approval, BidOrder, Call, ContentHash, Controller,
+    Credits, Encrypted, Fallback, Inclusion, JobClass, JobId, JobStatus, MAX_LOG_PAGE, Manifest,
+    OpeningKey, Outcome, Pickup, Price, Privacy, PrivateRoute, PublicKey, Receipt, Request, SHARES,
+    ShardRef, Share, ShareSet, Split, Sponsorship, Verification, Verify, WorkPreferences,
+    controller, encrypted, merkle, privacy, shares,
 };
 use decomp_node::beacon::Rounds;
 use decomp_node::client::{Client, ClientError, unix_now};
@@ -56,20 +57,28 @@ struct Cli {
     /// Directory holding this device's key.
     #[arg(long, env = "DECOMP_NODE_DIR", default_value = "node", global = true)]
     dir: PathBuf,
-    /// Address of the coordinator.
+    /// Address of the control plane: a local devnet, or a gateway to the
+    /// network's canisters.
     #[arg(
         long,
-        env = "DECOMP_COORDINATOR_URL",
+        env = "DECOMP_CONTROL_URL",
         default_value = "http://127.0.0.1:8787",
         global = true
     )]
-    coordinator: String,
+    control: String,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create an account for this device: make an account key, save it in a
+    /// file to be kept offline, and make this device the account's first.
+    CreateAccount {
+        /// Where to save the new account key.
+        #[arg(long)]
+        account_key: PathBuf,
+    },
     /// Join an account: show this device's code and wait for it to be approved.
     Link,
     /// Show this device's account, its credits, and how far this node is trusted.
@@ -108,7 +117,7 @@ enum Command {
         /// The code of the device whose recovery to cancel.
         device: PublicKey,
     },
-    /// As a coordinator's operator: record that an account bought credits.
+    /// As the treasury: record that an account bought credits.
     /// Nothing here takes or checks a payment.
     Bought {
         /// The ID of the account that bought them.
@@ -119,14 +128,14 @@ enum Command {
         #[arg(long)]
         payment: String,
         #[command(flatten)]
-        operator: OperatorArgs,
+        treasury: TreasuryArgs,
     },
-    /// As a coordinator's operator: show the cash-outs that wait.
+    /// As the treasury: show the cash-outs that wait.
     CashOuts {
         #[command(flatten)]
-        operator: OperatorArgs,
+        treasury: TreasuryArgs,
     },
-    /// As a coordinator's operator: record that a cash-out was paid, which
+    /// As the treasury: record that a cash-out was paid, which
     /// removes its credits for good. Nothing here pays anyone.
     PayCashOut {
         /// The cash-out's name, as `cash-outs` shows it.
@@ -135,15 +144,15 @@ enum Command {
         #[arg(long)]
         payout: String,
         #[command(flatten)]
-        operator: OperatorArgs,
+        treasury: TreasuryArgs,
     },
-    /// As a coordinator's operator: refuse a cash-out, which returns its
+    /// As the treasury: refuse a cash-out, which returns its
     /// credits to the account.
     RefuseCashOut {
         /// The cash-out's name, as `cash-outs` shows it.
         id: ContentHash,
         #[command(flatten)]
-        operator: OperatorArgs,
+        treasury: TreasuryArgs,
     },
     /// Put earned credits up as stake, which jobs of tier 3 and above require.
     Stake {
@@ -155,7 +164,8 @@ enum Command {
         /// Credits to take back, such as 20 or 12.5.
         amount: Credits,
     },
-    /// Work as a node: run the jobs the coordinator hands out, until stopped.
+    /// Work as a node: ask for work and run the jobs leased to this device,
+    /// within the owner's work preferences, until stopped.
     Start {
         /// Also hold and relay data for the network, at this local address, such
         /// as 0.0.0.0:9000. Other devices must be able to connect to it.
@@ -194,6 +204,14 @@ enum Command {
         /// credits a day for each account. Without it the app pays for none.
         #[arg(long)]
         sponsor_daily: Option<Credits>,
+        /// The app's client files, bundled into one file, for a gateway to
+        /// serve at the app's name.
+        #[arg(long)]
+        client: Option<PathBuf>,
+        /// A file of metadata the application layer reads, such as how the app
+        /// presents itself in a launcher.
+        #[arg(long)]
+        metadata: Option<PathBuf>,
     },
     /// Send a file to another device through a relay node.
     Send {
@@ -220,10 +238,18 @@ enum Command {
         /// Seconds from now by which the job must have a result.
         #[arg(long, default_value_t = 300)]
         deadline_secs: u64,
-        /// Nodes, each from a different account, that must run the job. Without
-        /// it the coordinator decides: one proven node, or two if one is new.
+        /// How the result is confirmed: opportunistic (accepted after one
+        /// result, confirmed if a second node picks it up in time), required
+        /// (waits for a second node), or none.
+        #[arg(long, value_parser = parse_verify, default_value = "opportunistic")]
+        verify: Verify,
+        /// If no node finishes the job in time, run it in the control plane at
+        /// the fallback rate instead of letting it expire.
         #[arg(long)]
-        redundancy: Option<u32>,
+        fallback: bool,
+        /// The job's class: menial, data, or inference.
+        #[arg(long, value_parser = parse_class, default_value = "menial")]
+        class: JobClass,
         /// Cut the input into pieces of this many bytes and run the module on
         /// each as a job of its own. The output is the outputs of the pieces, joined in order.
         #[arg(long)]
@@ -255,15 +281,70 @@ enum Command {
         #[arg(value_parser = parse_shard)]
         shard: ShardRef,
     },
-    /// Check the coordinator's settlement log from its first entry, and show
-    /// the batches in it.
+    /// Check the settlement log from its first entry, and show the batches in it.
     Log,
     /// Check that the receipts of the jobs this node has run are in the
-    /// batches the coordinator posted.
+    /// batches the receipts canister posted.
     Receipts,
-    /// Check the draws the coordinator's operator has published: that each
-    /// job's nodes are the ones the rule draws from public randomness.
+    /// Check the draws the job board has published: that each lease went to
+    /// the node the rule draws from public randomness.
     Draws,
+    /// Show a device's work preferences, or change them. Without a device, this
+    /// device's. Options left out keep their value.
+    Preferences {
+        /// The device, by its code. Any device of this account.
+        #[arg(long)]
+        device: Option<PublicKey>,
+        #[command(flatten)]
+        set: PreferenceArgs,
+    },
+    /// Show the posted rate of every job class and tier.
+    Rates,
+    /// Place a standing bid in the open market (tiers 3 and 4).
+    Bid {
+        /// The job class: menial, data, or inference.
+        #[arg(long, value_parser = parse_class)]
+        class: JobClass,
+        /// The lowest tier the bid takes.
+        #[arg(long, default_value_t = 3)]
+        min_tier: u32,
+        /// The highest tier the bid takes.
+        #[arg(long, default_value_t = 4)]
+        max_tier: u32,
+        /// How many jobs the bid asks for.
+        #[arg(long)]
+        quantity: u32,
+        /// The price per compute unit, in microcredits.
+        #[arg(long, conflicts_with = "per_job", required_unless_present = "per_job")]
+        per_unit: Option<u64>,
+        /// The price per job, in microcredits.
+        #[arg(long)]
+        per_job: Option<u64>,
+        /// How long the bid stands, in hours.
+        #[arg(long, default_value_t = 24)]
+        hours: u64,
+    },
+    /// Show this account's standing bids.
+    Bids,
+    /// Withdraw a standing bid.
+    CancelBid { id: ContentHash },
+    /// Register a name for this account's app, setting the deposit aside.
+    RegisterName { name: String },
+    /// Show what a name points to.
+    Resolve { name: String },
+    /// List registered names, in order.
+    Directory {
+        /// Only apps that have been reviewed.
+        #[arg(long)]
+        verified: bool,
+    },
+    /// As a reviewer: mark the app a name points to as reviewed, or not.
+    Review {
+        name: String,
+        /// Mark it as not reviewed.
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Run a job module on this device only, without the network. For a private
     /// job this is the local route.
     Run {
@@ -273,11 +354,40 @@ enum Command {
 }
 
 #[derive(Args)]
-struct OperatorArgs {
-    /// The operator's key file: `operator.key` in the coordinator's data
-    /// directory. The key must be a device of an account.
+struct TreasuryArgs {
+    /// The treasury's key file: on a local network, `control.key` in the
+    /// devnet's data directory.
     #[arg(long)]
-    operator_key: PathBuf,
+    treasury_key: PathBuf,
+}
+
+#[derive(Args)]
+struct PreferenceArgs {
+    /// Whether the device contributes at all.
+    #[arg(long)]
+    contributing: Option<bool>,
+    /// Job classes accepted, comma-separated: menial, data, inference.
+    #[arg(long, value_delimiter = ',', value_parser = parse_class)]
+    classes: Option<Vec<JobClass>>,
+    #[arg(long)]
+    min_tier: Option<u32>,
+    #[arg(long)]
+    max_tier: Option<u32>,
+    /// The lowest posted rate worked for, in microcredits per unit. 0 takes any.
+    #[arg(long)]
+    floor: Option<u64>,
+    #[arg(long)]
+    slots: Option<u32>,
+    /// Working hours, local time, as START-END, such as 22-6; or "any".
+    #[arg(long, value_parser = parse_hours)]
+    hours: Option<Option<(u8, u8)>>,
+    #[arg(long)]
+    on_battery: Option<bool>,
+    #[arg(long)]
+    on_metered: Option<bool>,
+    /// Take work in tiers 3 and 4 only through this account's bids.
+    #[arg(long)]
+    market_only: Option<bool>,
 }
 
 #[derive(Args)]
@@ -303,16 +413,19 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let connect = || -> Result<Client, Box<dyn Error>> {
         let key = device::load(&cli.dir)?.ok_or(NO_KEY)?;
-        Ok(Client::new(&cli.coordinator, key))
+        Ok(Client::new(&cli.control, key))
     };
     let outcome = match cli.command {
-        Command::Link => agent::link(&cli.dir, &cli.coordinator).map(|()| ExitCode::SUCCESS),
+        Command::Link => agent::link(&cli.dir, &cli.control).map(|()| ExitCode::SUCCESS),
+        Command::CreateAccount { account_key } => {
+            create_account(&cli.dir, &cli.control, &account_key)
+        }
         Command::Start { listen, public_url } => {
             let public_url =
                 public_url.or_else(|| listen.as_ref().map(|at| format!("http://{at}")));
             let reachable = listen.as_deref().zip(public_url.as_deref());
             let reachable = reachable.map(|(listen, public_url)| Reachable { listen, public_url });
-            agent::start(&cli.dir, &cli.coordinator, reachable).map(|()| ExitCode::SUCCESS)
+            agent::start(&cli.dir, &cli.control, reachable).map(|()| ExitCode::SUCCESS)
         }
         Command::Store { file, days } => connect().and_then(|client| store(&client, &file, days)),
         Command::Fetch { root, output } => {
@@ -322,7 +435,15 @@ fn main() -> ExitCode {
             name,
             modules,
             sponsor_daily,
-        } => connect().and_then(|client| publish(&client, name, &modules, sponsor_daily)),
+            client: client_files,
+            metadata,
+        } => connect().and_then(|client| {
+            let files = AppFiles {
+                client: client_files,
+                metadata,
+            };
+            publish(&client, name, &modules, sponsor_daily, files)
+        }),
         Command::Send {
             file,
             to,
@@ -338,7 +459,7 @@ fn main() -> ExitCode {
             account,
             keys,
             approvals,
-        } => recover(&cli.dir, &cli.coordinator, account, &keys, &approvals),
+        } => recover(&cli.dir, &cli.control, account, &keys, &approvals),
         Command::ApproveRecovery { account, device } => connect().and_then(|client| {
             let statement = controller::statement(&account, &device);
             let approval = Approval::Key {
@@ -357,40 +478,39 @@ fn main() -> ExitCode {
             account,
             amount,
             payment,
-            operator,
-        } => as_operator(&cli.coordinator, &operator).and_then(|client| {
+            treasury,
+        } => as_treasury(&cli.control, &treasury).and_then(|client| {
             client.credit_purchase(account, amount, payment)?;
             println!("credited {amount} bought credits to account {account}");
             Ok(ExitCode::SUCCESS)
         }),
-        Command::CashOuts { operator } => {
-            as_operator(&cli.coordinator, &operator).and_then(|client| {
-                let waiting = client.cash_outs()?;
-                for cash_out in &waiting {
-                    let (id, account) = (cash_out.id, cash_out.account);
-                    println!("{id}  {} credits  account {account}", cash_out.amount);
-                }
-                if waiting.is_empty() {
-                    println!("no cash-out is waiting");
-                }
-                Ok(ExitCode::SUCCESS)
-            })
-        }
+        Command::CashOuts { treasury } => as_treasury(&cli.control, &treasury).and_then(|client| {
+            let waiting = client.cash_outs()?;
+            for cash_out in &waiting {
+                let (id, account) = (cash_out.id, cash_out.account);
+                println!("{id}  {} credits  account {account}", cash_out.amount);
+            }
+            if waiting.is_empty() {
+                println!("no cash-out is waiting");
+            }
+            Ok(ExitCode::SUCCESS)
+        }),
         Command::PayCashOut {
             id,
             payout,
-            operator,
-        } => as_operator(&cli.coordinator, &operator).and_then(|client| {
+            treasury,
+        } => as_treasury(&cli.control, &treasury).and_then(|client| {
             client.pay_cash_out(id, payout)?;
             println!("recorded as paid; the credits of cash-out {id} are gone");
             Ok(ExitCode::SUCCESS)
         }),
-        Command::RefuseCashOut { id, operator } => as_operator(&cli.coordinator, &operator)
-            .and_then(|client| {
+        Command::RefuseCashOut { id, treasury } => {
+            as_treasury(&cli.control, &treasury).and_then(|client| {
                 client.refuse_cash_out(id)?;
                 println!("refused; the credits of cash-out {id} are back with the account");
                 Ok(ExitCode::SUCCESS)
-            }),
+            })
+        }
         Command::Stake { amount } => connect().and_then(|client| {
             show_credits(&client.stake(amount)?);
             Ok(ExitCode::SUCCESS)
@@ -402,7 +522,9 @@ fn main() -> ExitCode {
         Command::Submit {
             job,
             deadline_secs,
-            redundancy,
+            verify,
+            fallback,
+            class,
             split_bytes,
             sponsor,
             state,
@@ -412,7 +534,9 @@ fn main() -> ExitCode {
         } => connect().and_then(|client| {
             let limits = Limits {
                 deadline_secs,
-                redundancy,
+                verify,
+                fallback: fallback.then_some(Fallback::AlwaysOn),
+                class,
                 split_bytes,
                 sponsor,
                 state,
@@ -426,6 +550,109 @@ fn main() -> ExitCode {
         Command::Log => connect().and_then(|client| show_log(&client)),
         Command::Receipts => connect().and_then(|client| check_receipts(&client, &cli.dir)),
         Command::Draws => connect().and_then(|client| check_draws(&client)),
+        Command::Preferences { device, set } => {
+            connect().and_then(|client| preferences(&client, device, set))
+        }
+        Command::Rates => connect().and_then(|client| show_rates(&client)),
+        Command::Bid {
+            class,
+            min_tier,
+            max_tier,
+            quantity,
+            per_unit,
+            per_job,
+            hours,
+        } => connect().and_then(|client| {
+            let price = match (per_unit, per_job) {
+                (Some(price), _) => Price::PerUnit(price),
+                (None, Some(price)) => Price::PerJob(price),
+                (None, None) => return Err("give --per-unit or --per-job".into()),
+            };
+            let bid = client.place_bid(BidOrder {
+                class,
+                min_tier,
+                max_tier,
+                quantity,
+                price,
+                expires_at: unix_now() + hours * 3600,
+            })?;
+            println!("bid {} placed", bid.id);
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::Bids => connect().and_then(|client| {
+            let bids = client.bids()?;
+            for bid in &bids {
+                let price = match bid.order.price {
+                    Price::PerUnit(price) => format!("{price} µc/unit"),
+                    Price::PerJob(price) => format!("{price} µc/job"),
+                };
+                println!(
+                    "{}  {:?} tiers {}-{}  {price}  {}/{} filled  lapses in {} s",
+                    bid.id,
+                    bid.order.class,
+                    bid.order.min_tier,
+                    bid.order.max_tier,
+                    bid.filled,
+                    bid.order.quantity,
+                    bid.order.expires_at.saturating_sub(unix_now())
+                );
+            }
+            if bids.is_empty() {
+                println!("no standing bids");
+            }
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::CancelBid { id } => connect().and_then(|client| {
+            client.cancel_bid(id)?;
+            println!("bid {id} withdrawn");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::RegisterName { name } => connect().and_then(|client| {
+            let record = client.register_name(name)?;
+            println!(
+                "{} registered to app {}, held until {}",
+                record.name, record.app, record.expires_at
+            );
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::Resolve { name } => connect().and_then(|client| {
+            let resolved = client.resolve_name(name)?;
+            println!("{} -> app {}", resolved.record.name, resolved.record.app);
+            println!(
+                "reviewed {}",
+                if resolved.record.verified {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            show_app(&resolved.manifest);
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::Directory { verified } => connect().and_then(|client| {
+            let mut from = None;
+            loop {
+                let page = client.directory(verified, from.take())?;
+                for entry in &page.entries {
+                    let mark = if entry.record.verified {
+                        "reviewed"
+                    } else {
+                        ""
+                    };
+                    println!("{:<24} {}  {mark}", entry.record.name, entry.record.app);
+                }
+                match page.next {
+                    Some(next) => from = Some(next),
+                    None => break,
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::Review { name, revoke } => connect().and_then(|client| {
+            let record = client.set_verified(name, !revoke)?;
+            println!("{} reviewed: {}", record.name, record.verified);
+            Ok(ExitCode::SUCCESS)
+        }),
         Command::Run { job } => {
             read_job(&job).and_then(|files| run_here(&Sandbox::new(), &cli.dir, &job, &files))
         }
@@ -436,12 +663,12 @@ fn main() -> ExitCode {
     })
 }
 
-/// A client that signs as a coordinator's operator.
-fn as_operator(coordinator: &str, operator: &OperatorArgs) -> Result<Client, Box<dyn Error>> {
-    let path = &operator.operator_key;
+/// A client that signs as the treasury.
+fn as_treasury(control: &str, treasury: &TreasuryArgs) -> Result<Client, Box<dyn Error>> {
+    let path = &treasury.treasury_key;
     let missing = || format!("{} is not there", path.display());
     let key = device::key_file(path)?.ok_or_else(missing)?;
-    Ok(Client::new(coordinator, key))
+    Ok(Client::new(control, key))
 }
 
 /// Makes a recovery key in `file`, or reads the one there, and shows its
@@ -537,38 +764,33 @@ fn recover(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Checks the coordinator's settlement log and shows what it holds.
+/// Checks the settlement log and shows what it holds.
 fn show_log(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
     let log = client.settlement_log()?;
-    let Some(operator) = log.operator() else {
+    let Some(signer) = log.signer() else {
         println!("the settlement log has no entries yet");
         return Ok(ExitCode::SUCCESS);
     };
-    println!("operator {operator}");
+    println!("signed by {signer}");
     for batch in log.batches() {
         let (start, end) = log.receipts_of(batch.number).unwrap_or_default();
-        let disputed = if log.is_disputed(batch.number) {
-            "  (found bad by another operator; the fingerprint is the one its dispute gave)"
-        } else {
-            ""
-        };
         println!(
-            "batch {}  {} receipts, {} balances changed, fingerprint {}{disputed}",
+            "batch {}  {} receipts, {} balances changed, fingerprint {}",
             batch.number,
             end - start,
             batch.changes.len(),
             batch.fingerprint
         );
     }
-    println!("every entry is signed by the operator and follows the one before it");
+    println!("every entry is signed by the control plane and follows the one before it");
     Ok(ExitCode::SUCCESS)
 }
 
 /// Checks, for every job this node has reported, that its receipt is in a
 /// batch of the settlement log (spec section 6: "Any node can check that its
 /// own receipts are included"). The log is checked from its first entry, each
-/// receipt is linked to its batch's fingerprint by the hashes the coordinator
-/// gives, and each must hold this node's own signed report of the job.
+/// receipt is linked to its batch's fingerprint by the hashes the control
+/// plane gives, and each must hold this node's own signed reveal of the job.
 fn check_receipts(client: &Client, dir: &Path) -> Result<ExitCode, Box<dyn Error>> {
     let log = client.settlement_log()?;
     let reported = fs::read_to_string(dir.join(agent::REPORTED_FILE)).unwrap_or_default();
@@ -591,14 +813,14 @@ fn check_receipts(client: &Client, dir: &Path) -> Result<ExitCode, Box<dyn Error
             Err(error) if error.is("not_batched") => {
                 println!("job {job_id}  its receipt is not in a batch yet");
             }
-            // A job that expired or was disputed has no receipt, and neither
-            // has one that was handed out to check this node.
+            // A job that expired or was rejected has no receipt, and neither
+            // has a check that was handed out to this node.
             Err(error) if error.is("unknown_receipt") => println!("job {job_id}  no receipt"),
             Err(error) => return Err(error.into()),
         }
     }
     println!(
-        "{} jobs reported by this node: {included} proven to be in a batch, {missing} not proven",
+        "{} jobs revealed by this node: {included} proven to be in a batch, {missing} not proven",
         jobs.len()
     );
     Ok(if missing == 0 {
@@ -608,41 +830,50 @@ fn check_receipts(client: &Client, dir: &Path) -> Result<ExitCode, Box<dyn Error
     })
 }
 
-/// Checks every draw the operator has published (spec section 4: "Each draw is
-/// published, so anyone can recheck that nodes were not hand-picked"). Each
-/// must be signed by the operator that signs the settlement log, name the
-/// beacon round that was newest when it was made, with the randomness the
-/// beacon itself gives for that round, and draw the nodes the rule gives.
+/// Checks every draw the job board has published (spec section 4: "Each draw
+/// is published, so anyone can recheck that nodes were not hand-picked"). Each
+/// must be signed by the key that signs the settlement log, name the beacon
+/// round that was newest when it was made, with the randomness the beacon
+/// itself gives for that round, and grant the lease to the node the rule
+/// draws.
 fn check_draws(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
-    let operator = client.settlement_log()?.operator();
+    let signer = client.settlement_log()?.signer();
     let mut rounds = Rounds::default();
-    let (mut from, mut spot_checked) = (0, 0);
+    let (mut from, mut confirming, mut audits, mut filled) = (0, 0, 0, 0);
     loop {
         let page = client.draws(from)?;
         for signed in &page.entries {
             let draw = rounds
-                .check(signed, &operator.unwrap_or(signed.signer))
+                .check(signed, &signer.unwrap_or(signed.signer))
                 .map_err(|fault| format!("draw {from} does not hold: {fault}"))?;
+            let pickup = match draw.pickup {
+                Pickup::First => "first pickup",
+                Pickup::Second => "second pickup",
+                Pickup::Audit => "audit",
+            };
+            let market = if draw.bid.is_some() {
+                ", filling a bid"
+            } else {
+                ""
+            };
             println!(
-                "job {}  round {}, {} of {} nodes drawn{}",
+                "job {}  round {}, {pickup} drawn from {} nodes{market}",
                 draw.job_id,
                 draw.beacon.round,
-                draw.nodes.len(),
                 draw.eligible.len(),
-                if draw.checker.is_some() {
-                    ", and a spot checker"
-                } else {
-                    ""
-                }
             );
-            spot_checked += u64::from(draw.checker.is_some());
+            confirming += u64::from(draw.pickup == Pickup::Second);
+            audits += u64::from(draw.pickup == Pickup::Audit);
+            filled += u64::from(draw.bid.is_some());
             from += 1;
         }
         if page.entries.len() < MAX_LOG_PAGE {
             break;
         }
     }
-    println!("{from} draws hold, {spot_checked} of them with a spot checker");
+    println!(
+        "{from} draws hold: {confirming} second pickups, {audits} audits, {filled} filled bids"
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -656,7 +887,7 @@ fn is_report_of(inclusion: &Inclusion, job_id: &JobId, client: &Client) -> bool 
     let reported = receipt.results.iter().find(mine).and_then(|report| {
         let request: Request = report.open().ok()?;
         match request.call {
-            Call::SubmitResult { result } => Some(result.job_id),
+            Call::RevealResult { result, .. } => Some(result.job_id),
             _ => None,
         }
     });
@@ -756,11 +987,18 @@ fn show_app(app: &AppManifest) {
 }
 
 /// Stores the app's modules and publishes its manifest.
+/// The files an app publishes besides its modules.
+struct AppFiles {
+    client: Option<PathBuf>,
+    metadata: Option<PathBuf>,
+}
+
 fn publish(
     client: &Client,
     name: String,
     modules: &[PathBuf],
     sponsor_daily: Option<Credits>,
+    files: AppFiles,
 ) -> Result<ExitCode, Box<dyn Error>> {
     let mut hashes = Vec::new();
     for path in modules {
@@ -769,10 +1007,17 @@ fn publish(
         println!("module   {hash}  {}", path.display());
         hashes.push(hash);
     }
+    let upload = |path: &Option<PathBuf>| -> Result<Option<ContentHash>, Box<dyn Error>> {
+        let Some(path) = path else { return Ok(None) };
+        let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Some(client.put_blob(bytes)?))
+    };
     let status = client.publish_app(AppManifest {
         name,
         modules: hashes,
         sponsorship: sponsor_daily.map(|per_account_daily| Sponsorship { per_account_daily }),
+        client: upload(&files.client)?,
+        metadata: upload(&files.metadata)?,
     })?;
     println!("app ID   {}", status.account.id);
     if let Some(app) = &status.account.app {
@@ -807,11 +1052,16 @@ impl Report {
 /// unverified or under dispute is flagged as such").
 fn how_checked(verified: Verification) -> &'static str {
     match verified {
-        Verification::Agreed => "yes: the nodes that ran it agreed",
+        Verification::Confirmed => "confirmed: a second node's result matched",
         Verification::Refereed => {
-            "yes: nodes disagreed, and a referee ran it to find which were right"
+            "refereed: nodes disagreed, and a checkpoint dispute named the right one"
         }
-        Verification::Unchecked => "no: one node ran it, and no other was asked to",
+        Verification::AlwaysOn => {
+            "always-on: no node finished in time, so the control plane ran it"
+        }
+        Verification::Unconfirmed => {
+            "unconfirmed: one node's result, accepted on its reputation and open to audit"
+        }
     }
 }
 
@@ -819,7 +1069,9 @@ fn how_checked(verified: Verification) -> &'static str {
 /// kept from.
 struct Limits {
     deadline_secs: u64,
-    redundancy: Option<u32>,
+    verify: Verify,
+    fallback: Option<Fallback>,
+    class: JobClass,
     split_bytes: Option<u64>,
     sponsor: Option<AccountId>,
     state: Option<ShardRef>,
@@ -835,9 +1087,12 @@ fn wait_for(
 ) -> Result<Result<Box<Receipt>, &'static str>, ClientError> {
     loop {
         match client.job(job_id)? {
-            JobStatus::Waiting | JobStatus::Running => sleep(JOB_POLL),
-            JobStatus::Verified { receipt } => return Ok(Ok(receipt)),
-            JobStatus::Disputed => return Ok(Err("the nodes disagreed and none was right")),
+            JobStatus::Submitted
+            | JobStatus::Leased
+            | JobStatus::Committed
+            | JobStatus::Disputed => sleep(JOB_POLL),
+            JobStatus::Settled { receipt } => return Ok(Ok(receipt)),
+            JobStatus::Rejected => return Ok(Err("the nodes disagreed and none was right")),
             JobStatus::Expired => {
                 return Ok(Err("the deadline passed before the job had a result"));
             }
@@ -929,7 +1184,9 @@ fn submit(
     }
     let Limits {
         deadline_secs,
-        redundancy,
+        verify,
+        fallback,
+        class,
         split_bytes,
         sponsor,
         state,
@@ -949,7 +1206,10 @@ fn submit(
         input: client.put_blob(input)?,
         compute_cap: job.compute_cap,
         deadline: unix_now() + deadline_secs,
-        redundancy,
+        class,
+        slots: 1,
+        verify,
+        fallback,
         split,
         max_fee: Credits::ZERO,
         sponsor,
@@ -963,12 +1223,17 @@ fn submit(
         keep_from,
         apart_from,
     };
-    // Set aside the most the job can cost, and what its follow-ups may; what is
-    // not spent comes back.
-    for _ in 0..pieces {
-        manifest.max_fee += manifest.highest_fee();
-    }
-    manifest.max_fee += follow_up_credits;
+    // Set aside the most the job can cost at the rate posted now, and what its
+    // follow-ups may; what is not spent comes back.
+    let quote = client.quote(manifest.clone())?;
+    println!(
+        "rate    {} µc per unit (tier {}, premium {:.2})",
+        quote.rate.micros_per_unit,
+        quote.rate.tier,
+        quote.rate.premium as f64 / 1000.0
+    );
+    manifest.max_fee = quote.highest_fee + follow_up_credits;
+    let _ = pieces;
     println!("module  {}", manifest.module);
     let job_id = client.submit_job(manifest)?;
     println!("job     {job_id}");
@@ -979,9 +1244,10 @@ fn submit(
     };
     if receipt.pieces.is_empty() {
         println!(
-            "units   {} on each of {} nodes",
+            "units   {} on each of {} nodes, {} paid runs",
             receipt.units,
-            receipt.results.len()
+            receipt.results.len(),
+            receipt.runs
         );
     } else {
         println!(
@@ -1050,7 +1316,10 @@ fn submit_shares(
             input: client.put_blob(input)?,
             compute_cap: job.compute_cap,
             deadline,
-            redundancy: limits.redundancy,
+            class: limits.class,
+            slots: 1,
+            verify: limits.verify,
+            fallback: limits.fallback,
             split: None,
             max_fee: Credits::ZERO,
             sponsor: limits.sponsor,
@@ -1061,7 +1330,7 @@ fn submit_shares(
             keep_from: limits.keep_from.clone(),
             apart_from: limits.apart_from.clone(),
         };
-        manifest.max_fee = manifest.highest_fee();
+        manifest.max_fee = client.quote(manifest.clone())?.highest_fee;
         jobs.push(client.submit_job(manifest)?);
     }
 
@@ -1085,7 +1354,7 @@ fn submit_shares(
     let times = receipts.iter().map(|receipt| receipt.seconds);
     Report {
         route: format!("private totals: {SHARES} shares, each run by other accounts' nodes"),
-        checked: how_checked(checks.min().unwrap_or(Verification::Unchecked)),
+        checked: how_checked(checks.min().unwrap_or(Verification::Unconfirmed)),
         fee: (receipts.iter()).fold(Credits::ZERO, |sum, receipt| sum + receipt.fee.total),
         time: Duration::from_secs(times.max().unwrap_or(0)),
         enclave: receipts.iter().any(|receipt| receipt.enclave),
@@ -1130,7 +1399,10 @@ fn submit_encrypted(
         input: client.put_blob(input)?,
         compute_cap: job.compute_cap,
         deadline: unix_now() + limits.deadline_secs,
-        redundancy: limits.redundancy,
+        class: limits.class,
+        slots: 1,
+        verify: limits.verify,
+        fallback: limits.fallback,
         split: None,
         max_fee: Credits::ZERO,
         sponsor: limits.sponsor,
@@ -1141,7 +1413,7 @@ fn submit_encrypted(
         keep_from: limits.keep_from,
         apart_from: limits.apart_from,
     };
-    manifest.max_fee = manifest.highest_fee();
+    manifest.max_fee = client.quote(manifest.clone())?.highest_fee;
     println!("module  {}", manifest.module);
     let job_id = client.submit_job(manifest)?;
     println!("job     {job_id}");
@@ -1390,4 +1662,133 @@ fn report_output(bytes: &[u8], save_to: Option<&Path>) -> Result<(), Box<dyn Err
 fn fail(reason: &str) -> Result<ExitCode, Box<dyn Error>> {
     println!("failed  {reason}");
     Ok(ExitCode::FAILURE)
+}
+
+fn parse_verify(text: &str) -> Result<Verify, String> {
+    match text {
+        "opportunistic" => Ok(Verify::Opportunistic),
+        "required" => Ok(Verify::Required),
+        "none" => Ok(Verify::None),
+        _ => Err("verify is opportunistic, required, or none".into()),
+    }
+}
+
+fn parse_class(text: &str) -> Result<JobClass, String> {
+    match text {
+        "menial" => Ok(JobClass::Menial),
+        "data" => Ok(JobClass::Data),
+        "inference" => Ok(JobClass::Inference),
+        _ => Err("a job class is menial, data, or inference".into()),
+    }
+}
+
+fn parse_hours(text: &str) -> Result<Option<(u8, u8)>, String> {
+    if text == "any" {
+        return Ok(None);
+    }
+    let (start, end) = text
+        .split_once('-')
+        .ok_or("write hours as START-END, such as 22-6, or any")?;
+    let hour = |part: &str| part.trim().parse::<u8>().map_err(|_| "an hour is 0 to 24");
+    Ok(Some((hour(start)?, hour(end)?)))
+}
+
+/// Shows a device's work preferences, changing those given first.
+fn preferences(
+    client: &Client,
+    device: Option<PublicKey>,
+    set: PreferenceArgs,
+) -> Result<ExitCode, Box<dyn Error>> {
+    let device = device.unwrap_or_else(|| client.device_key());
+    let mut preferences: WorkPreferences = client.work_preferences(device)?;
+    let PreferenceArgs {
+        contributing,
+        classes,
+        min_tier,
+        max_tier,
+        floor,
+        slots,
+        hours,
+        on_battery,
+        on_metered,
+        market_only,
+    } = set;
+    let changing = contributing.is_some()
+        || classes.is_some()
+        || min_tier.is_some()
+        || max_tier.is_some()
+        || floor.is_some()
+        || slots.is_some()
+        || hours.is_some()
+        || on_battery.is_some()
+        || on_metered.is_some()
+        || market_only.is_some();
+    if changing {
+        let p = &mut preferences;
+        p.contributing = contributing.unwrap_or(p.contributing);
+        p.classes = classes.unwrap_or_else(|| p.classes.clone());
+        p.min_tier = min_tier.unwrap_or(p.min_tier);
+        p.max_tier = max_tier.unwrap_or(p.max_tier);
+        p.floor_micros_per_unit = floor.unwrap_or(p.floor_micros_per_unit);
+        p.slots = slots.unwrap_or(p.slots);
+        p.hours = hours.unwrap_or(p.hours);
+        p.on_battery = on_battery.unwrap_or(p.on_battery);
+        p.on_metered = on_metered.unwrap_or(p.on_metered);
+        p.market_only = market_only.unwrap_or(p.market_only);
+        preferences = client.set_work_preferences(device, preferences)?;
+    }
+    let p = &preferences;
+    println!("device       {device}");
+    println!("contributing {}", p.contributing);
+    println!("classes      {:?}", p.classes);
+    println!("tiers        {} to {}", p.min_tier, p.max_tier);
+    println!("rate floor   {} µc per unit", p.floor_micros_per_unit);
+    println!("slots        {}", p.slots);
+    match p.hours {
+        Some((start, end)) => println!("hours        {start}:00 to {end}:00, local time"),
+        None => println!("hours        any"),
+    }
+    println!("on battery   {}", p.on_battery);
+    println!("on metered   {}", p.on_metered);
+    println!("market only  {}", p.market_only);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn show_rates(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
+    let rates = client.rates()?;
+    println!("class      tier  µc/unit  premium  waiting  asking");
+    for rate in rates.rates {
+        println!(
+            "{:<10} {:>4}  {:>7}  {:>7.2}  {:>7}  {:>6}",
+            format!("{:?}", rate.class).to_lowercase(),
+            rate.tier,
+            rate.micros_per_unit,
+            rate.premium as f64 / 1000.0,
+            rate.waiting,
+            rate.asking
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Makes an account key and an account with this device as its first device.
+fn create_account(dir: &Path, control: &str, file: &Path) -> Result<ExitCode, Box<dyn Error>> {
+    if device::key_file(file)?.is_some() {
+        return Err(format!("{} already holds a key", file.display()).into());
+    }
+    let device = match device::load(dir)? {
+        Some(key) => key,
+        None => device::create(dir)?,
+    };
+    let account_key = device::create_key_file(file)?;
+    let status = Client::new(control, account_key).create_account(device.public_key())?;
+    // So that other devices can send to this one from now on.
+    Client::new(control, device).publish_sealing_key(device::opening_key(dir)?.sealing_key())?;
+    println!("account  {}", status.account.id);
+    println!("device   {}", status.account.devices[0].key);
+    println!(
+        "Keep {} offline: it approves new devices and cash-outs.",
+        file.display()
+    );
+    Ok(ExitCode::SUCCESS)
 }
