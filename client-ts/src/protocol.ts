@@ -289,6 +289,12 @@ export type Manifest = {
   verify?: Verify;
   /** Run the job in the control plane if no node finishes it in time. */
   fallback?: 'always_on';
+  /** The app that pays for the job, by its ID. Left out, the submitter pays. */
+  sponsor?: string;
+  /** Blobs the job may read, by hash, besides its input. */
+  reads?: string[];
+  /** Cut the input into pieces of this many bytes, each run as a job of its own. */
+  split?: { chunk_bytes: number };
   /** Left out, open. It must be what the job's module declares. */
   privacy?: Privacy;
   /** Set when the job is one share of a private job. */

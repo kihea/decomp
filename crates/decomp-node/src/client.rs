@@ -5,11 +5,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use decomp_core::LogError;
 use decomp_core::{
     AccountId, AccountOp, AccountStatus, Activity, AppManifest, Approval, Bid, BidOrder, Bids,
-    Blob, BlobData, BlobRef, Call, CashOut, CashOuts, Challenge, ContentHash, Credits, Directory,
-    Envelope, Inclusion, IncomingChannels, JobId, JobResult, JobStatus, LeasesGranted, Located,
-    LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES, Manifest, NameRecord, Placement, PublicKey,
-    PublishedKey, Quote, Rates, Refusal, Request, Resolved, Route, SealingKey, SettlementLog,
-    ShardNow, SigningKey, Standing, Submitted, WorkPreferences, seal,
+    Blob, BlobData, BlobRef, Call, CashOut, CashOutAsked, CashOuts, Challenge, ContentHash,
+    Credits, Directory, Envelope, Inclusion, IncomingChannels, JobId, JobResult, JobStatus,
+    LeasesGranted, Located, LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES, Manifest, NameRecord,
+    Placement, PublicKey, PublishedKey, Quote, Rates, Refusal, Request, Resolved, Route,
+    SealingKey, SettlementLog, ShardNow, SigningKey, Standing, Submitted, WorkPreferences, seal,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -274,6 +274,34 @@ impl Client {
 
     pub fn activity(&self, since: u64) -> Result<Activity, ClientError> {
         self.call(Call::GetActivity { since })
+    }
+
+    /// Approves a device into this device's account, by the code the new
+    /// device shows.
+    pub fn approve_device(&self, device_key: PublicKey) -> Result<AccountStatus, ClientError> {
+        let account = self.account()?.account;
+        let op = AccountOp::ApproveDevice {
+            account_id: account.id,
+            seq: account.seq,
+            device_key,
+        };
+        self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
+    }
+
+    /// Asks for earned credits to be cashed out. The client must sign with the
+    /// account key itself.
+    pub fn cash_out(&self, amount: Credits) -> Result<ContentHash, ClientError> {
+        let asked: CashOutAsked = self.call(Call::CashOut { amount })?;
+        Ok(asked.id)
+    }
+
+    pub fn renew_name(&self, name: String) -> Result<NameRecord, ClientError> {
+        self.call(Call::RenewName { name })
+    }
+
+    pub fn release_name(&self, name: String) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::ReleaseName { name })?;
+        Ok(())
     }
 
     pub fn register_name(&self, name: String) -> Result<NameRecord, ClientError> {

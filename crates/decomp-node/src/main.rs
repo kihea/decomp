@@ -81,6 +81,21 @@ enum Command {
     },
     /// Join an account: show this device's code and wait for it to be approved.
     Link,
+    /// Approve a new device into this device's account, by the code its
+    /// `link` shows.
+    ApproveDevice { device: PublicKey },
+    /// Ask for earned credits to be cashed out. Signed by the account key.
+    CashOut {
+        /// Credits to cash out, such as 20 or 12.5.
+        amount: Credits,
+        /// The account key file, as `create-account` made it.
+        #[arg(long)]
+        account_key: PathBuf,
+    },
+    /// Start a name's term again.
+    RenewName { name: String },
+    /// Return a name to the pool; its deposit comes back.
+    ReleaseName { name: String },
     /// Show this device's account, its credits, and how far this node is trusted.
     Account,
     /// Make a recovery key, save it in a file to be kept offline, and show its
@@ -423,6 +438,35 @@ fn main() -> ExitCode {
     };
     let outcome = match cli.command {
         Command::Link => agent::link(&cli.dir, &cli.control).map(|()| ExitCode::SUCCESS),
+        Command::ApproveDevice { device } => connect().and_then(|client| {
+            client.approve_device(device)?;
+            println!("approved device {device}");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::CashOut {
+            amount,
+            account_key,
+        } => {
+            let missing = || format!("{} is not there", account_key.display());
+            device::key_file(&account_key)
+                .map_err(Box::<dyn Error>::from)
+                .and_then(|key| key.ok_or_else(|| missing().into()))
+                .and_then(|key| {
+                    let id = Client::new(&cli.control, key).cash_out(amount)?;
+                    println!("cash-out {id} asked for; {amount} credits are set aside until it is paid or refused");
+                    Ok(ExitCode::SUCCESS)
+                })
+        }
+        Command::RenewName { name } => connect().and_then(|client| {
+            let record = client.renew_name(name)?;
+            println!("{} held until {}", record.name, record.expires_at);
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::ReleaseName { name } => connect().and_then(|client| {
+            client.release_name(name.clone())?;
+            println!("{name} released; its deposit is back");
+            Ok(ExitCode::SUCCESS)
+        }),
         Command::CreateAccount { account_key } => {
             create_account(&cli.dir, &cli.control, &account_key)
         }
@@ -1792,7 +1836,15 @@ fn create_account(dir: &Path, control: &str, file: &Path) -> Result<ExitCode, Bo
         None => device::create(dir)?,
     };
     let account_key = device::create_key_file(file)?;
-    let status = Client::new(control, account_key).create_account(device.public_key())?;
+    let status = match Client::new(control, account_key).create_account(device.public_key()) {
+        Ok(status) => status,
+        Err(error) => {
+            // A key for an account that was never made is of no use, and would
+            // block the next attempt.
+            let _ = fs::remove_file(file);
+            return Err(error.into());
+        }
+    };
     // So that other devices can send to this one from now on.
     Client::new(control, device).publish_sealing_key(device::opening_key(dir)?.sealing_key())?;
     println!("account  {}", status.account.id);

@@ -78,8 +78,8 @@ pub struct Reachable<'a> {
 /// reach it at.
 ///
 /// The command-line node runs on machines its owner points it at, so it takes
-/// the device to be on mains power and an unmetered network; the desktop app
-/// reads both from the system.
+/// the device to be on mains power and an unmetered network. Neither front end
+/// reads battery or network state from the system yet.
 pub fn start(
     dir: &Path,
     control_url: &str,
