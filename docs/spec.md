@@ -542,7 +542,7 @@ An application is a client, a set of job modules, and a typed state schema; the 
 
 **Standard modules.** Common tasks ship as audited modules with known costs, so most apps start without writing WebAssembly: signature and result checks, thumbnailing, video segment encoding, blob storage and serving, message relay, batch embedding, and feed ranking over a shard.
 
-**Typing.** Input and output types are checked when a job is submitted, and a mismatch is rejected before any node runs it. A custom language can wait; Rust already gives strong types and compiles to WebAssembly.
+**Typing.** Input and output types are checked when a job is submitted, and a mismatch is rejected before any node runs it. There is no custom language. Any language that compiles to WebAssembly and can import the host functions can write a job: Rust through the SDK, which declares types for the check, and C and C++ through a header, built freestanding or with Emscripten or wasi-sdk, as long as the module imports nothing besides the host functions.
 
 ```rust
 // Illustrative only; the SDK surface is not final.
@@ -895,7 +895,7 @@ Version 1 is the whole system in this spec, built and released as one. There are
 | Third Spaces | SDK with typed manifests and standard modules; open and private modes with all three private routes and the enclave opt-in; batch and always-on components on a single bill; sign-in by passkey, wallet, recovery key, guardians, and email reset; buying and cashing out credits; the home launcher, name registry, and gateway |
 | Apps | Send; the private short-video feed; the shared-world strategy game |
 
-**Also in version 1.** Nothing in this spec is left for later: zero-knowledge proofs, compute for other chains, governance by token-holder vote, a custom language for job modules, a node agent for phones, real-time apps, and a tradable token are all part of version 1, and come last in the build order.
+**Also in version 1.** Nothing in this spec is left for later: zero-knowledge proofs, compute for other chains, governance by token-holder vote, job modules written in any language that compiles to WebAssembly, a node agent for phones, real-time apps, and a tradable token are all part of version 1, and come last in the build order.
 
 **Acceptance criteria.** Version 1 is done when all eight hold. The targets are proposals.
 
