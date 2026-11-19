@@ -28,10 +28,15 @@ export type ControlPlane = {
 
 /** Makes a client for the control plane at `url`, such as `http://127.0.0.1:8787`. */
 export function connect(url: string): ControlPlane {
+  // An address may carry a query, as a canister's does on a gateway that names
+  // it as `?canisterId=...`; it stays on every request.
+  const [base, query] = url.includes('?') ? [url.slice(0, url.indexOf('?')), url.slice(url.indexOf('?'))] : [url, ''];
+  const root = base.replace(/\/+$/, '');
+
   async function post<Answer>(path: string, envelope: Envelope): Promise<Answer> {
     let response: Response;
     try {
-      response = await fetch(url + path, {
+      response = await fetch(root + path + query, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(envelope),

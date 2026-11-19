@@ -29,6 +29,8 @@ and what is built today in
 | Path | What it is |
 | --- | --- |
 | `crates/decomp-core` | The protocol's rules: accounts, keys, jobs, the job board, the market, the ledger, the registry, records, storage, relays, and settlement. It does no I/O, so every host applies the same rules. |
+| `canisters/control` | The control plane on the Internet Computer: accounts, sealing keys, names, and records, answering the same calls over the HTTP gateway. |
+| `crates/decomp-replica` | Runs the canisters on a local Internet Computer replica (PocketIC) behind an HTTP gateway, and upgrades them in place when rebuilt. |
 | `crates/decomp-devnet` | A local network: the control plane's services in one process, behind the same calls the canisters take. |
 | `crates/decomp-node` | The node agent and command-line client: create or join an account, contribute compute, submit jobs, store and send files, and check receipts and draws. Its library is shared with desktop apps. |
 | `crates/decomp-sandbox` | The metered, deterministic WebAssembly sandbox jobs run in. |
@@ -72,6 +74,28 @@ The node prints when it commits and reveals; the submitter prints the result,
 how it was verified, and what it cost. `decomp-node --help` lists every
 command, including `preferences`, `rates`, `bid`, `register-name`, `log`,
 `receipts`, and `draws`.
+
+### On a local Internet Computer replica
+
+The control canister runs on PocketIC, the Internet Computer's local
+replica, which runs on Linux and macOS (on Windows, inside WSL). Start a
+PocketIC server (it ships with `dfx`, in `~/.cache/dfinity/versions/<version>/`):
+
+```bash
+pocket-ic --port 47200 --ttl 86400
+```
+
+Build the canister and install it behind a gateway:
+
+```bash
+cargo build --release --target wasm32-unknown-unknown -p decomp-control-canister
+cargo run -p decomp-replica
+```
+
+It prints the canister's address. Clients take it as the control plane's
+address; where `*.localhost` names do not resolve, use the gateway's form,
+`http://localhost:4943?canisterId=<canister id>`. Rebuilding the canister
+upgrades it in place, and its state is kept.
 
 ### Devnet settings
 

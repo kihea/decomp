@@ -7,6 +7,7 @@ mod account;
 mod app;
 pub mod controller;
 mod draw;
+#[cfg(feature = "encrypted")]
 pub mod encrypted;
 mod envelope;
 mod hosts;
@@ -41,6 +42,7 @@ pub use draw::{
     BEACON_CHAIN, BEACON_MAX_LAG_ROUNDS, BEACON_PERIOD_SECS, Beacon, Draw, DrawError, Eligible,
     Pickup, SPOT_CHECK_RATE, is_audited, round_at,
 };
+#[cfg(feature = "encrypted")]
 pub use encrypted::{EncryptError, Encrypted, EncryptionKey};
 pub use envelope::{Envelope, EnvelopeError};
 pub use hosts::{Host, Hosts};

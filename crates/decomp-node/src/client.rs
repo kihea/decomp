@@ -45,17 +45,23 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(coordinator_url: &str, key: SigningKey) -> Self {
+    pub fn new(control_url: &str, key: SigningKey) -> Self {
         let http = ureq::Agent::config_builder()
             // Read error bodies ourselves: they carry the coordinator's reason.
             .http_status_as_error(false)
             .timeout_global(Some(REQUEST_TIMEOUT))
             .build()
             .new_agent();
-        let base = coordinator_url.trim_end_matches('/');
+        // An address may carry a query, as a canister's does on a gateway
+        // that names it as `?canisterId=...`; it stays on every request.
+        let (base, query) = match control_url.split_once('?') {
+            Some((base, query)) => (base, format!("?{query}")),
+            None => (control_url, String::new()),
+        };
+        let base = base.trim_end_matches('/');
         Self {
-            endpoint: format!("{base}/v1/request"),
-            ops_endpoint: format!("{base}/v1/ops"),
+            endpoint: format!("{base}/v1/request{query}"),
+            ops_endpoint: format!("{base}/v1/ops{query}"),
             key,
             http,
         }

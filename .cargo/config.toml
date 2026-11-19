@@ -1,0 +1,5 @@
+# WebAssembly builds of the protocol (the control plane's canisters) have no
+# operating system to draw randomness from. The canister supplies its own
+# source, seeded from the network's verifiable randomness.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="custom"']
