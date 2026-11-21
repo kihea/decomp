@@ -87,7 +87,11 @@ fn clear_port(server: &str, port: u16) -> Result<(), Box<dyn Error>> {
         .body_mut()
         .read_json()?;
     for gateway in gateways.iter().filter(|gateway| gateway.port == port) {
-        ureq::post(format!("{server}/http_gateway/{}/stop", gateway.instance_id)).send_empty()?;
+        ureq::post(format!(
+            "{server}/http_gateway/{}/stop",
+            gateway.instance_id
+        ))
+        .send_empty()?;
         if let Forward::PocketIcInstance(instance) = gateway.forward_to {
             ureq::delete(format!("{server}/instances/{instance}")).call()?;
         }
