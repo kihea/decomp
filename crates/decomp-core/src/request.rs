@@ -42,9 +42,14 @@ pub struct Request {
 pub enum Call {
     /// The account the signer belongs to. Answer: `AccountStatus`.
     GetAccount,
-    /// Stores bytes and names them by their hash. Answer: `BlobRef`.
+    /// Keeps bytes in the control plane, named by their root (`merkle::root`),
+    /// for always-on work: the module, input, and blobs to read of a job with
+    /// an always-on fallback, which the control plane runs if no node finishes
+    /// it. Everything else is stored on storage nodes (`StoreBlob`), since the
+    /// control plane holds hashes, not data. Answer: `BlobRef`.
     PutBlob { data: Blob },
-    /// The bytes stored under a hash. Anyone who knows the hash may ask.
+    /// Bytes the control plane keeps: always-on work's, and what jobs that
+    /// fell back to always-on produced. Anyone who knows the root may ask.
     /// Answer: `BlobData`.
     GetBlob { hash: ContentHash },
     /// Submits a job, billed to the signer's account. Answer: `Submitted`.
@@ -187,6 +192,16 @@ pub enum Call {
     /// `seal`). The signed request itself is kept, and handed to whoever asks, as
     /// proof that the device chose the key. Answer: an empty object.
     PublishSealingKey { key: SealingKey },
+    /// Stores a blob a job produced (its output, a blob it stored, its shard's
+    /// new contents, or a follow-up's input), signed by a node that holds a
+    /// lease on the job. It is kept for `PRODUCED_RETENTION_DAYS` days, paid by
+    /// the job's payer; the node then uploads it to the nodes chosen. Answer:
+    /// `Placement`, with no addresses if the blob is already stored.
+    StoreProduced {
+        job_id: JobId,
+        root: ContentHash,
+        size: u64,
+    },
     /// The sealing key a device has published. Answer: `PublishedKey`.
     GetSealingKey { device: PublicKey },
     /// The key for the signer's account's private values under `label`,

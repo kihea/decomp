@@ -17,15 +17,17 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{
     AccountId, AccountStatus, AppManifest, Approval, BidOrder, Call, ContentHash, Controller,
-    Credits, Encrypted, Fallback, Inclusion, JobClass, JobId, JobStatus, MAX_LOG_PAGE, Manifest,
-    OpeningKey, Outcome, Pickup, Price, Privacy, PrivateRoute, PublicKey, Receipt, Request, SHARES,
-    ShardRef, Share, ShareSet, Split, Sponsorship, Verification, Verify, WorkPreferences,
-    controller, encrypted, merkle, privacy, shares,
+    Credits, Encrypted, Fallback, Inclusion, JobClass, JobId, JobStatus, MAX_LOG_PAGE,
+    MAX_STORAGE_DAYS, Manifest, OpeningKey, Outcome, Pickup, Price, Privacy, PrivateRoute,
+    PublicKey, Receipt, Request, SHARES, ShardRef, Share, ShareSet, Split, Sponsorship,
+    Verification, Verify, WorkPreferences, controller, cut, encrypted, merkle, privacy, shares,
 };
+
 use decomp_node::beacon::Rounds;
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::deliver::{self, Delivered};
 use decomp_node::relay;
+use decomp_node::store;
 
 use crate::agent::Reachable;
 use decomp_sandbox::{Blobs, Job, Sandbox};
@@ -916,6 +918,7 @@ fn check_draws(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
                 Pickup::First => "first pickup",
                 Pickup::Second => "second pickup",
                 Pickup::Audit => "audit",
+                Pickup::Referee => "referee for a dispute",
             };
             let market = if draw.bid.is_some() {
                 ", filling a bid"
@@ -1069,14 +1072,14 @@ fn publish(
     let mut hashes = Vec::new();
     for path in modules {
         let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let hash = client.put_blob(bytes)?;
+        let hash = store::put(client, &bytes, MAX_STORAGE_DAYS)?;
         println!("module   {hash}  {}", path.display());
         hashes.push(hash);
     }
     let upload = |path: &Option<PathBuf>| -> Result<Option<ContentHash>, Box<dyn Error>> {
         let Some(path) = path else { return Ok(None) };
         let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Some(client.put_blob(bytes)?))
+        Ok(Some(store::put(client, &bytes, MAX_STORAGE_DAYS)?))
     };
     let status = client.publish_app(AppManifest {
         name,
@@ -1120,7 +1123,7 @@ fn how_checked(verified: Verification) -> &'static str {
     match verified {
         Verification::Confirmed => "confirmed: a second node's result matched",
         Verification::Refereed => {
-            "refereed: nodes disagreed, and a checkpoint dispute named the right one"
+            "refereed: nodes disagreed, and referee nodes agreed with one of them"
         }
         Verification::AlwaysOn => {
             "always-on: no node finished in time, so the control plane ran it"
@@ -1187,6 +1190,11 @@ fn show_follow_up(client: &Client, job_id: JobId) -> Result<(), Box<dyn Error>> 
                 spawned.len()
             ),
             Outcome::Failed { failure } => format!("failed: {failure}"),
+            Outcome::Pieces { outputs } => format!(
+                "{} pieces' outputs, fee {} credits",
+                outputs.len(),
+                receipt.fee.total
+            ),
         },
     };
     println!("follow-up {job_id}: {went}");
@@ -1213,7 +1221,7 @@ fn show_state(client: &Client, shard: ShardRef) -> Result<ExitCode, Box<dyn Erro
         println!("the shard is empty");
         return Ok(ExitCode::SUCCESS);
     };
-    let records = records::decode(&client.get_blob(contents)?)
+    let records = records::decode(&store::fetch(client, contents)?)
         .ok_or("the shard's contents are not a set of records")?;
     println!("contents {contents}");
     for (key, value) in &records {
@@ -1265,11 +1273,20 @@ fn submit(
         input,
         blobs,
     } = files;
-    let split = split_bytes.map(|chunk_bytes| Split { chunk_bytes });
-    let pieces = split.map_or(1, |split| split.pieces(input.len() as u64));
+    let always_on = fallback == Some(Fallback::AlwaysOn);
+    let split = match split_bytes {
+        Some(chunk_bytes) => {
+            let pieces = cut(&input, chunk_bytes as usize)
+                .into_iter()
+                .map(|piece| put_job_blob(client, piece.to_vec(), always_on))
+                .collect::<Result<_, _>>()?;
+            Some(Split { pieces })
+        }
+        None => None,
+    };
     let mut manifest = Manifest {
-        module: client.put_blob(module)?,
-        input: client.put_blob(input)?,
+        module: put_job_blob(client, module, always_on)?,
+        input: put_job_blob(client, input, always_on)?,
         compute_cap: job.compute_cap,
         deadline: unix_now() + deadline_secs,
         class,
@@ -1281,7 +1298,7 @@ fn submit(
         sponsor,
         reads: blobs
             .into_values()
-            .map(|blob| client.put_blob(blob))
+            .map(|blob| put_job_blob(client, blob, always_on))
             .collect::<Result<_, _>>()?,
         state,
         privacy: Privacy::Open,
@@ -1299,7 +1316,6 @@ fn submit(
         quote.rate.premium as f64 / 1000.0
     );
     manifest.max_fee = quote.highest_fee + follow_up_credits;
-    let _ = pieces;
     println!("module  {}", manifest.module);
     let job_id = client.submit_job(manifest)?;
     println!("job     {job_id}");
@@ -1346,12 +1362,35 @@ fn submit(
             for index in 0..spawned.len() {
                 show_follow_up(client, JobId::follow_up(&job_id, index as u64))?;
             }
-            let bytes = client.get_blob(output)?;
+            let bytes = store::fetch(client, output)?;
+            report_output(&bytes, job.output.as_deref())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        // A split job's output is its pieces' outputs, joined here.
+        Outcome::Pieces { outputs } => {
+            let mut bytes = Vec::new();
+            for output in outputs {
+                bytes.extend(store::fetch(client, output)?);
+            }
             report_output(&bytes, job.output.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         Outcome::Failed { failure } => fail(&failure.to_string()),
     }
+}
+
+/// Puts one of a job's blobs where it is run from: on storage nodes, and, for
+/// a job that may fall back to always-on, with the control plane as well.
+fn put_job_blob(
+    client: &Client,
+    bytes: Vec<u8>,
+    always_on: bool,
+) -> Result<ContentHash, Box<dyn Error>> {
+    let root = store::put(client, &bytes, store::JOB_DATA_DAYS)?;
+    if always_on {
+        client.put_blob(bytes)?;
+    }
+    Ok(root)
 }
 
 /// Runs a private job by the private totals route (spec section 7: "Private
@@ -1367,9 +1406,10 @@ fn submit_shares(
     limits: Limits,
 ) -> Result<ExitCode, Box<dyn Error>> {
     let inputs = shares::cut(signature, &files.input)?;
-    let module = client.put_blob(files.module)?;
+    let always_on = limits.fallback == Some(Fallback::AlwaysOn);
+    let module = put_job_blob(client, files.module, always_on)?;
     let reads = (files.blobs.into_values())
-        .map(|blob| client.put_blob(blob))
+        .map(|blob| put_job_blob(client, blob, always_on))
         .collect::<Result<Vec<_>, _>>()?;
     let deadline = unix_now() + limits.deadline_secs;
     let set = ShareSet::generate();
@@ -1379,7 +1419,7 @@ fn submit_shares(
     for (index, input) in (0..).zip(inputs) {
         let mut manifest = Manifest {
             module,
-            input: client.put_blob(input)?,
+            input: put_job_blob(client, input, always_on)?,
             compute_cap: job.compute_cap,
             deadline,
             class: limits.class,
@@ -1430,8 +1470,9 @@ fn submit_shares(
     let mut outputs = Vec::new();
     for receipt in receipts {
         match receipt.outcome {
-            Outcome::Completed { output, .. } => outputs.push(client.get_blob(output)?),
+            Outcome::Completed { output, .. } => outputs.push(store::fetch(client, output)?),
             Outcome::Failed { failure } => return fail(&failure.to_string()),
+            Outcome::Pieces { .. } => return fail("a share is never split"),
         }
     }
     report_output(&shares::join(signature, &outputs)?, job.output.as_deref())?;
@@ -1456,13 +1497,14 @@ fn submit_encrypted(
         computing_key,
         input,
     } = encrypted::encrypt(signature, &files.input)?;
-    let mut reads = vec![client.put_blob(computing_key)?];
+    let always_on = limits.fallback == Some(Fallback::AlwaysOn);
+    let mut reads = vec![put_job_blob(client, computing_key, always_on)?];
     for blob in files.blobs.into_values() {
-        reads.push(client.put_blob(blob)?);
+        reads.push(put_job_blob(client, blob, always_on)?);
     }
     let mut manifest = Manifest {
-        module: client.put_blob(files.module)?,
-        input: client.put_blob(input)?,
+        module: put_job_blob(client, files.module, always_on)?,
+        input: put_job_blob(client, input, always_on)?,
         compute_cap: job.compute_cap,
         deadline: unix_now() + limits.deadline_secs,
         class: limits.class,
@@ -1503,12 +1545,13 @@ fn submit_encrypted(
     .show();
     match receipt.outcome {
         Outcome::Completed { output, .. } => {
-            let returned = client.get_blob(output)?;
+            let returned = store::fetch(client, output)?;
             let output = encrypted::decrypt(signature, &key, &returned)?;
             report_output(&output, job.output.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         Outcome::Failed { failure } => fail(&failure.to_string()),
+        Outcome::Pieces { .. } => fail("an encrypted job is never split"),
     }
 }
 
@@ -1656,7 +1699,7 @@ fn run_here(
     })?;
     let took = started.elapsed();
 
-    println!("module  {}", ContentHash::of(module));
+    println!("module  {}", merkle::root(module));
     if let Some(signature) = sandbox.signature(module)? {
         println!("types   {}", String::from_utf8_lossy(&signature));
     }
@@ -1680,7 +1723,7 @@ fn run_here(
     match run.result {
         Ok(produced) => {
             for blob in &produced.blobs {
-                println!("stored  {} ({} bytes)", ContentHash::of(blob), blob.len());
+                println!("stored  {} ({} bytes)", merkle::root(blob), blob.len());
             }
             report_output(&produced.output, job.output.as_deref())?;
             Ok(ExitCode::SUCCESS)
@@ -1706,8 +1749,10 @@ fn read_job(job: &JobArgs) -> Result<JobFiles, Box<dyn Error>> {
     let mut blobs = Blobs::new();
     for path in &job.reads {
         let bytes = read(path)?;
-        println!("read    {}  {}", ContentHash::of(&bytes), path.display());
-        blobs.insert(ContentHash::of(&bytes), bytes);
+        // Named by its root, as it is stored and as a job asks for it.
+        let root = merkle::root(&bytes);
+        println!("read    {root}  {}", path.display());
+        blobs.insert(root, bytes);
     }
     Ok(JobFiles {
         module: read(&job.module)?,
@@ -1717,7 +1762,7 @@ fn read_job(job: &JobArgs) -> Result<JobFiles, Box<dyn Error>> {
 }
 
 fn report_output(bytes: &[u8], save_to: Option<&Path>) -> Result<(), Box<dyn Error>> {
-    println!("output  {} ({} bytes)", ContentHash::of(bytes), bytes.len());
+    println!("output  {} ({} bytes)", merkle::root(bytes), bytes.len());
     if let Some(path) = save_to {
         fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     }

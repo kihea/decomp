@@ -14,8 +14,10 @@
 //!   reseeds the control plane's own generator.
 //! - **Time.** A timer settles jobs whose windows or deadlines pass, and
 //!   posts a batch of receipts each period.
-//! - **Disputes and fallbacks** run in the canister on the interpreter
-//!   (`decomp-sandbox` with `wasmi`).
+//! - **Fallbacks.** A job with an always-on fallback that no node finished
+//!   runs in the canister on the interpreter (`decomp-sandbox` with
+//!   `wasmi`). Such jobs leave their data here; every other job's data stays
+//!   on storage nodes, and disputes are settled by further nodes.
 //! - **Value keys.** Keys for an account's private values are derived by
 //!   the subnet's threshold key (vetKD) and encrypted to the asking device
 //!   (`decomp_core::value_keys`), so no single party holds them.
@@ -31,7 +33,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use candid::{CandidType, Deserialize, Principal};
-use decomp_control::referee::{self, referee};
+use decomp_control::fallback;
 use decomp_control::{ControlPlane, MemorySnapshot, MemoryStorage, Settings, ValueKeyRequest};
 use decomp_core::{
     AccountId, BATCH_PERIOD_SECS, BEACON_PERIOD_SECS, Beacon, Blob, ContentHash, RandomnessSource,
@@ -129,23 +131,18 @@ fn with_canister<R>(f: impl FnOnce(&mut Canister) -> R) -> R {
     CANISTER.with_borrow_mut(|slot| f(slot.as_mut().expect("the canister is installed")))
 }
 
-/// Settles what time has decided and runs the disputes and fallbacks that
-/// came of it, until none are left.
+/// Settles what time has decided and runs the fallbacks that came of it,
+/// until none are left.
 fn settle(canister: &mut Canister) {
     loop {
         let at = now();
         canister.control.settle(at);
-        let cases = canister.control.take_cases();
         let fall_backs = canister.control.take_fall_backs();
-        if cases.is_empty() && fall_backs.is_empty() {
+        if fall_backs.is_empty() {
             return;
         }
-        for case in cases {
-            let verdict = referee(&canister.sandbox, &case);
-            canister.control.resolve(&case, &verdict, at);
-        }
-        for (job_id, _, case) in fall_backs {
-            let (result, produced) = referee::run(&canister.sandbox, &case, job_id);
+        for (job_id, run) in fall_backs {
+            let (result, produced) = fallback::run(&canister.sandbox, &run, job_id);
             canister.control.fell_back(job_id, result, produced, at);
         }
     }
@@ -333,13 +330,7 @@ async fn http_request_update(http: HttpRequest) -> HttpResponse {
         None => {}
     }
     let answer = with_canister(|canister| {
-        let answer = decomp_control::handle(
-            &mut canister.control,
-            &canister.sandbox,
-            &path,
-            &http.body,
-            now(),
-        );
+        let answer = decomp_control::handle(&mut canister.control, &path, &http.body, now());
         // Any call can find that a job's window or deadline has passed.
         settle(canister);
         answer

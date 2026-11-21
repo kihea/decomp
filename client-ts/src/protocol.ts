@@ -301,8 +301,8 @@ export type Manifest = {
   sponsor?: string;
   /** Blobs the job may read, by hash, besides its input. */
   reads?: string[];
-  /** Cut the input into pieces of this many bytes, each run as a job of its own. */
-  split?: { chunk_bytes: number };
+  /** The pieces of the input, each a stored blob, that each run as a job of their own. */
+  split?: { pieces: string[] };
   /** Left out, open. It must be what the job's module declares. */
   privacy?: Privacy;
   /** Set when the job is one share of a private job. */
@@ -441,7 +441,9 @@ export type Failure = 'compute_cap_exceeded' | 'trapped' | 'invalid_job';
 /** How a job ended (`Outcome`), as far as this client reads it. */
 export type Outcome =
   | { status: 'completed'; output: string }
-  | { status: 'failed'; failure: Failure };
+  | { status: 'failed'; failure: Failure }
+  /** A split job whose pieces all completed: their outputs, in order, to join. */
+  | { status: 'pieces'; outputs: string[] };
 
 /**
  * The private route a job was run by (`PrivateRoute`). A private job sent to

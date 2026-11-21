@@ -13,7 +13,7 @@ use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use decomp_control::ControlPlane;
-use decomp_control::referee::{self, Case, referee};
+use decomp_control::fallback::{self, FallBackRun};
 use decomp_core::{BEACON_PERIOD_SECS, MAX_MESSAGE_BYTES};
 use decomp_node::beacon::Rounds;
 use decomp_sandbox::Sandbox;
@@ -21,8 +21,7 @@ use tower_http::cors::CorsLayer;
 
 struct App {
     control: Mutex<ControlPlane>,
-    /// For refereeing disputes and running always-on fallbacks, which means
-    /// running the job.
+    /// For running always-on fallbacks.
     sandbox: Sandbox,
 }
 
@@ -94,33 +93,19 @@ async fn tick(app: Arc<App>) {
         let work = {
             let mut control = app.control.lock().expect("control plane lock");
             control.settle(unix_now());
-            (control.take_cases(), control.take_fall_backs())
+            control.take_fall_backs()
         };
         run_aside(&app, work);
     }
 }
 
-/// Refereeing and fallbacks run the job, which can take as long as the job
-/// did, so they happen off to the side and the control plane stays free.
-fn run_aside(
-    app: &Arc<App>,
-    (cases, fall_backs): (
-        Vec<Case>,
-        Vec<(decomp_core::JobId, decomp_core::FallBackJob, Case)>,
-    ),
-) {
-    for case in cases {
+/// A fallback runs the job, which can take as long as the job did, so it
+/// happens off to the side and the control plane stays free.
+fn run_aside(app: &Arc<App>, fall_backs: Vec<(decomp_core::JobId, FallBackRun)>) {
+    for (job_id, run) in fall_backs {
         let app = Arc::clone(app);
         tokio::task::spawn_blocking(move || {
-            let verdict = referee(&app.sandbox, &case);
-            let mut control = app.control.lock().expect("control plane lock");
-            control.resolve(&case, &verdict, unix_now());
-        });
-    }
-    for (job_id, _, case) in fall_backs {
-        let app = Arc::clone(app);
-        tokio::task::spawn_blocking(move || {
-            let (result, produced) = referee::run(&app.sandbox, &case, job_id);
+            let (result, produced) = fallback::run(&app.sandbox, &run, job_id);
             let mut control = app.control.lock().expect("control plane lock");
             control.fell_back(job_id, result, produced, unix_now());
         });
@@ -139,11 +124,11 @@ async fn answer(State(app): State<Arc<App>>, uri: Uri, body: Bytes) -> Response 
     let now = unix_now();
     let (answer, work) = {
         let mut control = app.control.lock().expect("control plane lock");
-        let answer = decomp_control::handle(&mut control, &app.sandbox, uri.path(), &body, now);
+        let answer = decomp_control::handle(&mut control, uri.path(), &body, now);
         // Any call can find that a job's window or deadline has passed, so
         // settle after each.
         control.settle(now);
-        (answer, (control.take_cases(), control.take_fall_backs()))
+        (answer, control.take_fall_backs())
     };
     run_aside(&app, work);
     let status = StatusCode::from_u16(answer.status.0).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

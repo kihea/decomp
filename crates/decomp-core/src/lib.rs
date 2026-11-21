@@ -50,11 +50,11 @@ pub use hosts::{Host, Hosts};
 pub use job::{
     Failure, Fallback, JobResult, JobStatus, Lease, MAX_APART_FROM, MAX_JOB_SLOTS, MAX_KEPT_FROM,
     MAX_PIECES, MAX_READS, MAX_RUNS, MAX_SPAWNED, MAX_TIER, Manifest, Outcome, Receipt, Share,
-    Spawn, Split, Verification, Verify,
+    Spawn, Split, Verification, Verify, cut,
 };
 pub use jobs::{
-    CONFIRMATION_WINDOW_SECS, ClosedJob, Closure, Dispute, FallBackJob, FollowUps, Granted,
-    JobError, Jobs, LEASE_SECS, REVEAL_WINDOW_SECS, Standings,
+    CONFIRMATION_WINDOW_SECS, ClosedJob, Closure, FallBackJob, FollowUps, Granted, JobError, Jobs,
+    LEASE_SECS, MAX_REFEREES, REVEAL_WINDOW_SECS, Standings,
 };
 pub use keys::{
     AccountId, ContentHash, JobId, LedgerAddress, OpeningKey, PasskeyKey, PublicKey, SealingKey,
@@ -91,10 +91,10 @@ pub use settlement::{
     SettlementLog, Through, fingerprint,
 };
 pub use shares::{SHARES, ShareError};
-pub use splits::{Merge, Splits};
+pub use splits::Splits;
 pub use state::{MAX_SHARD_NAME_BYTES, ShardRef, StateEntry, States};
 pub use storage::{
-    Addressed, Challenge, Located, Storage, StorageEntry, StorageError, StoreOrder, Storing,
-    Waiting, placement_order, storage_fee,
+    Addressed, Challenge, Located, MAX_DAYS as MAX_STORAGE_DAYS, PRODUCED_RETENTION_DAYS, Storage,
+    StorageEntry, StorageError, StoreOrder, Storing, Waiting, placement_order, storage_fee,
 };
 pub use value_keys::{MAX_VALUE_KEY_LABEL_BYTES, VALUE_KEY_CONTEXT, value_key_input};

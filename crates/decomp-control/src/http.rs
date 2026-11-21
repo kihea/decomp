@@ -17,7 +17,6 @@ use decomp_core::{
     PrivacyError, PublicKey, PublishedKey, Rates, RecordError, RecordList, Refusal, RelayError,
     Request, ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted, value_key_input,
 };
-use decomp_sandbox::Sandbox;
 use serde::Serialize;
 use serde_json::json;
 
@@ -63,13 +62,7 @@ impl<T: Serialize> Json<T> {
 /// Answers a request for `path`, with `body` as it arrived, at time `now`.
 /// After it, the host settles the control plane and runs any disputes and
 /// fallbacks it has queued (`take_cases`, `take_fall_backs`).
-pub fn handle(
-    control: &mut ControlPlane,
-    sandbox: &Sandbox,
-    path: &str,
-    body: &[u8],
-    now: u64,
-) -> Response {
+pub fn handle(control: &mut ControlPlane, path: &str, body: &[u8], now: u64) -> Response {
     let Ok(envelope) = serde_json::from_slice::<Envelope>(body) else {
         let message = "the body is not a signed envelope";
         return ApiError::new(StatusCode::BAD_REQUEST, "bad_payload", message).into_response();
@@ -79,7 +72,7 @@ pub fn handle(
             .apply_op(&envelope, now)
             .map(|status| Json(status).into_response())
             .map_err(ApiError::from),
-        "/v1/request" => request(control, sandbox, envelope, now),
+        "/v1/request" => request(control, envelope, now),
         _ => Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -89,18 +82,14 @@ pub fn handle(
     answer.unwrap_or_else(ApiError::into_response)
 }
 
-fn request(
-    control: &mut ControlPlane,
-    sandbox: &Sandbox,
-    envelope: Envelope,
-    now: u64,
-) -> Result<Response, ApiError> {
+fn request(control: &mut ControlPlane, envelope: Envelope, now: u64) -> Result<Response, ApiError> {
     let Request { issued_at, call } = envelope.open()?;
     check_fresh(issued_at, now)?;
 
     match call {
         // Anyone may resolve a name, read the directory, or fetch a blob by its
-        // hash, signed in or not.
+        // hash or find the nodes that hold it, signed in or not (spec, "Blobs":
+        // "Any client can compute where a chunk lives").
         Call::ResolveName { name } => control
             .resolve_name(&name)
             .map(|resolved| Json(resolved).into_response())
@@ -115,6 +104,10 @@ fn request(
             let page = control.directory(verified_only, query.as_deref(), from.as_deref(), limit);
             Ok(Json(page).into_response())
         }
+        Call::LocateBlob { root } => control
+            .locate(&root)
+            .map(|located| Json(located).into_response())
+            .ok_or_else(|| ApiError::from(StorageError::UnknownBlob)),
         Call::GetBlob { hash } => control
             .blobs
             .get(&hash)
@@ -123,7 +116,7 @@ fn request(
             .map(|bytes| Json(BlobData { data: Blob(bytes) }).into_response()),
         call => {
             let account = member(&control.accounts, &envelope.signer)?.clone();
-            answer(control, sandbox, call, &account, envelope, now)
+            answer(control, call, &account, envelope, now)
         }
     }
 }
@@ -188,7 +181,6 @@ pub fn value_key_request(
 
 fn answer(
     control: &mut ControlPlane,
-    sandbox: &Sandbox,
     call: Call,
     account: &Account,
     envelope: Envelope,
@@ -202,7 +194,7 @@ fn answer(
         })
         .into_response(),
         Call::SubmitJob { manifest } => {
-            let job_id = control.submit_job(&envelope, account.id, manifest, now, sandbox)?;
+            let job_id = control.submit_job(&envelope, account.id, manifest, now)?;
             Json(Submitted { job_id }).into_response()
         }
         Call::GetReceipt { job_id } => {
@@ -283,7 +275,6 @@ fn answer(
                     require_blob(control, hash)?;
                 }
             }
-            require_blob(control, &result.checkpoints)?;
             control.reveal_result(signer, result, salt, envelope, now)?;
             Json(json!({})).into_response()
         }
@@ -326,7 +317,10 @@ fn answer(
         Call::AssignName { name, app } => {
             Json(control.assign_name(&account.id, name, app, now)?).into_response()
         }
-        Call::ResolveName { .. } | Call::ListDirectory { .. } | Call::GetBlob { .. } => {
+        Call::ResolveName { .. }
+        | Call::ListDirectory { .. }
+        | Call::GetBlob { .. }
+        | Call::LocateBlob { .. } => {
             unreachable!("answered before membership is checked")
         }
         Call::StoreBlob {
@@ -344,6 +338,9 @@ fn answer(
             };
             Json(control.store_blob(blob, now)?).into_response()
         }
+        Call::StoreProduced { job_id, root, size } => {
+            Json(control.store_produced(&signer, job_id, root, size, now)?).into_response()
+        }
         Call::ConfirmStored { root } => {
             control.confirm_stored(root, signer, now)?;
             Json(json!({})).into_response()
@@ -351,10 +348,6 @@ fn answer(
         Call::DeleteBlob { root } => {
             control.delete_blob(&root, &account.id)?;
             Json(json!({})).into_response()
-        }
-        Call::LocateBlob { root } => {
-            let located = control.locate(&root).ok_or(StorageError::UnknownBlob)?;
-            Json(located).into_response()
         }
         Call::AnswerChallenge {
             challenge,
@@ -499,8 +492,10 @@ fn check_address(address: &str) -> Result<(), ApiError> {
     ))
 }
 
+/// Refuses a hash that names no blob: one neither placed on storage nodes nor
+/// kept by the control plane for always-on work.
 fn require_blob(control: &ControlPlane, hash: &ContentHash) -> Result<(), ApiError> {
-    if control.blobs.contains(hash) {
+    if control.locate(hash).is_some() || control.blobs.contains(hash) {
         Ok(())
     } else {
         Err(unknown_blob(hash))
@@ -647,9 +642,6 @@ impl From<SubmitError> for ApiError {
             SubmitError::FeeCapTooLow(_) => {
                 Self::new(StatusCode::BAD_REQUEST, "over_fee_cap", message)
             }
-            SubmitError::TypeMismatch(_) | SubmitError::TypedJobSplitByBytes => {
-                Self::new(StatusCode::BAD_REQUEST, "type_mismatch", message)
-            }
             SubmitError::TooManyPieces => {
                 Self::new(StatusCode::BAD_REQUEST, "too_many_pieces", message)
             }
@@ -743,6 +735,8 @@ impl From<StoreError> for ApiError {
             StoreError::UnknownDevice => {
                 Self::new(StatusCode::NOT_FOUND, "unknown_device", message)
             }
+            StoreError::NotLeased => Self::new(StatusCode::FORBIDDEN, "not_leased", message),
+            StoreError::NoPayer => Self::new(StatusCode::FORBIDDEN, "no_payer", message),
         }
     }
 }

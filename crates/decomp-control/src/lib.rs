@@ -4,8 +4,8 @@
 //! `store`), its clock, the beacon's rounds, and the transport, so the same
 //! services run on the devnet and in a canister.
 
+pub mod fallback;
 pub mod http;
-pub mod referee;
 pub mod state;
 pub mod store;
 

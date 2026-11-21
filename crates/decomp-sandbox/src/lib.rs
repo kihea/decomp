@@ -31,8 +31,8 @@
 //! | `seal` | `(key, src, len, dest) -> sealed` | Seals the `len` bytes at `src` to the 32-byte sealing key at `key`, writes the `len` + 48 sealed bytes at `dest`, and returns 1. Returns 0, and writes nothing, if `key` is not a usable key |
 //! | `open` | `(src, len) -> len` | Opens the `len` sealed bytes at `src` with the key of the device the job runs on, and returns the message's length as a 64-bit integer, or -1 if that key does not open them. `result.read` then copies the message |
 //! | `rand.seeded` | `(dest, len)` | Fills `len` bytes at `dest` from a stream fixed by the job's seed, so every node draws the same bytes |
-//! | `blob.get` | `(hash) -> len` | Looks up the blob whose SHA-256 hash is the 32 bytes at `hash` among those the job was given to read, and returns its length as a 64-bit integer, or -1 if it is not one of them. `result.read` then copies it |
-//! | `blob.put` | `(src, len, dest)` | Stores the `len` bytes at `src` as a blob and writes its hash to the 32 bytes at `dest`. The blob is kept only if the job completes |
+//! | `blob.get` | `(hash) -> len` | Looks up the blob whose root (`merkle::root`, as it is stored) is the 32 bytes at `hash` among those the job was given to read, and returns its length as a 64-bit integer, or -1 if it is not one of them. `result.read` then copies it |
+//! | `blob.put` | `(src, len, dest)` | Stores the `len` bytes at `src` as a blob and writes its root to the 32 bytes at `dest`. The blob is kept only if the job completes |
 //! | `kv.get` | `(key, len) -> len` | Looks up the record whose key is the `len` bytes at `key`, in the shard of state the job was handed, and returns its value's length as a 64-bit integer, or -1 if there is no such record. `result.read` then copies the value |
 //! | `kv.put` | `(key, key_len, value, value_len)` | Sets the record with that key to that value. The change is kept only if the job completes |
 //! | `kv.scan` | `(prefix, len) -> len` | Gathers the records whose keys start with the `len` bytes at `prefix`, in the byte form `decomp_schema::records` defines, and returns its length as a 64-bit integer. `result.read` then copies it |
@@ -189,6 +189,51 @@ pub struct Finding {
     pub produced: Result<Produced, decomp_core::Failure>,
     /// The job's checkpoints, one 32-byte hash after another.
     pub checkpoints: Vec<u8>,
+}
+
+impl Finding {
+    /// The result a node reports for this run of the job `job_id`: what it
+    /// produced, each blob named by its root as it is stored, and a hash of
+    /// its checkpoints.
+    pub fn result(&self, job_id: decomp_core::JobId) -> decomp_core::JobResult {
+        use decomp_core::merkle::root;
+        let outcome = match &self.produced {
+            Ok(produced) => decomp_core::Outcome::Completed {
+                output: root(&produced.output),
+                blobs: produced.blobs.iter().map(|blob| root(blob)).collect(),
+                state: produced.state.as_deref().map(root),
+                spawned: produced
+                    .spawned
+                    .iter()
+                    .map(|asked| decomp_core::Spawn {
+                        module: asked.module,
+                        input: root(&asked.input),
+                        compute_cap: asked.compute_cap,
+                    })
+                    .collect(),
+            },
+            Err(failure) => decomp_core::Outcome::Failed { failure: *failure },
+        };
+        decomp_core::JobResult {
+            job_id,
+            units: self.units,
+            outcome,
+            checkpoints: ContentHash::of(&self.checkpoints),
+        }
+    }
+
+    /// Every blob the run produced, to be stored: the output, the blobs it
+    /// stored, the shard it left, and the inputs of the follow-ups it asked for.
+    pub fn produced_blobs(&self) -> Vec<&[u8]> {
+        let Ok(made) = &self.produced else {
+            return Vec::new();
+        };
+        let mut blobs = vec![made.output.as_slice()];
+        blobs.extend(made.blobs.iter().map(Vec::as_slice));
+        blobs.extend(made.state.as_deref());
+        blobs.extend(made.spawned.iter().map(|asked| asked.input.as_slice()));
+        blobs
+    }
 }
 
 /// A job that ran but did not finish. Every honest node sees the same failure.
@@ -726,7 +771,8 @@ fn blob_put(mut caller: Caller<'_, State>, src: u32, len: u32, dest: u32) -> Hos
     charge_for_bytes(state, len as usize)?;
     make_room(state, len as usize)?;
     let bytes = range(memory, src, len as usize)?.to_vec();
-    let hash = ContentHash::of(&bytes);
+    // Named as stored blobs are, so it can be fetched from storage nodes.
+    let hash = decomp_core::merkle::root(&bytes);
     range_mut(memory, dest, 32)?.copy_from_slice(hash.as_bytes());
     state.stored.push(bytes);
     Ok(())

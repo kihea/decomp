@@ -3,19 +3,9 @@
  * it (the command-line node's `submit` does the same in Rust).
  */
 
-import { fromBase64, toBase64 } from './bytes';
-import type { ControlPlane } from './client';
-import {
-  type BlobData,
-  type BlobRef,
-  type Failure,
-  type JobStatus,
-  type Manifest,
-  type Quote,
-  now,
-  type Signer,
-  type Submitted,
-} from './protocol';
+import { concat } from './bytes';
+import { type Failure, type JobStatus, type Manifest, now, type Quote, type Submitted } from './protocol';
+import { getBlob, JOB_DATA_DAYS, putBlob, type Storage } from './storage';
 
 /** How often a submitter asks whether its job is done. */
 const JOB_POLL_MS = 500;
@@ -25,7 +15,7 @@ export class JobError extends Error {}
 
 /** A job to run, with the limits its submitter sets. */
 export type JobOrder = {
-  /** The module's hash; the module must already be stored (see `putBlob`). */
+  /** The module's root; the module must already be stored (see `putBlob`). */
   module: string;
   input: Uint8Array;
   /** Compute units the job may use before it is stopped. */
@@ -40,41 +30,17 @@ export type JobResult = {
   fee: number;
 };
 
-/** Stores bytes with the network; resolves with their hash. */
-export async function putBlob(
-  controlPlane: ControlPlane,
-  signer: Signer,
-  data: Uint8Array,
-): Promise<string> {
-  const stored = await controlPlane.request<BlobRef>(signer, {
-    type: 'put_blob',
-    data: toBase64(data),
-  });
-  return stored.hash;
-}
-
-export async function getBlob(
-  controlPlane: ControlPlane,
-  signer: Signer,
-  hash: string,
-): Promise<Uint8Array> {
-  const blob = await controlPlane.request<BlobData>(signer, { type: 'get_blob', hash });
-  return fromBase64(blob.data);
-}
-
 /**
  * Submits a job, billed to the signer's account, and waits for its settled
- * result. The most it can cost is set aside when it is submitted, and what it
+ * result. Its input goes to storage nodes first, and its output comes from
+ * them. The most it can cost is set aside when it is submitted, and what it
  * does not use comes back.
  */
-export async function runJob(
-  controlPlane: ControlPlane,
-  signer: Signer,
-  order: JobOrder,
-): Promise<JobResult> {
+export async function runJob(storage: Storage, order: JobOrder): Promise<JobResult> {
+  const { controlPlane, signer } = storage;
   const manifest: Manifest = {
     module: order.module,
-    input: await putBlob(controlPlane, signer, order.input),
+    input: await putBlob(storage, order.input, JOB_DATA_DAYS),
     compute_cap: order.computeCap,
     deadline: now() + order.deadlineSecs,
     max_fee: 0,
@@ -99,7 +65,10 @@ export async function runJob(
       case 'settled': {
         const { outcome, fee } = status.receipt;
         if (outcome.status === 'failed') throw new JobError(FAILURES[outcome.failure]);
-        return { output: await getBlob(controlPlane, signer, outcome.output), fee: fee.total };
+        // A split job's output is its pieces' outputs, joined here.
+        const roots = outcome.status === 'pieces' ? outcome.outputs : [outcome.output];
+        const parts = await Promise.all(roots.map((root) => getBlob(storage, root)));
+        return { output: concat(...parts), fee: fee.total };
       }
     }
   }

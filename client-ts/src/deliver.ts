@@ -10,6 +10,7 @@
 import { concat, equal, fromBase64, fromHex, toBase64, toHex, utf8 } from './bytes';
 import { type ControlPlane, ControlPlaneError } from './client';
 import { root as merkleRoot } from './merkle';
+import { BLOB_PATH, fetchStored, offer, sleep, TransferError, UPLOAD_ATTEMPTS } from './storage';
 import {
   type Envelope,
   type Frame,
@@ -33,9 +34,6 @@ import {
   type Taken,
 } from './protocol';
 
-/** A transfer that did not go through, with a reason a person can read. */
-export class TransferError extends Error {}
-
 /** What a device needs to send and receive. */
 export type Transfers = {
   controlPlane: ControlPlane;
@@ -46,28 +44,19 @@ export type Transfers = {
   opener: Opener;
 };
 
-/** Where a node's server keeps channels and blobs, in its web addresses. */
+/** Where a node's server keeps channels, in its web addresses. */
 const CHANNEL_PATH = '/v1/relay/';
-const BLOB_PATH = '/v1/stored/';
 
 /** Mixed into what a sender signs inside a seal (`SENDER_PURPOSE`). */
 const SENDER_PURPOSE = utf8('decomp/v1 sealed from\n');
 
-/**
- * How long to wait before offering a frame or a blob again to a node that is not
- * ready for it, and how many times to offer. A node is not ready until it has
- * heard from the controlPlane, at its next check-in, what it is to carry or hold.
- */
-const RETRY_MS = 500;
+/** How many times a frame is offered to a relay that is not ready for it. */
 const SEND_ATTEMPTS = 120;
-const UPLOAD_ATTEMPTS = 30;
 
 /** How often a receiver asks a relay for more when none is waiting, and how
  * many times in a row it may find nothing before giving up on a channel. */
 const TAKE_POLL_MS = 500;
 const TAKE_ATTEMPTS = 120;
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Publishes the key that data for this device should be sealed to. */
 export async function publishSealingKey({ controlPlane, signer, opener }: Transfers): Promise<void> {
@@ -172,31 +161,6 @@ async function sendOverChannel(
   return route;
 }
 
-/**
- * Offers a body to a node until it takes it. Resolves with `false` if the node
- * was still not ready after `attempts` tries; throws if it refuses outright.
- */
-async function offer(
-  url: string,
-  method: 'POST' | 'PUT',
-  body: string | Uint8Array,
-  attempts: number,
-): Promise<boolean> {
-  const headers = typeof body === 'string' ? { 'content-type': 'application/json' } : undefined;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const response = await fetch(url, { method, headers, body: body as BodyInit }).catch(() => {
-      throw new TransferError('A node could not be reached.');
-    });
-    if (response.ok) return true;
-    // Not yet asked to carry or hold this (404, 409 for a blob), or told to
-    // wait while the receiver catches up (429).
-    const notReady = [404, 429].includes(response.status) || (method === 'PUT' && response.status === 409);
-    if (!notReady) throw new TransferError(`A node refused: ${await response.text()}`);
-    await sleep(RETRY_MS);
-  }
-  return false;
-}
-
 /** Something another device sent to this one. */
 export type Collected = {
   /** The device that sent it, as its signature shows. */
@@ -253,18 +217,6 @@ export async function collect(
     return { from: toHex(from), data, storedAs: stored.root };
   }
   return null;
-}
-
-/** Fetches a stored blob from the first node that gives a true copy of it. */
-async function fetchStored(primitives: Primitives, root: string, located: Located): Promise<Uint8Array> {
-  for (const address of located.addresses) {
-    const response = await fetch(`${address}${BLOB_PATH}${root}`).catch(() => null);
-    if (!response?.ok) continue;
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    const named = bytes.length === located.size && toHex(await merkleRoot(bytes, primitives.sha256)) === root;
-    if (named) return bytes;
-  }
-  throw new TransferError('No node that holds the data gave it.');
 }
 
 /**

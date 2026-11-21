@@ -27,6 +27,12 @@ use crate::merkle;
 
 /// How many nodes hold each blob, when that many can be found.
 pub const TARGET_REPLICAS: usize = 3;
+
+/// How long the blobs a job produces (its output, the blobs it stored, its
+/// shard's new contents, its follow-ups' inputs) are kept, paid by the job's
+/// payer. The submitter fetches them in that time, or stores them again for
+/// longer. A starting value.
+pub const PRODUCED_RETENTION_DAYS: u32 = 7;
 /// The fewest nodes a blob may be placed on.
 pub const MIN_REPLICAS: usize = 2;
 
@@ -646,6 +652,12 @@ impl Storage {
             }
         }
         entries
+    }
+
+    /// Whether a blob is held by at least one node, so it can be fetched.
+    pub fn is_stored(&self, root: &ContentHash) -> bool {
+        self.locate(root)
+            .is_some_and(|located| !located.addresses.is_empty())
     }
 
     /// Where a stored blob can be fetched from: the nodes known to hold it.

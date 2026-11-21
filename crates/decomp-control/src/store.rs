@@ -89,8 +89,9 @@ impl Blobs {
         Self { backend }
     }
 
+    /// Keeps `bytes`, named by their root as stored blobs are.
     pub fn put(&self, bytes: &[u8]) -> io::Result<ContentHash> {
-        let hash = ContentHash::of(bytes);
+        let hash = decomp_core::merkle::root(bytes);
         if !self.backend.contains(&hash) {
             self.backend.put(&hash, bytes)?;
         }

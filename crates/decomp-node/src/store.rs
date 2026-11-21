@@ -24,6 +24,16 @@ use crate::server::respond;
 /// Where a node's server keeps blobs, in its web addresses.
 pub(crate) const BLOB_PATH: &str = "/v1/stored/";
 
+/// How long a device keeps a job's module, input, and blobs to read on
+/// storage nodes: long enough for the job, the checks that may follow it, and
+/// its reissue as a known-answer job. A starting value.
+pub const JOB_DATA_DAYS: u32 = 7;
+
+/// How long `put` waits for a node to say it holds a blob it took in, and how
+/// often it asks. Nodes say so when they next ask for work, seconds apart.
+const HELD_WAIT: Duration = Duration::from_secs(30);
+const HELD_POLL: Duration = Duration::from_millis(500);
+
 /// The blobs this node holds, and those it has been asked to take in.
 pub struct Store {
     dir: PathBuf,
@@ -156,9 +166,45 @@ pub fn upload_to(placement: &Placement, root: &ContentHash, bytes: &[u8]) -> usi
         .count()
 }
 
-/// Fetches a stored blob from the first node that gives a true copy of it.
+/// Stores `bytes` on storage nodes for `days` days, paid by this device's
+/// account, and returns their root once a node has said it holds them, so
+/// that from then on anyone can fetch them. A blob is stored once whoever
+/// stores it: if it already is, it is not stored again.
+pub fn put(client: &Client, bytes: &[u8], days: u32) -> Result<ContentHash, String> {
+    let root = merkle::root(bytes);
+    match client.store_blob(root, bytes.len() as u64, days, None) {
+        Ok(placement) => {
+            if upload_to(&placement, &root, bytes) == 0 {
+                return Err("no node chosen to hold the blob took it".into());
+            }
+        }
+        Err(error) if error.is("already_stored") => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if client
+            .locate(root)
+            .is_ok_and(|located| !located.addresses.is_empty())
+        {
+            return Ok(root);
+        }
+        if started.elapsed() >= HELD_WAIT {
+            return Err(format!("no node said it holds {root} in time"));
+        }
+        sleep(HELD_POLL);
+    }
+}
+
+/// Fetches a blob from the first storage node that gives a true copy of it.
+/// A blob no storage node holds may be one the control plane keeps for
+/// always-on work, such as what a job that fell back produced; it is fetched
+/// from there.
 pub fn fetch(client: &Client, root: ContentHash) -> Result<Vec<u8>, String> {
-    let located = client.locate(root).map_err(|error| error.to_string())?;
+    let located = match client.locate(root) {
+        Ok(located) if !located.addresses.is_empty() => located,
+        _ => return client.get_blob(root).map_err(|error| error.to_string()),
+    };
     let mut reasons = Vec::new();
     for address in &located.addresses {
         match download(address, &root, located.size) {

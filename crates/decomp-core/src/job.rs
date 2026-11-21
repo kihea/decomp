@@ -153,25 +153,29 @@ pub struct Share {
     pub index: u32,
 }
 
-/// The rule for cutting a job into pieces (spec section 2, "Decomposition"). The
-/// input is cut into runs of `chunk_bytes` bytes, the module runs on each, and the
-/// job's output is the pieces' outputs joined in order. No node sees more of the
-/// input than its own piece.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// A job cut into pieces (spec section 2, "Decomposition"): the parts of its
+/// input, each a stored blob. The submitter cuts the input (see `cut`) and
+/// stores each part, since the control plane holds no job data. The module
+/// runs on each piece as a job of its own, and the job's outcome lists the
+/// pieces' outputs in order, for the submitter to join. No node sees more of
+/// the input than its own piece.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Split {
-    pub chunk_bytes: u64,
+    pub pieces: Vec<ContentHash>,
 }
 
 /// The most pieces one job may be cut into.
 pub const MAX_PIECES: u64 = 1024;
 
-impl Split {
-    /// How many pieces an input of `input_bytes` bytes is cut into. An empty input
-    /// is still one piece.
-    pub fn pieces(&self, input_bytes: u64) -> u64 {
-        input_bytes.div_ceil(self.chunk_bytes.max(1)).max(1)
+/// Cuts `input` into runs of `chunk_bytes` bytes, the pieces of a split job.
+/// An empty input is still one piece.
+pub fn cut(input: &[u8], chunk_bytes: usize) -> Vec<&[u8]> {
+    let mut pieces: Vec<&[u8]> = input.chunks(chunk_bytes.max(1)).collect();
+    if pieces.is_empty() {
+        pieces.push(&[]);
     }
+    pieces
 }
 
 impl Manifest {
@@ -261,6 +265,11 @@ pub enum Outcome {
     Failed {
         failure: Failure,
     },
+    /// Every piece of a split job completed: their outputs, in order. Joined,
+    /// they are the job's output.
+    Pieces {
+        outputs: Vec<ContentHash>,
+    },
 }
 
 /// A follow-up job that a job asked for (spec section 7, `job.spawn`). It is
@@ -330,7 +339,7 @@ pub enum Verification {
     /// Run as an always-on fallback in the control plane, after no node
     /// finished in time.
     AlwaysOn,
-    /// Two results differed, and a checkpoint dispute named the right one.
+    /// Two results differed, and referee nodes agreed with one of them.
     Refereed,
     /// A second node's result matched.
     Confirmed,
@@ -388,7 +397,7 @@ pub enum JobStatus {
     /// A node has committed the hash of its result. A second pickup may still
     /// come, or the commitments are being revealed.
     Committed,
-    /// Two results differ, and the checkpoint dispute is running.
+    /// Two results differ, and referee nodes are running the job again.
     Disputed,
     /// A result stood and was paid for. The receipt says how it was verified.
     Settled { receipt: Box<Receipt> },

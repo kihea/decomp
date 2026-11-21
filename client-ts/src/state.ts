@@ -3,9 +3,8 @@
  * the same in Rust). Anyone can read a shard; only a job changes one.
  */
 
-import type { ControlPlane } from './client';
-import { getBlob } from './jobs';
-import type { ShardNow, Signer } from './protocol';
+import type { ShardNow } from './protocol';
+import { getBlob, type Storage } from './storage';
 
 /** Bytes in a length or count in the byte form of a set of records. */
 const LENGTH_BYTES = 4;
@@ -17,15 +16,11 @@ export type Records = Map<string, Uint8Array>;
  * The records a shard of an app's state holds now. A shard no job has written
  * to holds none.
  */
-export async function readShard(
-  controlPlane: ControlPlane,
-  signer: Signer,
-  app: string,
-  shard: string,
-): Promise<Records> {
-  const now = await controlPlane.request<ShardNow>(signer, { type: 'get_state', app, shard });
+export async function readShard(storage: Storage, app: string, shard: string): Promise<Records> {
+  const call = { type: 'get_state', app, shard } as const;
+  const now = await storage.controlPlane.request<ShardNow>(storage.signer, call);
   if (now.contents === null) return new Map();
-  return decodeRecords(await getBlob(controlPlane, signer, now.contents));
+  return decodeRecords(await getBlob(storage, now.contents));
 }
 
 /**

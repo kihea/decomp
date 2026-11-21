@@ -49,18 +49,21 @@ Start a local network:
 cargo run --release -p decomp-devnet
 ```
 
-It listens on `http://127.0.0.1:8787` and keeps its data in `./data`. In
-another terminal, create an account for this device and keep the account key
-somewhere safe:
+It listens on `http://127.0.0.1:8787` and keeps its data in `./data`. Job
+data lives on storage nodes, and a blob is kept on nodes of at least two
+accounts, so start two contributing nodes, each with its own account and its
+own address to hold data at. Keep each account key somewhere safe:
 
 ```bash
-cargo run --release -p decomp-node -- create-account --account-key account.key
+cargo run --release -p decomp-node -- --dir one create-account --account-key one.key
+cargo run --release -p decomp-node -- --dir one start --listen 127.0.0.1:9101
 ```
 
-Contribute this device's compute:
+and, in another terminal:
 
 ```bash
-cargo run --release -p decomp-node -- start
+cargo run --release -p decomp-node -- --dir two create-account --account-key two.key
+cargo run --release -p decomp-node -- --dir two start --listen 127.0.0.1:9102
 ```
 
 From a second account, submit a job. The input is a JSON array of the job
@@ -71,8 +74,10 @@ cargo run --release -p decomp-node -- --dir other create-account --account-key o
 cargo run --release -p decomp-node -- --dir other submit module.wasm --input input.json --compute-cap 1
 ```
 
-The node prints when it commits and reveals; the submitter prints the result,
-how it was verified, and what it cost. `decomp-node --help` lists every
+The submitter stores the module and input on the nodes, which fetch them, run
+the job, and store its output there. The nodes print when they commit and
+reveal; the submitter prints the result, how it was verified, and what it
+cost. `decomp-node --help` lists every
 command, including `preferences`, `rates`, `bid`, `register-name`, `log`,
 `receipts`, and `draws`.
 

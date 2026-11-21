@@ -164,8 +164,8 @@ deadline, as a `required` job does.
 
 **A result nothing was compared with says so.** "A result that is unverified or
 under dispute is flagged as such." Every receipt names one of four levels:
-`confirmed` (a second node's result matched), `refereed` (results differed and a
-checkpoint dispute named the right one), `always_on` (the control plane ran it
+`confirmed` (a second node's result matched), `refereed` (results differed and
+referee nodes agreed with one of them), `always_on` (the control plane ran it
 after no node finished in time), or `unconfirmed` (one node's result, accepted on
 its reputation and open to audit). A job whose pieces were checked in different
 ways reports the weakest of them.
@@ -356,8 +356,10 @@ it decides who holds or carries what, checks them, and pays.
 
 **Stored blobs are named by a hash-tree root over 1 MB chunks.** With a root, one
 chunk can be proven to belong to the blob, so the control plane can check that a
-node still holds a blob without holding it too. Modules, inputs, and outputs keep
-their plain hashes.
+node still holds a blob without holding it too. Every blob is named this way:
+modules, inputs, outputs, record values, and what `blob.put` returns inside a
+job, so any of them can be fetched from storage nodes by the name a job or a
+record gives it.
 
 **Placement is computed, not recorded.** A blob goes to the storage nodes whose
 hash with the blob's name ranks highest (rendezvous hashing), each from a
@@ -435,8 +437,8 @@ for.
 A node holds no user's opening key, and must not. So `open` is given no key by
 the job: it opens with a key the device running the job was given for it. The
 command-line node gives its own opening key to a private job it runs by the local
-route, and to nothing else. Nodes, the control plane's referee, and an open job
-run on a device alone are given none. There `open` answers "cannot be opened" for
+route, and to nothing else. Nodes, referees, and an open job run on a device
+alone are given none. There `open` answers "cannot be opened" for
 any input, and charges the same, so every node agrees and results still compare.
 
 Each costs a job what checking a signature does, and one instruction more for
@@ -678,6 +680,64 @@ out, as is pay held back for a spot check. So putting up stake, taking it back,
 and setting credits aside change no balance on the log. Paying for a job does,
 and so does a forfeit.
 
+## Hashes, not data
+
+Spec, "Two rules shape the control plane": "Canisters hold records, hashes, and
+proofs. Job inputs, outputs, and files travel peer to peer between clients and
+nodes."
+
+**Every job's data is on storage nodes.** A submitter stores a job's module,
+input, and blobs to read with `store_blob`, uploads them to the nodes chosen,
+and waits until one says it holds each; `submit_job` refuses a job whose blobs
+no storage node holds. Nodes fetch them from storage nodes, and anyone, signed
+in or not, may ask where a blob is held. Record values and app files are stored
+the same way.
+
+**The submitter cuts a split job.** The control plane never reads an input, so
+it cannot cut one. `split` lists the pieces, each stored by the submitter
+(`decomp_core::cut` is the rule the clients share), and a split job's outcome
+lists the pieces' outputs, which the submitter joins.
+
+**Nodes check a job against its module.** The control plane checks only what a
+manifest shows (a share only on a private route, no state for a private job).
+A node checks the rest before it runs a job: that the module declares the job's
+privacy mode, that a route fits, and that the input has the module's types. A
+job that fails is a verified failure, `invalid_job`, for no units.
+
+**What a job produces goes to storage nodes, paid by its payer.** Before it
+commits, the node that ran a job stores each blob it produced with
+`store_produced`, which only a node holding a lease on the job may ask for. The
+blobs are kept for `PRODUCED_RETENTION_DAYS` (7) at the payer's expense; the
+spec leaves the period open, and a week covers fetching the result and any
+follow-ups. A second node that ran the job finds its output already stored. A
+reveal naming a produced blob that was never placed is refused, so an output a
+receipt names can be fetched. Checkpoint lists are not uploaded: a result
+commits to their hash.
+
+**Disputes are settled by referee nodes.** The spec has the job board re-run the
+segment where two checkpoint lists part. That needs the job's data in the
+control plane, which the rule above forbids, and a canister cannot run a large
+job in one call. So a disputed job takes a further lease, drawn at random like a
+second pickup, and the node granted it cannot tell that the job is disputed.
+The first result two nodes report stands (`refereed`). One honest referee is
+enough, as one honest node is in the spec's version; two referees at most are
+drawn, and if no two results agree by then the job is rejected and refunded and
+nobody is penalized. Referees whose result stood are paid as checkers are, from
+the verification fund; each node found wrong pays what the referees' runs cost
+out of its stake (spec section 5).
+
+**Always-on jobs keep their data with the control plane.** A job with
+`fallback: always_on` may be run by the control plane, which must then have its
+data, as an always-on component does. Its submitter also leaves its module,
+input, and blobs to read there (`put_blob`), and what a fallback run produces
+is kept there and fetched with `get_blob`. A client fetches a blob from storage
+nodes first and asks the control plane when none holds it.
+
+**A committed node is free.** A node that has committed a result has finished
+the job, so the job no longer takes up its slots while results are revealed.
+Otherwise a node with one slot could not confirm another node's job while its
+own waited to be revealed.
+
 ## Hosts
 
 **One library, two hosts.** The control plane's services and interface live
@@ -694,12 +754,11 @@ fetched again, and checks drand rounds against drand. The control plane's own
 generator (known-answer jobs, challenges, relays) is reseeded from the same
 source.
 
-**The canister runs jobs on an interpreter.** Disputes, fallbacks, and the
-type check run on wasmi, which compiles into a canister; nodes run wasmtime.
-Metering is part of the module, and both engines give NaN results the
-canonical bit pattern, so they count and compute the same. An update call has
-an instruction limit, so a dispute over a large job cannot yet be refereed in
-the canister.
+**The canister runs fallbacks on an interpreter.** Always-on fallbacks run on
+wasmi, which compiles into a canister; nodes run wasmtime. Metering is part of
+the module, and both engines give NaN results the canonical bit pattern, so
+they count and compute the same. An update call has an instruction limit, so a
+large always-on job cannot yet finish in the canister.
 
 ## Value keys
 

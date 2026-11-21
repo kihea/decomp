@@ -23,7 +23,7 @@
 //! decisions. Only the choice of known-answer jobs uses randomness of the
 //! caller's own, because a node must not be able to tell one is coming. What
 //! the caller must act on comes back through lists it takes after each call:
-//! jobs that closed, score events, draws to publish, and disputes to referee.
+//! jobs that closed, score events, and draws to publish.
 //!
 //! Nothing here is durable: leases and commitments are needed only until a job
 //! closes (spec, "Data management"). What lasts is the receipt, which the caller
@@ -77,6 +77,11 @@ const KNOWN_ANSWERS_KEPT: usize = 256;
 
 /// How long a node is given to finish a known-answer job or an audit.
 const CHECK_DEADLINE_SECS: u64 = 600;
+
+/// How many further nodes are drawn to settle a dispute before the job is
+/// given up as rejected. Each runs the job again; the first result that two
+/// nodes report stands. A starting value.
+pub const MAX_REFEREES: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
@@ -138,6 +143,10 @@ pub enum Closure {
     /// An audit found an unconfirmed result wrong. The caller takes what was
     /// held back from the account's payout. The job's ID is the audited job's.
     AuditFailed { account: AccountId },
+    /// A dispute found a node's result wrong. The caller takes what settling
+    /// the dispute cost out of its account's stake (spec section 5: wrong
+    /// nodes pay for refereeing).
+    WrongInDispute { node: PublicKey, cost: Credits },
 }
 
 /// A job to run as an always-on fallback.
@@ -159,14 +168,15 @@ pub struct FollowUps {
     pub jobs: Vec<(JobId, Manifest)>,
 }
 
-/// Nodes disagreed about a job. The caller referees it (which means running the
-/// job, so it cannot happen here) and answers with [`Jobs::resolve`].
-pub struct Dispute {
-    pub job_id: JobId,
-    pub manifest: Manifest,
-    /// The contents of the shard the job was handed, if any.
-    pub shard: Option<ContentHash>,
-    pub reports: Vec<(PublicKey, JobResult)>,
+/// Nodes disagreed about a job, and further nodes are drawn to run it again
+/// (spec section 4, "Checkpoint disputes"). The control plane holds no job
+/// data, so it cannot run the job itself; a node drawn at random can, and like
+/// a second pickup it cannot tell that the job it was granted is disputed.
+struct Refereeing {
+    /// The results that disagree, and those of referees that agreed with none.
+    reports: Vec<(PublicKey, JobResult)>,
+    /// How many referees have reported.
+    referees: u32,
 }
 
 /// What a node learns when it asks for work.
@@ -221,8 +231,6 @@ enum Phase {
     Revealing {
         until: u64,
     },
-    /// The results differed; the caller is refereeing.
-    Disputed,
     Closed,
 }
 
@@ -240,6 +248,8 @@ struct Job {
     draws: Vec<Draw>,
     /// Until when a second node may pick the job up, once the first committed.
     confirm_until: Option<u64>,
+    /// Set while a dispute about the job is being settled.
+    refereeing: Option<Refereeing>,
     phase: Phase,
     status: JobStatus,
     closed_at: Option<u64>,
@@ -258,6 +268,8 @@ struct Held {
     taper: u64,
     expires_at: u64,
     proven: bool,
+    /// The node was drawn to settle a dispute.
+    referee: bool,
     commitment: Option<ContentHash>,
     revealed: Option<(JobResult, Envelope)>,
 }
@@ -286,7 +298,6 @@ pub struct Jobs {
     holds: VecDeque<(u64, JobId)>,
     closed: Vec<ClosedJob>,
     events: Vec<ScoreEvent>,
-    disputes: Vec<Dispute>,
     draws: Vec<Draw>,
     beacon: Option<Beacon>,
 }
@@ -407,6 +418,13 @@ impl Jobs {
         }
     }
 
+    /// Whether `node` holds a lease on `job_id` that is still taking results.
+    pub fn holds_lease(&self, job_id: &JobId, node: &PublicKey) -> bool {
+        self.jobs.get(job_id).is_some_and(|job| {
+            job.closed_at.is_none() && job.leases.iter().any(|held| held.node == *node)
+        })
+    }
+
     /// `account`'s live bids.
     pub fn bids_of(&self, account: &AccountId, now: u64) -> Vec<Bid> {
         let mine = self.bids.values().filter(|bid| bid.account == *account);
@@ -419,6 +437,9 @@ impl Jobs {
     ///
     /// `contents` gives the contents a shard of state has now. The caller must
     /// have applied what every settled job left behind before calling this.
+    /// `stored` says whether a blob can still be fetched from storage nodes,
+    /// which a job reissued as a check needs of every blob it reads.
+    #[allow(clippy::too_many_arguments)]
     pub fn request_lease(
         &mut self,
         node: PublicKey,
@@ -427,6 +448,7 @@ impl Jobs {
         rng: &mut impl Rng,
         standings: &Standings,
         contents: &dyn Fn(&ShardRef) -> Option<ContentHash>,
+        stored: &dyn Fn(&ContentHash) -> bool,
     ) -> Granted {
         self.sweep(now);
         let entry = self.nodes.entry(node).or_insert(Node {
@@ -438,7 +460,7 @@ impl Jobs {
         entry.account = account;
         if self.nodes[&node].known_answer_due && self.free_slots(&node) > 0 {
             let standing = (standings.node)(&node, &account);
-            self.issue_check(node, account, now, rng, &standing);
+            self.issue_check(node, account, now, rng, &standing, stored);
         }
         self.grant(now, standings, contents);
 
@@ -540,15 +562,66 @@ impl Jobs {
         Ok(())
     }
 
-    /// Closes a disputed job once the caller has worked out which nodes, if any,
-    /// reported the right result.
-    pub fn resolve(&mut self, job_id: JobId, right: &[PublicKey], now: u64) {
+    /// Closes a disputed job: `right` are the nodes, referees among them,
+    /// whose result stands, if two agreed. Every other node that reported pays
+    /// for what the referees' runs cost.
+    fn decide(&mut self, job_id: JobId, right: &[PublicKey], now: u64) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
-        if job.phase != Phase::Disputed {
+        let Some(refereeing) = &job.refereeing else {
             return;
+        };
+        let referee_units: u64 = job
+            .leases
+            .iter()
+            .filter(|held| held.referee)
+            .filter_map(|held| held.revealed.as_ref().map(|(result, _)| result.units))
+            .sum();
+        let cost = compute_fee(referee_units, job.rate);
+        let wrong: Vec<PublicKey> = refereeing
+            .reports
+            .iter()
+            .map(|(node, _)| *node)
+            .filter(|node| !right.contains(node))
+            .collect();
+        // Referees whose result stood are paid as checkers are; the job's
+        // payer pays only for the runs it asked for.
+        // With no two results agreeing, nobody is found right or wrong.
+        let decided = !right.is_empty();
+        for held in job.leases.iter().filter(|held| held.referee && decided) {
+            let Some((result, _)) = &held.revealed else {
+                continue;
+            };
+            let what = if right.contains(&held.node) {
+                let reward = compute_fee(result.units, job.rate).percent(85);
+                self.closed.push(ClosedJob {
+                    job_id,
+                    how: Closure::CheckPassed {
+                        account: held.account,
+                        reward,
+                    },
+                });
+                Conduct::Matched
+            } else {
+                Conduct::Wrong
+            };
+            self.events.push(ScoreEvent {
+                node: held.node,
+                at: now,
+                what,
+            });
         }
+        if !right.is_empty() {
+            for node in wrong {
+                self.closed.push(ClosedJob {
+                    job_id,
+                    how: Closure::WrongInDispute { node, cost },
+                });
+            }
+        }
+        let job = self.jobs.get_mut(&job_id).expect("checked above");
+        job.leases.retain(|held| !held.referee);
         if let Kind::Audit {
             audited,
             account,
@@ -559,7 +632,7 @@ impl Jobs {
             // The audited node was wrong unless the referee said otherwise.
             let (audited, account, node) = (*audited, *account, *node);
             let original_right = right.contains(&node);
-            if !original_right {
+            if decided && !original_right {
                 self.events.push(ScoreEvent {
                     node,
                     at: now,
@@ -571,18 +644,24 @@ impl Jobs {
                 });
             }
             let job = self.jobs.get_mut(&job_id).expect("checked above");
-            let auditor = job.leases[0].node;
+            let Some(auditor) = job.leases.first() else {
+                job.finish(JobStatus::Rejected, now);
+                return;
+            };
+            let auditor = auditor.node;
             let auditor_account = job.leases[0].account;
             let auditor_right = right.contains(&auditor);
-            self.events.push(ScoreEvent {
-                node: auditor,
-                at: now,
-                what: if auditor_right {
-                    Conduct::Matched
-                } else {
-                    Conduct::Wrong
-                },
-            });
+            if decided {
+                self.events.push(ScoreEvent {
+                    node: auditor,
+                    at: now,
+                    what: if auditor_right {
+                        Conduct::Matched
+                    } else {
+                        Conduct::Wrong
+                    },
+                });
+            }
             if auditor_right {
                 let units = job.leases[0].revealed.as_ref().map_or(0, |(r, _)| r.units);
                 let reward = compute_fee(units, job.rate).percent(85);
@@ -682,11 +761,6 @@ impl Jobs {
         std::mem::take(&mut self.draws)
     }
 
-    /// The disputes that arose since this was last called.
-    pub fn take_disputes(&mut self) -> Vec<Dispute> {
-        std::mem::take(&mut self.disputes)
-    }
-
     /// Lets time pass: expires leases and jobs, moves jobs whose windows closed,
     /// releases holds, retunes rates, and forgets what is no longer needed.
     pub fn tick(&mut self, now: u64) {
@@ -699,6 +773,16 @@ impl Jobs {
             return;
         };
         match job.phase {
+            Phase::Open if job.refereeing.is_some() => {
+                let referee_committed = job.leases.iter().any(|held| {
+                    held.referee && held.commitment.is_some() && held.revealed.is_none()
+                });
+                if referee_committed {
+                    job.phase = Phase::Revealing {
+                        until: now + REVEAL_WINDOW_SECS,
+                    };
+                }
+            }
             Phase::Open => {
                 let committed = job.committed();
                 let pending = job.leases.iter().any(|held| held.commitment.is_none());
@@ -719,7 +803,61 @@ impl Jobs {
                     self.evaluate(job_id, now);
                 }
             }
-            Phase::Disputed | Phase::Closed => {}
+            Phase::Closed => {}
+        }
+    }
+
+    /// Starts settling a dispute: the job takes a lease again, for a referee.
+    fn dispute(&mut self, job_id: JobId, reports: Vec<(PublicKey, JobResult)>) {
+        let job = self.jobs.get_mut(&job_id).expect("disputed jobs exist");
+        job.refereeing = Some(Refereeing {
+            reports,
+            referees: 0,
+        });
+        job.phase = Phase::Open;
+        job.status = JobStatus::Disputed;
+        job.confirm_until = None;
+        if !self.open.contains(&job_id) {
+            self.open.push_back(job_id);
+        }
+    }
+
+    /// Weighs a referee's result, once it is revealed or its time is up.
+    fn referee_reported(&mut self, job_id: JobId, now: u64) {
+        let job = self.jobs.get_mut(&job_id).expect("evaluated jobs exist");
+        let refereeing = job.refereeing.as_mut().expect("the job is disputed");
+        let reported = job.leases.iter().find(|held| {
+            held.referee
+                && !refereeing
+                    .reports
+                    .iter()
+                    .any(|(node, _)| *node == held.node)
+        });
+        if let Some(held) = reported {
+            let (found, _) = held.revealed.clone().expect("kept leases revealed");
+            let node = held.node;
+            refereeing.referees += 1;
+            let mut right: Vec<PublicKey> = refereeing
+                .reports
+                .iter()
+                .filter(|(_, result)| *result == found)
+                .map(|(node, _)| *node)
+                .collect();
+            if !right.is_empty() {
+                right.push(node);
+                self.decide(job_id, &right, now);
+                return;
+            }
+            refereeing.reports.push((node, found));
+        }
+        if refereeing.referees >= MAX_REFEREES || job.manifest.deadline <= now {
+            self.decide(job_id, &[], now);
+            return;
+        }
+        job.phase = Phase::Open;
+        job.status = JobStatus::Disputed;
+        if !self.open.contains(&job_id) {
+            self.open.push_back(job_id);
         }
     }
 
@@ -737,6 +875,10 @@ impl Jobs {
             }
         }
         job.leases.retain(|held| held.revealed.is_some());
+        if job.refereeing.is_some() {
+            self.referee_reported(job_id, now);
+            return;
+        }
         let reveals: Vec<(PublicKey, JobResult)> = job
             .leases
             .iter()
@@ -797,8 +939,8 @@ impl Jobs {
                     },
                     false,
                 ) => {
-                    // The auditor and the audited node disagree: a dispute names
-                    // which of them was right.
+                    // The auditor and the audited node disagree: referees
+                    // settle which of them was right.
                     let original = (
                         *audited_node,
                         JobResult {
@@ -806,13 +948,7 @@ impl Jobs {
                             ..expected.result.clone()
                         },
                     );
-                    job.phase = Phase::Disputed;
-                    self.disputes.push(Dispute {
-                        job_id,
-                        manifest: job.manifest.clone(),
-                        shard: job.shard,
-                        reports: vec![original, (node, found)],
-                    });
+                    self.dispute(job_id, vec![original, (node, found)]);
                 }
                 (Kind::Submitted { .. }, _) => unreachable!("matched above"),
             }
@@ -858,16 +994,7 @@ impl Jobs {
                 let everyone: Vec<PublicKey> = reveals.iter().map(|(node, _)| *node).collect();
                 self.close(job_id, &everyone, now);
             }
-            _ => {
-                job.phase = Phase::Disputed;
-                job.status = JobStatus::Disputed;
-                self.disputes.push(Dispute {
-                    job_id,
-                    manifest: job.manifest.clone(),
-                    shard: job.shard,
-                    reports: reveals,
-                });
-            }
+            _ => self.dispute(job_id, reveals),
         }
     }
 
@@ -880,7 +1007,7 @@ impl Jobs {
             .get_mut(&job_id)
             .expect("the job being closed exists");
         self.draws.append(&mut job.draws);
-        let disputed = job.phase == Phase::Disputed;
+        let disputed = job.refereeing.is_some();
         for held in &job.leases {
             let what = if right.contains(&held.node) {
                 Conduct::Matched
@@ -1092,7 +1219,8 @@ impl Jobs {
             .filter(|job| {
                 job.leases
                     .iter()
-                    .any(|held| held.node == *node && held.revealed.is_none())
+                    // A node that committed has finished running the job.
+                    .any(|held| held.node == *node && held.commitment.is_none())
             })
             .map(|job| job.manifest.slots)
             .sum();
@@ -1185,6 +1313,7 @@ impl Jobs {
                 barred.extend(shares.iter().copied());
             }
             let pickup = match (&job.kind, job.leases.len()) {
+                _ if job.refereeing.is_some() => Pickup::Referee,
                 (Kind::Audit { .. }, _) => Pickup::Audit,
                 (_, 0) => Pickup::First,
                 _ => Pickup::Second,
@@ -1319,6 +1448,7 @@ impl Jobs {
                 taper,
                 expires_at: (now + LEASE_SECS).min(job.manifest.deadline),
                 proven,
+                referee: job.refereeing.is_some(),
                 commitment: None,
                 revealed: None,
             });
@@ -1339,12 +1469,22 @@ impl Jobs {
         now: u64,
         rng: &mut impl Rng,
         standing: &Standing,
+        stored: &dyn Fn(&ContentHash) -> bool,
     ) {
         let usable: Vec<&Known> = self
             .known
             .iter()
             .filter(|known| standing.max_tier >= known.manifest.tier())
             .filter(|known| !known.kept_from.contains(&account))
+            .filter(|known| {
+                let manifest = &known.manifest;
+                let shard = known.shard.iter();
+                [manifest.module, manifest.input]
+                    .iter()
+                    .chain(&manifest.reads)
+                    .chain(shard)
+                    .all(stored)
+            })
             .collect();
         if usable.is_empty() {
             return;
@@ -1378,6 +1518,7 @@ impl Jobs {
             taper: PREMIUM_SCALE,
             expires_at: now + CHECK_DEADLINE_SECS,
             proven: true,
+            referee: false,
             commitment: None,
             revealed: None,
         });
@@ -1430,6 +1571,10 @@ impl Jobs {
             }
             let past_deadline = job.manifest.deadline <= now;
             match job.phase {
+                Phase::Open if past_deadline && job.refereeing.is_some() => {
+                    // The dispute could not be settled in time.
+                    self.decide(id, &[], now);
+                }
                 Phase::Open if past_deadline => {
                     if job.committed() > 0 {
                         // Whatever was committed by the deadline is revealed.
@@ -1444,7 +1589,7 @@ impl Jobs {
                     }
                 }
                 Phase::Open | Phase::Revealing { .. } => self.advance(id, now),
-                Phase::Disputed | Phase::Closed => {}
+                Phase::Closed => {}
             }
         }
 
@@ -1514,6 +1659,7 @@ impl Job {
             leases: Vec::new(),
             draws: Vec::new(),
             confirm_until: None,
+            refereeing: None,
             phase: Phase::Open,
             status: JobStatus::Submitted,
             closed_at: None,
@@ -1529,6 +1675,13 @@ impl Job {
 
     /// How many more leases the job wants granted now.
     fn leases_wanted(&self, now: u64) -> usize {
+        if let Some(refereeing) = &self.refereeing {
+            let waiting = self
+                .leases
+                .iter()
+                .any(|held| held.referee && held.revealed.is_none());
+            return usize::from(!waiting && refereeing.referees < MAX_REFEREES);
+        }
         let single = matches!(self.kind, Kind::KnownAnswer { .. } | Kind::Audit { .. })
             || self.manifest.verify == Verify::None;
         let target = if single { 1 } else { 2 };

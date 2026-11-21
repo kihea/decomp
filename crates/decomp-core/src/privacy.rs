@@ -145,6 +145,20 @@ pub fn check(manifest: &Manifest, declared: Option<&Signature>) -> Result<(), Pr
     }
 }
 
+/// What the control plane can check of a job's privacy without its module,
+/// which it never holds: that a share is handed to nodes only on a private
+/// route, and that no private job is handed state. Nodes check the rest
+/// against the module (`check` and `check_input`) before they run the job,
+/// and report a job that fails as invalid.
+pub fn check_manifest(manifest: &Manifest) -> Result<(), PrivacyError> {
+    match route_to_nodes(manifest) {
+        None if manifest.share.is_some() => Err(PrivacyError::Mismatch),
+        None => Ok(()),
+        Some(_) if manifest.state.is_some() => Err(PrivacyError::State),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Checks a job's input against the types its module declares, in the form
 /// nodes are handed it. On the encrypted compute route every private value in
 /// it must be encrypted, so a device that sent one as it is has it refused.

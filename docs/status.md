@@ -25,10 +25,10 @@ Last updated 2026-11-21.
 | Work preferences | Available | Classes, tier range, rate floor, slots, hours, battery, metered networks, market-only. Battery and metered state are not yet read from the system, so devices are taken to be on mains power and an unmetered network |
 | Leases drawn from public randomness | Available | drand on the devnet; ICP's verifiable randomness on canisters. Every draw is published and can be rechecked with `decomp-node draws` |
 | Commit and reveal; verification that follows supply | Available | `opportunistic`, `required`, and `none`; every receipt states its level |
-| Checkpoint disputes, known-answer jobs, spot-check audits, holdback | Available | Checkpoints are taken once per compute unit rather than every 10 million instructions, because each one hashes the job's whole memory |
+| Disputes, known-answer jobs, spot-check audits, holdback | Available | A dispute is settled by further nodes drawn at random, which run the job again; the first result two nodes report stands. Checkpoints are taken once per compute unit |
 | Splitting, tiers, follow-up jobs | Available | |
 | Node scores | In development | Reliability and availability are kept; bandwidth and hardware-fit scores are not yet measured |
-| Always-on fallback | Available on the devnet | On canisters the module runs in the job board canister |
+| Always-on fallback | Available | The module runs in the control canister, on data the submitter left there |
 | Inference class with TOPLOC | Not started | Needs the approved model list and a runtime for it, and GPU nodes |
 | Attested nodes (Intel TDX, AMD SEV-SNP) | Not started | Needs nodes on that hardware |
 
@@ -48,7 +48,7 @@ Last updated 2026-11-21.
 | Part | Status | Notes |
 | --- | --- | --- |
 | Local devnet | Available | `decomp-devnet` runs the accounts, registry, job board, and receipts services in one process |
-| ICP canisters | In development | The control canister (`canisters/control`) runs every control-plane service from the same library as the devnet (accounts, registry, job board, receipts), over the HTTP gateway with the same signed calls; leases and audits draw on the Internet Computer's randomness, disputes and fallbacks run on an interpreter in the canister, and state survives upgrades. `decomp-replica` runs it on a local replica. Still to do: splitting the job board across canisters by class and tier, signing the settlement log with the subnet's threshold Ed25519 key instead of a key held in the canister, and moving job blobs out of the canister onto storage nodes |
+| ICP canisters | In development | The control canister (`canisters/control`) runs every control-plane service from the same library as the devnet (accounts, registry, job board, receipts), over the HTTP gateway with the same signed calls. Leases and audits draw on the Internet Computer's randomness, value keys come from the subnet's threshold key, always-on fallbacks run on an interpreter in the canister, and state survives upgrades; job data stays on storage nodes. `decomp-replica` runs it on a local replica. Still to do: splitting the job board across canisters by class and tier, and signing the settlement log with the subnet's threshold Ed25519 key instead of a key held in the canister |
 | Batched receipts, a signed settlement log, inclusion proofs | Available | Anyone can recompute a batch fingerprint from its receipts |
 | Name registry | Available | Deposits, held brand names, look-alike blocking, expiry, review, and a searchable directory |
 
@@ -61,7 +61,7 @@ Last updated 2026-11-21.
 | Deletion by the owner | Available | `decomp-node delete`; nodes drop the blob when they next ask for work, and what is left of its fee returns |
 | Records with versioned writes | Available | `write_record`, `get_record`, `list_records` |
 | Relays | Available | |
-| Job inputs and outputs travelling only between clients and nodes | In development | The devnet still holds a copy of job inputs and outputs |
+| Job inputs and outputs travelling only between clients and nodes | Available | Modules, inputs, outputs, record values, and app files live on storage nodes; the control plane holds their roots. Only jobs with an always-on fallback leave their data with it too |
 | Threshold keys for private values (ICP vetKeys) | Available | Value keys from the control canister's threshold key (vetKD): every device of an account gets the same key for a label, and no single party holds it. The devnet has no threshold key |
 
 ## Beyond the core

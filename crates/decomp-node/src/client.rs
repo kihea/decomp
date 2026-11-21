@@ -185,16 +185,18 @@ impl Client {
         self.call(Call::GetStanding)
     }
 
+    /// Leaves bytes with the control plane, for always-on work only (see
+    /// `Call::PutBlob`); everything else goes to storage nodes (`store::put`).
     pub fn put_blob(&self, bytes: Vec<u8>) -> Result<ContentHash, ClientError> {
         let stored: BlobRef = self.call(Call::PutBlob { data: Blob(bytes) })?;
         Ok(stored.hash)
     }
 
-    /// Fetches a blob and checks it against its hash, so a wrong or damaged blob
-    /// is never run or handed on.
+    /// Fetches a blob the control plane keeps and checks it against its root,
+    /// so a wrong or damaged blob is never run or handed on.
     pub fn get_blob(&self, hash: ContentHash) -> Result<Vec<u8>, ClientError> {
         let BlobData { data: Blob(bytes) } = self.call(Call::GetBlob { hash })?;
-        if ContentHash::of(&bytes) != hash {
+        if decomp_core::merkle::root(&bytes) != hash {
             return Err(ClientError::CorruptBlob);
         }
         Ok(bytes)
@@ -364,6 +366,16 @@ impl Client {
     }
 
     /// Where a stored blob can be fetched from.
+    /// Asks for a blob a job produced to be stored, paid by the job's payer.
+    pub fn store_produced(
+        &self,
+        job_id: JobId,
+        root: ContentHash,
+        size: u64,
+    ) -> Result<Placement, ClientError> {
+        self.call(Call::StoreProduced { job_id, root, size })
+    }
+
     pub fn locate(&self, root: ContentHash) -> Result<Located, ClientError> {
         self.call(Call::LocateBlob { root })
     }

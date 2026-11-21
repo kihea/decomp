@@ -16,6 +16,7 @@ import { concat, fromBase64, fromHex, toBase64, utf8 } from './bytes';
 import type { ControlPlane } from './client';
 import { readRecord, writeRecord, type RecordValue } from './records';
 import type { AccountRecord, Signer, ValueKeyAnswer } from './protocol';
+import type { Storage } from './storage';
 
 /** The longest label a value key may be asked for under (`MAX_VALUE_KEY_LABEL_BYTES`). */
 export const MAX_VALUE_KEY_LABEL_BYTES = 256;
@@ -61,15 +62,14 @@ function recordPurpose(key: string): string {
  * `valueKey`, if `version` (0 for a key never written) is still current.
  */
 export async function writePrivateRecord(
-  controlPlane: ControlPlane,
-  signer: Signer,
+  storage: Storage,
   valueKey: ValueKey,
   key: string,
   version: number,
   value: Uint8Array,
 ): Promise<AccountRecord> {
   const sealed = await valueKey.encryptMessage(value, recordPurpose(key));
-  return writeRecord(controlPlane, signer, key, version, sealed);
+  return writeRecord(storage, key, version, sealed);
 }
 
 /**
@@ -78,12 +78,11 @@ export async function writePrivateRecord(
  * written; rejects if the value was not encrypted with this key.
  */
 export async function readPrivateRecord(
-  controlPlane: ControlPlane,
-  signer: Signer,
+  storage: Storage,
   valueKey: ValueKey,
   key: string,
 ): Promise<RecordValue | null> {
-  const read = await readRecord(controlPlane, signer, key);
+  const read = await readRecord(storage, key);
   if (read === null) return null;
   return { record: read.record, value: await valueKey.decryptMessage(read.value, recordPurpose(key)) };
 }

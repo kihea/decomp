@@ -29,26 +29,24 @@ use decomp_core::market::{BALANCED_LOOKBACK_SECS, fallback_rate};
 use decomp_core::{
     Account, AccountId, AccountStanding, AccountStatus, Accounts, Activity, Beacon, Bid, BidOrder,
     CashOut, Challenge, Closure, Conduct, ContentHash, Credits, Directory, Envelope, EnvelopeError,
-    FallBackJob, FollowUps, Hosts, Inclusion, IncomingChannels, JobError, JobId, JobResult,
-    JobStatus, Jobs, LeasesGranted, Ledger, LedgerAddress, LedgerEntry, LedgerError, Located,
-    LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES, MAX_READS,
-    MAX_SHARD_NAME_BYTES, Manifest, Merge, NAME_DEPOSIT, NameError, NameRecord, OpError, Opening,
-    Outcome, PROBATION_FORFEIT_PERCENT, Payout, Penalty, Placement, Posted, PrivacyError,
-    PublicKey, Quote, Receipt, Record, RecordError, Registry, RegistryEntry, RelayEntry,
-    RelayError, Relays, Resolved, Route, ScoreEvent, Scores, SealingKeys, SettlementLog, ShardRef,
-    SigningKey, Splits, SponsorError, Sponsored, Standing, Standings, StateEntry, States, Storage,
-    StorageEntry, StorageError, Storing, Through, WorkPreferences, channel_id, compute_fee, merkle,
-    privacy, settlement,
+    FallBackJob, Fallback, FollowUps, Hosts, Inclusion, IncomingChannels, JobError, JobId,
+    JobResult, JobStatus, Jobs, LeasesGranted, Ledger, LedgerAddress, LedgerEntry, LedgerError,
+    Located, LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES, MAX_READS,
+    MAX_SHARD_NAME_BYTES, Manifest, NAME_DEPOSIT, NameError, NameRecord, OpError, Opening, Outcome,
+    PROBATION_FORFEIT_PERCENT, PRODUCED_RETENTION_DAYS, Payout, Penalty, Placement, Posted,
+    PrivacyError, PublicKey, Quote, Receipt, Record, RecordError, Registry, RegistryEntry,
+    RelayEntry, RelayError, Relays, Resolved, Route, ScoreEvent, Scores, SealingKeys,
+    SettlementLog, ShardRef, SigningKey, Splits, SponsorError, Sponsored, Standing, Standings,
+    StateEntry, States, Storage, StorageEntry, StorageError, Storing, Through, WorkPreferences,
+    channel_id, merkle, privacy, settlement,
 };
-use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
-use decomp_schema::{Mismatch, Signature};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::referee::{Case, Verdict};
+use crate::fallback::FallBackRun;
 use crate::store::{Blobs, Log, StateStore};
 
 /// Why a blob was not accepted for storage.
@@ -60,6 +58,10 @@ pub enum StoreError {
     Ledger(#[from] LedgerError),
     #[error("the receiving key is not a device in any account")]
     UnknownDevice,
+    #[error("this node holds no lease on the job")]
+    NotLeased,
+    #[error("nobody pays for this job's blobs")]
+    NoPayer,
 }
 
 /// Why a channel was not opened.
@@ -118,10 +120,6 @@ pub enum SubmitError {
         "a job may be kept from the accounts of at most {MAX_KEPT_FROM} keys and from the nodes of at most {MAX_APART_FROM} earlier jobs"
     )]
     KeptFromTooMany,
-    #[error("{0}")]
-    TypeMismatch(Mismatch),
-    #[error("a job with typed input cannot be split by byte count")]
-    TypedJobSplitByBytes,
     #[error(transparent)]
     Sponsor(#[from] SponsorError),
     #[error("a job may be handed an app's state only if it runs one of that app's modules")]
@@ -204,9 +202,6 @@ pub struct ControlPlane {
     /// What each app has set aside today for each account's jobs.
     sponsored: Sponsored,
     splits: Splits,
-    /// What each module says its job takes and returns, read once per module.
-    /// `None` for a module that does not describe itself.
-    signatures: HashMap<ContentHash, Option<Signature>>,
     receipts: Log,
     /// The hash of each receipt's text, in the order the receipts were made,
     /// and each job's place in that order. Batches are made from these.
@@ -398,7 +393,6 @@ impl ControlPlane {
             jobs,
             sponsored: Sponsored::default(),
             splits: Splits::default(),
-            signatures: HashMap::new(),
             receipts,
             receipt_hashes,
             receipt_of,
@@ -660,7 +654,9 @@ impl ControlPlane {
             // already include what every settled job left behind.
             let states = &self.states;
             let contents = |shard: &ShardRef| states.contents(shard);
-            jobs.request_lease(node, account, now, &mut rng, &standings, &contents)
+            let storage = &self.storage;
+            let stored = |root: &ContentHash| storage.is_stored(root);
+            jobs.request_lease(node, account, now, &mut rng, &standings, &contents, &stored)
         };
         self.jobs = jobs;
         self.rng = rng;
@@ -678,13 +674,10 @@ impl ControlPlane {
 
     /// What a job would cost if it were submitted now.
     pub fn quote(&self, manifest: &Manifest) -> Result<Quote, SubmitError> {
-        let pieces = match manifest.split {
-            Some(split) => {
-                let input = self.blobs.get(&manifest.input)?.unwrap_or_default();
-                split.pieces(input.len() as u64)
-            }
-            None => 1,
-        };
+        let pieces = manifest
+            .split
+            .as_ref()
+            .map_or(1, |split| split.pieces.len().max(1) as u64);
         let per_piece = self.jobs.highest_fee(manifest);
         Ok(Quote {
             rate: self.jobs.posted(manifest),
@@ -968,7 +961,6 @@ impl ControlPlane {
         account: AccountId,
         manifest: Manifest,
         now: u64,
-        sandbox: &Sandbox,
     ) -> Result<JobId, SubmitError> {
         if manifest.reads.len() > MAX_READS {
             return Err(SubmitError::TooManyReads);
@@ -976,11 +968,17 @@ impl ControlPlane {
         if manifest.keep_from.len() > MAX_KEPT_FROM || manifest.apart_from.len() > MAX_APART_FROM {
             return Err(SubmitError::KeptFromTooMany);
         }
+        let pieces = manifest.split.iter().flat_map(|split| &split.pieces);
+        let always_on = manifest.fallback == Some(Fallback::AlwaysOn);
         for hash in [manifest.module, manifest.input]
             .iter()
             .chain(&manifest.reads)
+            .chain(pieces)
         {
-            if !self.blobs.contains(hash) {
+            // Nodes fetch every blob from storage nodes; a job that may fall
+            // back to always-on also leaves them with the control plane,
+            // which runs it then.
+            if !self.storage.is_stored(hash) || (always_on && !self.blobs.contains(hash)) {
                 return Err(SubmitError::UnknownBlob(*hash));
             }
         }
@@ -999,24 +997,19 @@ impl ControlPlane {
                 return Err(SubmitError::SplitWithState);
             }
         }
-        self.check_against_module(&manifest, sandbox)?;
+        privacy::check_manifest(&manifest)?;
         let job_id = JobId::of(&request.signer, &request.payload, &request.signature);
 
         // The jobs that will actually run: this one, or its pieces.
         let mut runs = vec![(job_id, manifest.clone())];
-        if let Some(split) = manifest.split {
-            let input = self.blobs.get(&manifest.input)?.unwrap_or_default();
-            if split.pieces(input.len() as u64) > MAX_PIECES {
+        if let Some(split) = &manifest.split {
+            if split.pieces.is_empty() || split.pieces.len() as u64 > MAX_PIECES {
                 return Err(SubmitError::TooManyPieces);
             }
-            let mut chunks: Vec<&[u8]> = input.chunks(split.chunk_bytes.max(1) as usize).collect();
-            if chunks.is_empty() {
-                chunks.push(&[]);
-            }
             runs.clear();
-            for (index, chunk) in chunks.into_iter().enumerate() {
+            for (index, input) in split.pieces.iter().enumerate() {
                 let piece = Manifest {
-                    input: self.blobs.put(chunk)?,
+                    input: *input,
                     split: None,
                     max_fee: self.jobs.highest_fee(&manifest),
                     ..manifest.clone()
@@ -1078,35 +1071,6 @@ impl ControlPlane {
             .collect()
     }
 
-    /// Refuses a job that is not what its module says of itself: one in another
-    /// privacy mode than the module declares, or a private one that no route
-    /// lets nodes run (see `privacy`), or one whose input does not fit the types
-    /// the module says its job takes (spec section 7, "Typing"), in the form
-    /// its route hands them to nodes. A module that does not describe itself is
-    /// open and takes any input.
-    fn check_against_module(
-        &mut self,
-        manifest: &Manifest,
-        sandbox: &Sandbox,
-    ) -> Result<(), SubmitError> {
-        if !self.signatures.contains_key(&manifest.module) {
-            let module = self.blobs.get(&manifest.module)?.unwrap_or_default();
-            self.signatures
-                .insert(manifest.module, sandbox.declared(&module));
-        }
-        let signature = self.signatures[&manifest.module].as_ref();
-        privacy::check(manifest, signature)?;
-        let Some(signature) = signature else {
-            return Ok(());
-        };
-        // Cutting typed input at byte boundaries would hand each piece broken data.
-        if manifest.split.is_some() {
-            return Err(SubmitError::TypedJobSplitByBytes);
-        }
-        let input = self.blobs.get(&manifest.input)?.unwrap_or_default();
-        privacy::check_input(manifest, signature, &input).map_err(SubmitError::TypeMismatch)
-    }
-
     /// Where a job stands, for the account that submitted it.
     pub fn job_status(
         &mut self,
@@ -1118,17 +1082,6 @@ impl ControlPlane {
             Some(status) => Ok(status),
             None => self.jobs.status(job_id, account, now),
         }
-    }
-
-    /// Joins the outputs of a split job whose pieces have all completed.
-    fn merge(&mut self, merge: Merge, now: u64) {
-        let mut output = Vec::new();
-        for hash in &merge.outputs {
-            let piece = self.blobs.get(hash).expect("blobs can be read back");
-            output.extend(piece.expect("a verified output was stored"));
-        }
-        let hash = self.blobs.put(&output).expect("blobs can be stored");
-        self.splits.merged(merge.job_id, hash, now);
     }
 
     /// Accepts a blob for storage: chooses the nodes to hold it and sets the
@@ -1151,6 +1104,37 @@ impl ControlPlane {
             .collect();
         self.note_storage(placed, None);
         Ok(Placement { addresses })
+    }
+
+    /// Stores a blob a job produced, for a node that holds a lease on the job,
+    /// paid by the job's payer for `PRODUCED_RETENTION_DAYS` days. A blob that
+    /// is already stored is not stored again, and the answer names no nodes:
+    /// a second node that ran the job finds its output there.
+    pub fn store_produced(
+        &mut self,
+        node: &PublicKey,
+        job_id: JobId,
+        root: ContentHash,
+        size: u64,
+        now: u64,
+    ) -> Result<Placement, StoreError> {
+        if !self.jobs.holds_lease(&job_id, node) {
+            return Err(StoreError::NotLeased);
+        }
+        if self.storage.locate(&root).is_some() {
+            return Ok(Placement {
+                addresses: Vec::new(),
+            });
+        }
+        let owner = self.payer_of(&job_id).ok_or(StoreError::NoPayer)?;
+        let blob = Storing {
+            root,
+            size,
+            owner,
+            days: PRODUCED_RETENTION_DAYS,
+            addressed: None,
+        };
+        self.store_blob(blob, now)
     }
 
     /// A node says it has received a blob it was asked to hold.
@@ -1357,9 +1341,14 @@ impl ControlPlane {
         for closed in self.jobs.take_closed() {
             let job_id = closed.job_id;
             let mut asked = None;
-            if let Some(merge) = self.splits.piece_closed(&closed, now) {
-                self.merge(merge, now);
-            }
+            self.splits.piece_closed(&closed, now);
+            let terminal = matches!(
+                closed.how,
+                Closure::Settled { .. }
+                    | Closure::Rejected
+                    | Closure::Expired
+                    | Closure::FallBack(_)
+            );
             // Every accepted job has its highest possible fee set aside, results
             // above the compute cap are refused, and the other entries here cannot
             // fail for an account that exists.
@@ -1434,11 +1423,17 @@ impl ControlPlane {
                 Closure::AuditFailed { account } => {
                     vec![Some(LedgerEntry::ForfeitHeld { job_id, account })]
                 }
+                Closure::WrongInDispute { node, cost } => {
+                    self.forfeit(&node, |staked| cost.min(staked));
+                    vec![]
+                }
             };
             for entry in entries.into_iter().flatten() {
                 self.record(entry).expect("a closed job can be settled");
             }
-            self.escrow_payer.remove(&job_id);
+            if terminal {
+                self.escrow_payer.remove(&job_id);
+            }
             // The job has been paid for and the rest of its fee cap returned,
             // which is what its follow-ups are paid from.
             if let Some(follow_ups) = asked {
@@ -1480,56 +1475,8 @@ impl ControlPlane {
         }
     }
 
-    /// The disputes that have arisen, each with the blobs needed to decide it.
-    pub fn take_cases(&mut self) -> Vec<Case> {
-        let disputes = self.jobs.take_disputes();
-        let blob = |hash: &ContentHash| -> Vec<u8> {
-            self.blobs.get(hash).ok().flatten().unwrap_or_default()
-        };
-        disputes
-            .into_iter()
-            .map(|dispute| Case {
-                job_id: dispute.job_id,
-                module: blob(&dispute.manifest.module),
-                input: blob(&dispute.manifest.input),
-                blobs: dispute
-                    .manifest
-                    .reads
-                    .iter()
-                    .map(|hash| (*hash, blob(hash)))
-                    .collect(),
-                shard: dispute
-                    .manifest
-                    .state
-                    .as_ref()
-                    .map(|_| match dispute.shard {
-                        Some(contents) => blob(&contents),
-                        None => records::encode(&Records::new()),
-                    }),
-                compute_cap: dispute.manifest.compute_cap,
-                checkpoint_lists: dispute
-                    .reports
-                    .iter()
-                    .map(|r| blob(&r.1.checkpoints))
-                    .collect(),
-                reports: dispute.reports,
-            })
-            .collect()
-    }
-
-    /// Closes a dispute. Nodes that were wrong pay what refereeing cost, out of
-    /// their accounts' stake.
-    pub fn resolve(&mut self, case: &Case, verdict: &Verdict, now: u64) {
-        self.jobs.resolve(case.job_id, &verdict.right, now);
-        let cost = compute_fee(verdict.units, decomp_core::market::BASE_MICROS_PER_UNIT);
-        for node in &verdict.wrong {
-            self.forfeit(node, |_| cost);
-        }
-        self.settle(now);
-    }
-
-    /// The jobs to run as an always-on fallback, each with what it needs.
-    pub fn take_fall_backs(&mut self) -> Vec<(JobId, FallBackJob, Case)> {
+    /// The jobs to run as an always-on fallback, each with what it reads.
+    pub fn take_fall_backs(&mut self) -> Vec<(JobId, FallBackRun)> {
         let fall_backs = std::mem::take(&mut self.fall_backs);
         let blob = |hash: &ContentHash| -> Vec<u8> {
             self.blobs.get(hash).ok().flatten().unwrap_or_default()
@@ -1537,8 +1484,8 @@ impl ControlPlane {
         fall_backs
             .into_iter()
             .map(|(job_id, job)| {
-                let case = Case {
-                    job_id: job.seed,
+                let run = FallBackRun {
+                    seed: job.seed,
                     module: blob(&job.manifest.module),
                     input: blob(&job.manifest.input),
                     blobs: job
@@ -1552,10 +1499,8 @@ impl ControlPlane {
                         None => records::encode(&Records::new()),
                     }),
                     compute_cap: job.manifest.compute_cap,
-                    checkpoint_lists: Vec::new(),
-                    reports: Vec::new(),
                 };
-                (job_id, job, case)
+                (job_id, run)
             })
             .collect()
     }

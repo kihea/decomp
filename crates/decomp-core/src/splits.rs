@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::job::{JobStatus, Manifest, Outcome, Receipt, Verification};
 use crate::jobs::{CLOSED_JOB_RETENTION_SECS, ClosedJob, Closure};
-use crate::keys::{AccountId, ContentHash, JobId};
+use crate::keys::{AccountId, JobId};
 use crate::ledger::FeeSplit;
 
 /// What became of one piece.
@@ -32,13 +32,6 @@ struct SplitJob {
     pieces: Vec<(JobId, Option<PieceEnd>)>,
     status: JobStatus,
     closed_at: Option<u64>,
-}
-
-/// Every piece of a split job completed. The caller joins their outputs, in this
-/// order, stores the result, and answers with [`Splits::merged`].
-pub struct Merge {
-    pub job_id: JobId,
-    pub outputs: Vec<ContentHash>,
 }
 
 #[derive(Default)]
@@ -66,9 +59,9 @@ impl Splits {
     }
 
     /// Notes a closed job if it is a piece of a split job. Once the last piece is
-    /// in, the split job closes too, unless every piece completed: then its
-    /// outputs still have to be joined, and this returns what to join.
-    pub fn piece_closed(&mut self, closed: &ClosedJob, now: u64) -> Option<Merge> {
+    /// in, the split job closes too; if every piece completed, its outcome
+    /// lists their outputs, for the submitter to join.
+    pub fn piece_closed(&mut self, closed: &ClosedJob, now: u64) {
         let end = match &closed.how {
             Closure::Settled { receipt, .. } => PieceEnd::Verified {
                 units: receipt.units,
@@ -83,15 +76,24 @@ impl Splits {
             Closure::FallBack(_)
             | Closure::CheckPassed { .. }
             | Closure::Release
-            | Closure::AuditFailed { .. } => return None,
+            | Closure::AuditFailed { .. }
+            | Closure::WrongInDispute { .. } => return,
         };
-        let job_id = self.parent_of.remove(&closed.job_id)?;
-        let job = self.jobs.get_mut(&job_id)?;
-        let piece = job.pieces.iter_mut().find(|(id, _)| *id == closed.job_id)?;
+        let Some(job_id) = self.parent_of.remove(&closed.job_id) else {
+            return;
+        };
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let Some(piece) = job.pieces.iter_mut().find(|(id, _)| *id == closed.job_id) else {
+            return;
+        };
         piece.1 = Some(end);
 
         let ends: Option<Vec<&PieceEnd>> = job.pieces.iter().map(|(_, end)| end.as_ref()).collect();
-        let ends = ends?; // some pieces are still open
+        let Some(ends) = ends else {
+            return; // some pieces are still open
+        };
         let mut outputs = Vec::new();
         for end in &ends {
             let failed = match end {
@@ -111,31 +113,21 @@ impl Splits {
                     outputs.push(*output);
                     None
                 }
+                // A piece is never itself split.
+                PieceEnd::Verified {
+                    outcome: Outcome::Pieces { .. },
+                    ..
+                } => Some(JobStatus::Rejected),
             };
             if let Some(status) = failed {
                 job.status = status;
                 job.closed_at = Some(now);
-                return None;
+                return;
             }
         }
-        Some(Merge { job_id, outputs })
-    }
-
-    /// Closes a split job whose pieces' outputs have been joined into `output`.
-    pub fn merged(&mut self, id: JobId, output: ContentHash, now: u64) {
-        if let Some(job) = self.jobs.get_mut(&id) {
-            let receipt = Box::new(job.receipt(
-                id,
-                Outcome::Completed {
-                    output,
-                    blobs: Vec::new(),
-                    state: None,
-                    spawned: Vec::new(),
-                },
-            ));
-            job.status = JobStatus::Settled { receipt };
-            job.closed_at = Some(now);
-        }
+        let receipt = Box::new(job.receipt(job_id, Outcome::Pieces { outputs }));
+        job.status = JobStatus::Settled { receipt };
+        job.closed_at = Some(now);
     }
 
     /// Where a split job stands, or `None` if `id` is not a split job submitted

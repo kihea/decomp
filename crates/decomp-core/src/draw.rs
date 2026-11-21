@@ -92,6 +92,9 @@ pub enum Pickup {
     Second,
     /// A spot check of a result accepted unconfirmed.
     Audit,
+    /// A further run of a job whose results disagreed, to settle which was
+    /// right.
+    Referee,
 }
 
 /// A node that could have been granted the lease: it asked for work, may take
