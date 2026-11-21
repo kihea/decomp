@@ -29,9 +29,10 @@ and what is built today in
 | Path | What it is |
 | --- | --- |
 | `crates/decomp-core` | The protocol's rules: accounts, keys, jobs, the job board, the market, the ledger, the registry, records, storage, relays, and settlement. It does no I/O, so every host applies the same rules. |
-| `canisters/control` | The control plane on the Internet Computer: accounts, sealing keys, names, and records, answering the same calls over the HTTP gateway. |
+| `canisters/control` | The control plane on the Internet Computer: every service, from `decomp-control`, answering the same calls over the HTTP gateway. |
 | `crates/decomp-replica` | Runs the canisters on a local Internet Computer replica (PocketIC) behind an HTTP gateway, and upgrades them in place when rebuilt. |
-| `crates/decomp-devnet` | A local network: the control plane's services in one process, behind the same calls the canisters take. |
+| `crates/decomp-control` | The control plane's services and interface, for any host. The devnet and the canister both run it. |
+| `crates/decomp-devnet` | A local network: `decomp-control` in one process, with files for storage, behind an HTTP server. |
 | `crates/decomp-node` | The node agent and command-line client: create or join an account, contribute compute, submit jobs, store and send files, and check receipts and draws. Its library is shared with desktop apps. |
 | `crates/decomp-sandbox` | The metered, deterministic WebAssembly sandbox jobs run in. |
 | `crates/decomp-schema` | How a job's input and output types are described and checked. |

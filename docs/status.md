@@ -48,7 +48,7 @@ Last updated 2026-11-18.
 | Part | Status | Notes |
 | --- | --- | --- |
 | Local devnet | Available | `decomp-devnet` runs the accounts, registry, job board, and receipts services in one process |
-| ICP canisters | In development | The control canister (`canisters/control`) serves accounts, sealing keys, names, and records over the HTTP gateway with the same signed calls as the devnet, and keeps its state across upgrades; `decomp-replica` runs it on a local replica. The job board and receipts canisters are next; until then the devnet serves jobs, storage, and relays |
+| ICP canisters | In development | The control canister (`canisters/control`) runs every control-plane service from the same library as the devnet (accounts, registry, job board, receipts), over the HTTP gateway with the same signed calls; leases and audits draw on the Internet Computer's randomness, disputes and fallbacks run on an interpreter in the canister, and state survives upgrades. `decomp-replica` runs it on a local replica. Still to do: splitting the job board across canisters by class and tier, signing the settlement log with the subnet's threshold Ed25519 key instead of a key held in the canister, and moving job blobs out of the canister onto storage nodes |
 | Batched receipts, a signed settlement log, inclusion proofs | Available | Anyone can recompute a batch fingerprint from its receipts |
 | Name registry | Available | Deposits, held brand names, look-alike blocking, expiry, review, and a searchable directory |
 

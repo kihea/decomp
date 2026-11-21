@@ -40,7 +40,7 @@ pub use controller::{
 };
 pub use draw::{
     BEACON_CHAIN, BEACON_MAX_LAG_ROUNDS, BEACON_PERIOD_SECS, Beacon, Draw, DrawError, Eligible,
-    Pickup, SPOT_CHECK_RATE, is_audited, round_at,
+    Pickup, RandomnessSource, SPOT_CHECK_RATE, is_audited, round_at,
 };
 #[cfg(feature = "encrypted")]
 pub use encrypted::{EncryptError, Encrypted, EncryptionKey};

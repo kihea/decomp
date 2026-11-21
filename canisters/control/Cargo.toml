@@ -2,16 +2,18 @@
 name = "decomp-control-canister"
 version = "0.1.0"
 edition.workspace = true
-description = "The DeComp control plane on the Internet Computer: accounts, names, and records, served over the HTTP gateway with the same signed calls as the devnet."
+description = "The DeComp control plane on the Internet Computer: its services, served over the HTTP gateway with the same signed calls as the devnet."
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 candid = "0.10.41"
+decomp-control = { version = "0.1.0", path = "../../crates/decomp-control", default-features = false, features = ["wasmi"] }
 decomp-core = { version = "0.1.0", path = "../../crates/decomp-core", default-features = false }
+decomp-sandbox = { version = "0.1.0", path = "../../crates/decomp-sandbox", default-features = false, features = ["wasmi"] }
 getrandom = "0.4.3"
 ic-cdk = "0.20.3"
+ic-cdk-timers = "1.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_bytes = "0.11"
-serde_json = "1.0.154"

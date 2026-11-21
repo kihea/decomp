@@ -5,9 +5,10 @@
 //! Both run the same metered module (see `meter`), so a job's compute bill
 //! and checkpoints do not depend on the engine. The host functions are
 //! written once, against the names re-exported here.
-
-#[cfg(all(feature = "wasmtime", feature = "wasmi"))]
-compile_error!("choose one engine: the `wasmtime` feature or the `wasmi` feature");
+//!
+//! Features add up across a workspace, so a build may have both: then it runs
+//! on wasmtime. A canister is built on its own, for its own target, with only
+//! `wasmi`.
 
 #[cfg(not(any(feature = "wasmtime", feature = "wasmi")))]
 compile_error!("choose an engine: the `wasmtime` feature or the `wasmi` feature");
@@ -76,7 +77,7 @@ mod chosen {
     }
 }
 
-#[cfg(feature = "wasmi")]
+#[cfg(all(feature = "wasmi", not(feature = "wasmtime")))]
 mod chosen {
     pub use wasmi::{
         Caller, Engine, Extern, ExternType, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,

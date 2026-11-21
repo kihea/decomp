@@ -925,12 +925,14 @@ name = "decomp-control-canister"
 version = "0.1.0"
 dependencies = [
  "candid",
+ "decomp-control",
  "decomp-core",
+ "decomp-sandbox",
  "getrandom 0.4.3",
  "ic-cdk",
+ "ic-cdk-timers",
  "serde",
  "serde_bytes",
- "serde_json",
 ]
 
 [[package]]
@@ -1673,6 +1675,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "ic-cdk-timers"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6852b9c1d4a82ff50fc7318599298aee8bfb082bd7e9fe7e5c1420692b2170f7"
+dependencies = [
+ "ic-cdk-executor",
+ "ic0",
+ "slotmap",
 ]
 
 [[package]]

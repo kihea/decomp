@@ -678,6 +678,29 @@ out, as is pay held back for a spot check. So putting up stake, taking it back,
 and setting credits aside change no balance on the log. Paying for a job does,
 and so does a forfeit.
 
+## Hosts
+
+**One library, two hosts.** The control plane's services and interface live
+in `decomp-control`, which does no I/O. The devnet keeps its logs and blobs
+in files and serves HTTP; the control canister keeps them in its heap, saves
+them to stable memory across upgrades, and serves the HTTP gateway. Both
+answer with `decomp_control::handle`, so a rule changes in one place.
+
+**The canister's randomness is the network's.** Leases and audits are drawn
+from `raw_rand`, fetched every few seconds (spec section 6: "Lease grants draw
+on ICP's verifiable randomness"). A draw records its source; `decomp-node
+draws` checks the rule for such a draw, since the randomness cannot be
+fetched again, and checks drand rounds against drand. The control plane's own
+generator (known-answer jobs, challenges, relays) is reseeded from the same
+source.
+
+**The canister runs jobs on an interpreter.** Disputes, fallbacks, and the
+type check run on wasmi, which compiles into a canister; nodes run wasmtime.
+Metering is part of the module, and both engines give NaN results the
+canonical bit pattern, so they count and compute the same. An update call has
+an instruction limit, so a dispute over a large job cannot yet be refereed in
+the canister.
+
 ## Open questions
 
 - **Passkey sign-in speed.** A device approved by a passkey waits the full
@@ -700,3 +723,7 @@ and so does a forfeit.
   offered for money.
 - **Cost of `seal` and `open` in a job.** They are charged as a signature check
   plus one instruction per byte. That figure should be measured.
+- **The canister's signing key.** The settlement log and draws are signed with
+  a key the canister derives at install and keeps in its state, which the
+  subnet's node providers can read. The subnet's threshold Ed25519 signing
+  should replace it before the canister holds real credits.

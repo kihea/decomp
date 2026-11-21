@@ -36,11 +36,37 @@ pub const SPOT_CHECK_RATE: f64 = 0.10;
 /// exactly the numbers it was made with.
 pub const WEIGHT_SCALE: f64 = 1_000_000.0;
 
-/// One round of the beacon: its number and the 32 random bytes it gave.
+/// One round of randomness: its number, the 32 random bytes it gave, and
+/// where they came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Beacon {
+    /// The drand round, or, for the network's own randomness, the drand round
+    /// that was current when the bytes were drawn, so that rounds are counted
+    /// the same way whatever the source.
     pub round: u64,
     pub randomness: ContentHash,
+    #[serde(default, skip_serializing_if = "RandomnessSource::is_drand")]
+    pub source: RandomnessSource,
+}
+
+/// Where a round's randomness came from (spec section 4: "a public source,
+/// such as the drand beacon or ICP's verifiable randomness").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RandomnessSource {
+    /// drand's quicknet chain, which anyone can fetch again by round.
+    #[default]
+    Drand,
+    /// The Internet Computer's verifiable randomness, drawn by the canister
+    /// that made the draw. It cannot be fetched again; the subnet's
+    /// consensus stands behind it.
+    Icp,
+}
+
+impl RandomnessSource {
+    pub fn is_drand(&self) -> bool {
+        *self == Self::Drand
+    }
 }
 
 impl Beacon {

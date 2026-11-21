@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use decomp_core::{BEACON_CHAIN, Beacon, Draw, DrawError, Envelope, EnvelopeError, PublicKey};
+use decomp_core::{
+    BEACON_CHAIN, Beacon, Draw, DrawError, Envelope, EnvelopeError, PublicKey, RandomnessSource,
+};
 
 /// Where the drand beacon is read.
 const BEACON_HOST: &str = "https://api.drand.sh";
@@ -80,6 +82,11 @@ impl Rounds {
             return Err(DrawFault::NotTheOperator(signed.signer));
         }
         draw.check()?;
+        // The network's own randomness cannot be fetched again; the subnet's
+        // consensus stands behind it, so only the rule is checked.
+        if draw.beacon.source == RandomnessSource::Icp {
+            return Ok(draw);
+        }
         let round = draw.beacon.round;
         if self.round(round).map_err(DrawFault::Unreachable)? != draw.beacon {
             return Err(DrawFault::NotTheBeacon(round));
