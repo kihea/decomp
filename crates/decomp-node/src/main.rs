@@ -73,8 +73,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create an account for this device: make an account key, save it in a
-    /// file to be kept offline, and make this device the account's first.
+    /// file to be kept offline, and make this device the account's first. If
+    /// the file already holds a key from `new-account-key`, the account is
+    /// made for that key.
     CreateAccount {
+        /// Where to save the new account key, or the key made earlier.
+        #[arg(long)]
+        account_key: PathBuf,
+    },
+    /// Make an account key without making the account, and show the ID the
+    /// account will have. For an account that has to be named before it
+    /// exists, such as a reviewer a control plane is installed with.
+    NewAccountKey {
         /// Where to save the new account key.
         #[arg(long)]
         account_key: PathBuf,
@@ -470,6 +480,7 @@ fn main() -> ExitCode {
         Command::CreateAccount { account_key } => {
             create_account(&cli.dir, &cli.control, &account_key)
         }
+        Command::NewAccountKey { account_key } => new_account_key(&account_key),
         Command::Start { listen, public_url } => {
             let public_url =
                 public_url.or_else(|| listen.as_ref().map(|at| format!("http://{at}")));
@@ -1826,22 +1837,35 @@ fn show_rates(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Makes an account key and an account with this device as its first device.
-fn create_account(dir: &Path, control: &str, file: &Path) -> Result<ExitCode, Box<dyn Error>> {
+/// Makes an account key and saves it, without making the account.
+fn new_account_key(file: &Path) -> Result<ExitCode, Box<dyn Error>> {
     if device::key_file(file)?.is_some() {
         return Err(format!("{} already holds a key", file.display()).into());
     }
+    let key = device::create_key_file(file)?;
+    println!("account  {}", AccountId::of(&key.public_key()));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Makes an account with this device as its first device, for the key in
+/// `file`, or for a new key saved there.
+fn create_account(dir: &Path, control: &str, file: &Path) -> Result<ExitCode, Box<dyn Error>> {
     let device = match device::load(dir)? {
         Some(key) => key,
         None => device::create(dir)?,
     };
-    let account_key = device::create_key_file(file)?;
+    let (account_key, made_here) = match device::key_file(file)? {
+        Some(key) => (key, false),
+        None => (device::create_key_file(file)?, true),
+    };
     let status = match Client::new(control, account_key).create_account(device.public_key()) {
         Ok(status) => status,
         Err(error) => {
-            // A key for an account that was never made is of no use, and would
-            // block the next attempt.
-            let _ = fs::remove_file(file);
+            // A key made here for an account that was never made is of no
+            // use, and would block the next attempt.
+            if made_here {
+                let _ = fs::remove_file(file);
+            }
             return Err(error.into());
         }
     };
