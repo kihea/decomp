@@ -754,6 +754,21 @@ fetched again, and checks drand rounds against drand. The control plane's own
 generator (known-answer jobs, challenges, relays) is reseeded from the same
 source.
 
+**The settlement log is signed by the subnet's threshold key.** A key held in
+the canister's state can be read by the subnet's node providers, who could then
+sign entries the canister never posted. So the canister has the subnet's
+threshold Ed25519 key sign each entry, on a path derived for it
+(`decomp/control`), and fetches that key's public key when it is installed; it
+answers nothing until it has it. A threshold signature costs cycles and takes
+seconds, so the control plane signs once a batch period rather than once a
+draw: draws are published unsigned, and each batch fingerprints the draws
+published since the last, which proves them. The devnet signs with a key file.
+
+**A canister low on cycles stops taking jobs.** Below two trillion cycles,
+about a day of steady use, `submit_job` is refused (`not_taking_jobs`) so the
+jobs taken can finish while the treasury tops the canister up (spec, "Failure
+handling").
+
 **The canister runs fallbacks on an interpreter.** Always-on fallbacks run on
 wasmi, which compiles into a canister; nodes run wasmtime. Metering is part of
 the module, and both engines give NaN results the canonical bit pattern, so
@@ -801,7 +816,3 @@ its place would defeat the point, so it refuses the call.
   offered for money.
 - **Cost of `seal` and `open` in a job.** They are charged as a signature check
   plus one instruction per byte. That figure should be measured.
-- **The canister's signing key.** The settlement log and draws are signed with
-  a key the canister derives at install and keeps in its state, which the
-  subnet's node providers can read. The subnet's threshold Ed25519 signing
-  should replace it before the canister holds real credits.

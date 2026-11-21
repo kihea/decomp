@@ -250,8 +250,9 @@ pub enum Call {
     /// may ask: its submitter and the nodes that ran it. Answer: `Inclusion`.
     GetInclusion { job_id: JobId },
     /// The draws the job board has published, from number `from` on, counting
-    /// from zero, at most `MAX_LOG_PAGE` of them. Each is a `Draw` signed by
-    /// the control plane (see `draw`). Answer: `LogPage`.
+    /// from zero, at most `MAX_LOG_PAGE` of them, each a `Draw` as the text it
+    /// was published as. The batch of the settlement log that covers a draw
+    /// fingerprints it (see `settlement`). Answer: `DrawPage`.
     GetDraws { from: u64 },
 }
 

@@ -642,6 +642,9 @@ impl From<SubmitError> for ApiError {
             SubmitError::FeeCapTooLow(_) => {
                 Self::new(StatusCode::BAD_REQUEST, "over_fee_cap", message)
             }
+            SubmitError::NotTakingJobs => {
+                Self::new(StatusCode::SERVICE_UNAVAILABLE, "not_taking_jobs", message)
+            }
             SubmitError::TooManyPieces => {
                 Self::new(StatusCode::BAD_REQUEST, "too_many_pieces", message)
             }

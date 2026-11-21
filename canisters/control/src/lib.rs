@@ -21,6 +21,11 @@
 //! - **Value keys.** Keys for an account's private values are derived by
 //!   the subnet's threshold key (vetKD) and encrypted to the asking device
 //!   (`decomp_core::value_keys`), so no single party holds them.
+//! - **Signing.** The settlement log is signed by the subnet's threshold
+//!   Ed25519 key, which no one machine of the subnet holds, so no node
+//!   provider can sign an entry the canister did not post. The canister
+//!   fetches the key's public key when it is installed, and answers no call
+//!   until it has it.
 //! - **Persistence.** The control plane's logs live in the heap, are saved to
 //!   stable memory before an upgrade, and are replayed after it.
 //!
@@ -36,13 +41,14 @@ use candid::{CandidType, Deserialize, Principal};
 use decomp_control::fallback;
 use decomp_control::{ControlPlane, MemorySnapshot, MemoryStorage, Settings, ValueKeyRequest};
 use decomp_core::{
-    AccountId, BATCH_PERIOD_SECS, BEACON_PERIOD_SECS, Beacon, Blob, ContentHash, RandomnessSource,
-    Refusal, VALUE_KEY_CONTEXT, ValueKey, round_at,
+    AccountId, BATCH_PERIOD_SECS, BEACON_PERIOD_SECS, Beacon, Blob, ContentHash, PublicKey,
+    RandomnessSource, Refusal, Signature, VALUE_KEY_CONTEXT, ValueKey, round_at,
 };
 use decomp_sandbox::Sandbox;
 use ic_cdk_management_canister::{
-    VetKDCurve, VetKDDeriveKeyArgs, VetKDKeyId, VetKDPublicKeyArgs, vetkd_derive_key,
-    vetkd_public_key,
+    SchnorrAlgorithm, SchnorrKeyId, SchnorrPublicKeyArgs, SignWithSchnorrArgs, VetKDCurve,
+    VetKDDeriveKeyArgs, VetKDKeyId, VetKDPublicKeyArgs, schnorr_public_key, sign_with_schnorr,
+    vetkd_derive_key, vetkd_public_key,
 };
 
 /// What the canister is installed with (`control.did`).
@@ -63,9 +69,17 @@ const CHALLENGE_INTERVAL_SECS: u64 = 3600;
 /// How often time is let pass for jobs nobody is asking about.
 const TICK: Duration = Duration::from_secs(1);
 
-/// The subnet's threshold key that value keys are derived with: the
-/// network's production key, which a local replica also provides.
+/// The subnet's threshold keys that value keys are derived with and the
+/// settlement log is signed with: the network's production keys, which a
+/// local replica also provides.
 const THRESHOLD_KEY: &str = "key_1";
+
+/// The path the canister's signing key is derived on from the threshold key.
+const SIGNING_PATH: &[u8] = b"decomp/control";
+
+/// How long to wait before asking again for the signing key's public key, if
+/// the subnet did not answer.
+const KEY_RETRY: Duration = Duration::from_secs(5);
 
 /// How many value keys one account may ask for in a day. Each costs the
 /// canister cycles; a device keeps the keys it has been given, so it asks
@@ -73,6 +87,11 @@ const THRESHOLD_KEY: &str = "key_1";
 const VALUE_KEYS_PER_ACCOUNT_PER_DAY: u32 = 100;
 
 const SECS_PER_DAY: u64 = 86_400;
+
+/// Below this many cycles the canister takes no new jobs, so that the jobs it
+/// has taken can finish and the treasury can top it up before it freezes
+/// (spec, "Failure handling"). About what a day of steady use costs.
+const MIN_CYCLES_FOR_NEW_JOBS: u128 = 2_000_000_000_000;
 
 struct Canister {
     install: InstallSettings,
@@ -83,6 +102,11 @@ struct Canister {
 
 thread_local! {
     static CANISTER: RefCell<Option<Canister>> = const { RefCell::new(None) };
+    /// What the canister was installed with, until it has its signing key and
+    /// opens the control plane.
+    static STARTING: RefCell<Option<InstallSettings>> = const { RefCell::new(None) };
+    /// Whether a settlement entry is being signed now.
+    static SIGNING: RefCell<bool> = const { RefCell::new(false) };
     /// The threshold key's public key for the value-key context, fetched once.
     static VALUE_KEY_PUBLIC: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     /// Value keys asked for today, by account: the day and the count.
@@ -125,6 +149,64 @@ fn open(install: InstallSettings, mut storage: MemoryStorage) -> Canister {
         control,
         sandbox: Sandbox::new(),
     }
+}
+
+fn signing_key_id() -> SchnorrKeyId {
+    SchnorrKeyId {
+        algorithm: SchnorrAlgorithm::Ed25519,
+        name: THRESHOLD_KEY.into(),
+    }
+}
+
+/// Fetches the signing key's public key and opens the control plane with it.
+async fn start() {
+    let fetched = schnorr_public_key(&SchnorrPublicKeyArgs {
+        canister_id: None,
+        derivation_path: vec![SIGNING_PATH.to_vec()],
+        key_id: signing_key_id(),
+    })
+    .await;
+    let key = fetched
+        .ok()
+        .and_then(|answer| <[u8; 32]>::try_from(answer.public_key.as_slice()).ok());
+    let Some(key) = key else {
+        ic_cdk_timers::set_timer(KEY_RETRY, start());
+        return;
+    };
+    let Some(install) = STARTING.take() else {
+        return;
+    };
+    let canister = open(install, MemoryStorage::new(PublicKey::from_bytes(key)));
+    CANISTER.with_borrow_mut(|slot| *slot = Some(canister));
+    start_timers();
+}
+
+/// Posts a batch to the settlement log, which the threshold key then signs.
+async fn post_batch() {
+    with_canister(|canister| canister.control.post_batch(now()));
+    if SIGNING.replace(true) {
+        return;
+    }
+    let message = with_canister(|canister| canister.control.entry_to_sign());
+    if let Some(message) = message {
+        let signed = sign_with_schnorr(&SignWithSchnorrArgs {
+            message,
+            derivation_path: vec![SIGNING_PATH.to_vec()],
+            key_id: signing_key_id(),
+            aux: None,
+        })
+        .await;
+        let signature = signed
+            .ok()
+            .and_then(|answer| <[u8; 64]>::try_from(answer.signature.as_slice()).ok());
+        // Without a signature the entry waits, and is signed next period.
+        if let Some(signature) = signature {
+            with_canister(|canister| {
+                let _ = canister.control.signed(Signature::from_bytes(signature));
+            });
+        }
+    }
+    SIGNING.set(false);
 }
 
 fn with_canister<R>(f: impl FnOnce(&mut Canister) -> R) -> R {
@@ -176,9 +258,7 @@ fn start_timers() {
     ic_cdk_timers::set_timer(Duration::ZERO, draw_randomness());
     ic_cdk_timers::set_timer_interval(Duration::from_secs(BEACON_PERIOD_SECS), draw_randomness);
     ic_cdk_timers::set_timer_interval(TICK, || async { with_canister(settle) });
-    ic_cdk_timers::set_timer_interval(Duration::from_secs(BATCH_PERIOD_SECS), || async {
-        with_canister(|canister| canister.control.post_batch(now()));
-    });
+    ic_cdk_timers::set_timer_interval(Duration::from_secs(BATCH_PERIOD_SECS), post_batch);
 }
 
 // --- The HTTP gateway's interface ---
@@ -321,6 +401,13 @@ async fn http_request_update(http: HttpRequest) -> HttpResponse {
             "the calls are POST /v1/ops and POST /v1/request",
         );
     }
+    if CANISTER.with_borrow(Option::is_none) {
+        return refusal(
+            503,
+            "starting",
+            "the control plane is fetching its signing key; ask again in a few seconds",
+        );
+    }
     let asked = with_canister(|canister| {
         decomp_control::value_key_request(&canister.control, &path, &http.body, now())
     });
@@ -330,6 +417,10 @@ async fn http_request_update(http: HttpRequest) -> HttpResponse {
         None => {}
     }
     let answer = with_canister(|canister| {
+        let cycles = ic_cdk::api::canister_cycle_balance();
+        canister
+            .control
+            .take_jobs(cycles >= MIN_CYCLES_FOR_NEW_JOBS);
         let answer = decomp_control::handle(&mut canister.control, &path, &http.body, now());
         // Any call can find that a job's window or deadline has passed.
         settle(canister);
@@ -340,35 +431,38 @@ async fn http_request_update(http: HttpRequest) -> HttpResponse {
 
 #[ic_cdk::init]
 fn init(install: Option<InstallSettings>) {
-    let storage = MemoryStorage::new(install_seed("decomp/control-key"));
-    let canister = open(install.unwrap_or_default(), storage);
-    CANISTER.with_borrow_mut(|slot| *slot = Some(canister));
-    start_timers();
+    STARTING.set(Some(install.unwrap_or_default()));
+    ic_cdk_timers::set_timer(Duration::ZERO, start());
 }
+
+/// What is saved across an upgrade: the install settings, and the control
+/// plane's state once it has opened.
+type Saved = (InstallSettings, Option<MemorySnapshot>);
 
 #[ic_cdk::pre_upgrade]
 fn pre_upgrade() {
-    CANISTER.with_borrow_mut(|slot| {
-        let canister = slot.take().expect("the canister is installed");
-        let (logs, blobs, key) = canister.storage.snapshot();
-        ic_cdk::storage::stable_save((canister.install, logs, blobs, key)).expect("state saves");
-    });
+    let saved: Saved = match CANISTER.take() {
+        Some(canister) => (canister.install, Some(canister.storage.snapshot())),
+        None => (STARTING.take().unwrap_or_default(), None),
+    };
+    ic_cdk::storage::stable_save((saved,)).expect("state saves");
 }
 
 #[ic_cdk::post_upgrade]
 fn post_upgrade() {
-    type Saved = (
-        InstallSettings,
-        Vec<(String, Vec<String>)>,
-        Vec<([u8; 32], Vec<u8>)>,
-        [u8; 32],
-    );
-    let (install, logs, blobs, key): Saved =
+    let ((install, snapshot),): (Saved,) =
         ic_cdk::storage::stable_restore().expect("state restores");
-    let snapshot: MemorySnapshot = (logs, blobs, key);
-    let canister = open(install, MemoryStorage::restore(snapshot));
-    CANISTER.with_borrow_mut(|slot| *slot = Some(canister));
-    start_timers();
+    match snapshot {
+        Some(snapshot) => {
+            let canister = open(install, MemoryStorage::restore(snapshot));
+            CANISTER.with_borrow_mut(|slot| *slot = Some(canister));
+            start_timers();
+        }
+        None => {
+            STARTING.set(Some(install));
+            ic_cdk_timers::set_timer(Duration::ZERO, start());
+        }
+    }
 }
 
 /// A canister has no operating system to draw randomness from. Nothing on

@@ -46,6 +46,9 @@ struct Settings {
     recovery_wait_secs: Option<u64>,
 }
 
+/// How often the canister is asked whether it has started.
+const READY_POLL: Duration = Duration::from_millis(500);
+
 /// How often the canister's module file is checked for a new build.
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -130,14 +133,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     replica.install_canister(canister, wasm, encode_one(Some(settings))?, None);
     let gateway = replica.make_live(Some(port));
+    let port = gateway.port().unwrap_or(port);
+
+    // The canister answers once it has fetched its signing key, seconds after
+    // it is installed; until then it refuses every call as `starting`.
+    let probe = format!("http://localhost:{port}/v1/request?canisterId={canister}");
+    let starting = || {
+        ureq::post(&probe)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send("{}")
+            .ok()
+            .and_then(|mut answer| answer.body_mut().read_to_string().ok())
+            .is_none_or(|body| body.contains("\"starting\""))
+    };
+    while starting() {
+        thread::sleep(READY_POLL);
+    }
 
     // The gateway finds the canister by the query as well as by the host
     // name; a `*.localhost` name does not resolve everywhere, the query does.
     println!("control canister {canister}");
-    println!(
-        "control plane at http://localhost:{}?canisterId={canister}",
-        gateway.port().unwrap_or(port)
-    );
+    println!("control plane at http://localhost:{port}?canisterId={canister}");
     // The replica runs for as long as this process does. A rebuilt module is
     // installed as an upgrade, so the canister keeps its state.
     loop {

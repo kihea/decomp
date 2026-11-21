@@ -28,17 +28,17 @@ use decomp_core::Records as AccountRecords;
 use decomp_core::market::{BALANCED_LOOKBACK_SECS, fallback_rate};
 use decomp_core::{
     Account, AccountId, AccountStanding, AccountStatus, Accounts, Activity, Beacon, Bid, BidOrder,
-    CashOut, Challenge, Closure, Conduct, ContentHash, Credits, Directory, Envelope, EnvelopeError,
-    FallBackJob, Fallback, FollowUps, Hosts, Inclusion, IncomingChannels, JobError, JobId,
-    JobResult, JobStatus, Jobs, LeasesGranted, Ledger, LedgerAddress, LedgerEntry, LedgerError,
-    Located, LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES, MAX_READS,
-    MAX_SHARD_NAME_BYTES, Manifest, NAME_DEPOSIT, NameError, NameRecord, OpError, Opening, Outcome,
-    PROBATION_FORFEIT_PERCENT, PRODUCED_RETENTION_DAYS, Payout, Penalty, Placement, Posted,
-    PrivacyError, PublicKey, Quote, Receipt, Record, RecordError, Registry, RegistryEntry,
-    RelayEntry, RelayError, Relays, Resolved, Route, ScoreEvent, Scores, SealingKeys,
-    SettlementLog, ShardRef, SigningKey, Splits, SponsorError, Sponsored, Standing, Standings,
-    StateEntry, States, Storage, StorageEntry, StorageError, Storing, Through, WorkPreferences,
-    channel_id, merkle, privacy, settlement,
+    CashOut, Challenge, Closure, Conduct, ContentHash, Credits, Directory, DrawPage, Envelope,
+    EnvelopeError, FallBackJob, Fallback, FollowUps, Hosts, Inclusion, IncomingChannels, JobError,
+    JobId, JobResult, JobStatus, Jobs, LeasesGranted, Ledger, LedgerAddress, LedgerEntry,
+    LedgerError, Located, LogError, LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE,
+    MAX_PIECES, MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, NAME_DEPOSIT, NameError, NameRecord,
+    OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT, PRODUCED_RETENTION_DAYS, Payout, Penalty,
+    Placement, Posted, PrivacyError, PublicKey, Quote, Receipt, Record, RecordError, Registry,
+    RegistryEntry, RelayEntry, RelayError, Relays, Resolved, Route, ScoreEvent, Scores,
+    SealingKeys, SettlementLog, ShardRef, Signature, Splits, SponsorError, Sponsored, Standing,
+    Standings, StateEntry, States, Storage, StorageEntry, StorageError, Storing, Through,
+    WorkPreferences, channel_id, draw_hash, merkle, privacy, settlement,
 };
 use decomp_schema::records::{self, Records};
 use rand::rngs::StdRng;
@@ -47,7 +47,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::fallback::FallBackRun;
-use crate::store::{Blobs, Log, StateStore};
+use crate::store::{Blobs, ControlKey, Log, StateStore};
 
 /// Why a blob was not accepted for storage.
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +102,8 @@ pub enum RegistryError {
 /// Why a job was not accepted.
 #[derive(Debug, thiserror::Error)]
 pub enum SubmitError {
+    #[error("the control plane is not taking new jobs now; ask again later")]
+    NotTakingJobs,
     #[error(transparent)]
     Job(#[from] JobError),
     #[error(transparent)]
@@ -207,13 +209,17 @@ pub struct ControlPlane {
     /// and each job's place in that order. Batches are made from these.
     receipt_hashes: Vec<ContentHash>,
     receipt_of: HashMap<JobId, u64>,
-    /// The key the settlement log and draws are signed with, which is also the
-    /// treasury's.
-    control: SigningKey,
+    /// The key the settlement log is signed with, which is also the treasury's.
+    control: ControlKey,
+    /// An entry of the settlement log waiting for a threshold key's signature.
+    unsigned: Option<(String, Vec<u8>)>,
     settlement: SettlementLog,
     settlement_log: Log,
-    /// The draws of jobs that have closed, each signed by the control plane.
+    /// The draws of jobs that have closed, each as the text it was published
+    /// as, and the hash of each text. Each batch fingerprints the draws since
+    /// the batch before it.
     draws_log: Log,
+    draw_hashes: Vec<ContentHash>,
     registry: Registry,
     registry_log: Log,
     records: AccountRecords,
@@ -243,6 +249,10 @@ pub struct ControlPlane {
     challenge_interval: u64,
     /// The control plane's own source of randomness (see `Settings::entropy`).
     rng: StdRng,
+    /// Whether new jobs are accepted. A host stops taking them when it is
+    /// about to run out of what it runs on (spec, "Failure handling": the
+    /// canister "stops taking new jobs before it runs out" of cycles).
+    taking_jobs: bool,
 }
 
 impl ControlPlane {
@@ -347,6 +357,11 @@ impl ControlPlane {
             Ok(())
         })?;
 
+        let draws_log = store.log("draws")?;
+        let draw_hashes = draws_log
+            .lines()?
+            .map(|line| line.map(|text| draw_hash(&text)))
+            .collect::<io::Result<Vec<_>>>()?;
         let receipts = store.log("receipts")?;
         let mut receipt_hashes = Vec::new();
         let mut receipt_of = HashMap::new();
@@ -365,8 +380,12 @@ impl ControlPlane {
             ops: posted_ops,
             entries,
             receipts: posted_receipts,
+            draws: posted_draws,
         } = settlement.through();
-        if posted_ops > ops.len() || entries > ledger_log.len() || posted_receipts > receipts.len()
+        if posted_ops > ops.len()
+            || entries > ledger_log.len()
+            || posted_receipts > receipts.len()
+            || posted_draws > draws_log.len()
         {
             let message = "the settlement log reaches further than the records it was made from";
             return Err(io::Error::new(io::ErrorKind::InvalidData, message));
@@ -397,9 +416,12 @@ impl ControlPlane {
             receipt_hashes,
             receipt_of,
             control: store.control_key()?,
+            unsigned: None,
+            taking_jobs: true,
             settlement,
             settlement_log,
-            draws_log: store.log("draws")?,
+            draw_hashes,
+            draws_log,
             registry,
             registry_log,
             records,
@@ -446,27 +468,72 @@ impl ControlPlane {
     /// one fingerprint and posts it with the net balance change per account").
     /// Nothing is posted when there is no new receipt and no balance changed.
     pub fn post_batch(&mut self, now: u64) {
+        // An entry still waiting for its signature comes first.
+        if self.unsigned.is_some() {
+            return;
+        }
         let through = Through {
             ops: self.ops.len(),
             entries: self.ledger_log.len(),
             receipts: self.receipts.len(),
+            draws: self.draw_hashes.len() as u64,
         };
-        let new = &self.receipt_hashes[self.settlement.through().receipts as usize..];
+        let last = self.settlement.through();
+        let receipts = &self.receipt_hashes[last.receipts as usize..];
+        let draws = &self.draw_hashes[last.draws as usize..];
         let holdings = self.holdings();
-        let Some(batch) = self.settlement.next_batch(new, &holdings, through) else {
+        let Some(batch) = self
+            .settlement
+            .next_batch(receipts, draws, &holdings, through)
+        else {
             return;
         };
         self.post(now, Posted::Batch(batch));
     }
 
-    /// Signs an entry and adds it to the settlement log.
+    /// Signs an entry and adds it to the settlement log, or, for a threshold
+    /// key, keeps it until the host has had it signed.
     fn post(&mut self, now: u64, posted: Posted) {
         let entry = self.settlement.entry(now, posted);
-        let entry = Envelope::seal(&self.control, &entry);
-        self.settlement
-            .apply(&entry)
-            .expect("the control plane's own entry follows the log's rules");
-        self.settlement_log.append(&entry);
+        match &self.control {
+            ControlKey::Held(key) => {
+                let entry = Envelope::seal(key, &entry);
+                self.append_entry(&entry)
+                    .expect("the control plane's own entry follows the log's rules");
+            }
+            ControlKey::Threshold(_) => self.unsigned = Some(Envelope::to_sign(&entry)),
+        }
+    }
+
+    /// Starts or stops taking new jobs. Jobs already taken run to the end.
+    pub fn take_jobs(&mut self, taking: bool) {
+        self.taking_jobs = taking;
+    }
+
+    /// The bytes the threshold key is to sign for the entry waiting to be
+    /// posted, if one is.
+    pub fn entry_to_sign(&self) -> Option<Vec<u8>> {
+        self.unsigned.as_ref().map(|(_, bytes)| bytes.clone())
+    }
+
+    /// Posts the waiting entry with the threshold key's signature of it.
+    pub fn signed(&mut self, signature: Signature) -> Result<(), LogError> {
+        let Some((payload, bytes)) = self.unsigned.take() else {
+            return Ok(());
+        };
+        let entry = Envelope::with_signature(payload.clone(), self.control.public_key(), signature);
+        let appended = self.append_entry(&entry);
+        if appended.is_err() {
+            // A signature that does not hold leaves the entry waiting.
+            self.unsigned = Some((payload, bytes));
+        }
+        appended
+    }
+
+    fn append_entry(&mut self, entry: &Envelope) -> Result<(), LogError> {
+        self.settlement.apply(entry)?;
+        self.settlement_log.append(entry);
+        Ok(())
     }
 
     /// Takes in the newest round of public randomness. Nodes are drawn for
@@ -476,9 +543,10 @@ impl ControlPlane {
     }
 
     /// Up to `MAX_LOG_PAGE` of the draws published so far, from number `from` on.
-    pub fn draws_page(&self, from: u64) -> io::Result<LogPage> {
-        let entries = read(self.draws_log.range(from, MAX_LOG_PAGE)?)?;
-        Ok(LogPage { entries })
+    pub fn draws_page(&self, from: u64) -> io::Result<DrawPage> {
+        Ok(DrawPage {
+            draws: self.draws_log.range(from, MAX_LOG_PAGE)?,
+        })
     }
 
     /// What sits at every ledger address now.
@@ -962,6 +1030,9 @@ impl ControlPlane {
         manifest: Manifest,
         now: u64,
     ) -> Result<JobId, SubmitError> {
+        if !self.taking_jobs {
+            return Err(SubmitError::NotTakingJobs);
+        }
         if manifest.reads.len() > MAX_READS {
             return Err(SubmitError::TooManyReads);
         }
@@ -1335,8 +1406,9 @@ impl ControlPlane {
         // A job's draws are published once the job has closed (spec section 4:
         // "Each draw is published").
         for draw in self.jobs.take_draws() {
-            let signed = Envelope::seal(&self.control, &draw);
-            self.draws_log.append(&signed);
+            let text = serde_json::to_string(&draw).expect("draws serialize");
+            self.draw_hashes.push(draw_hash(&text));
+            self.draws_log.append_line(text);
         }
         for closed in self.jobs.take_closed() {
             let job_id = closed.job_id;

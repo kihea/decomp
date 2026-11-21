@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use decomp_core::{ContentHash, SigningKey};
+use decomp_core::{ContentHash, PublicKey, SigningKey};
 use serde::Serialize;
 
 /// How a log's lines are kept.
@@ -30,8 +30,8 @@ pub trait StateStore {
     /// The log of one kind of entry, by name, such as `ops` or `ledger`.
     fn log(&mut self, name: &str) -> io::Result<Log>;
     fn blobs(&mut self) -> io::Result<Blobs>;
-    /// The key the settlement log and draws are signed with.
-    fn control_key(&mut self) -> io::Result<SigningKey>;
+    /// The key the settlement log is signed with.
+    fn control_key(&mut self) -> io::Result<ControlKey>;
 }
 
 /// An append-only log of JSON lines.
@@ -107,6 +107,26 @@ impl Blobs {
     }
 }
 
+/// The key that signs the settlement log, which is also the treasury's.
+pub enum ControlKey {
+    /// A key the host holds, as the devnet does in its data directory.
+    Held(SigningKey),
+    /// A key no one machine holds, such as an Internet Computer subnet's
+    /// threshold key. The control plane hands the host each entry to sign
+    /// (`ControlPlane::entry_to_sign`) and takes the signature back
+    /// (`ControlPlane::signed`).
+    Threshold(PublicKey),
+}
+
+impl ControlKey {
+    pub fn public_key(&self) -> PublicKey {
+        match self {
+            Self::Held(key) => key.public_key(),
+            Self::Threshold(key) => *key,
+        }
+    }
+}
+
 /// Logs and blobs kept in memory, which a canister saves to stable memory
 /// before an upgrade and hands back after it.
 /// One log's lines, shared between the log and the storage that saves them.
@@ -116,6 +136,7 @@ type SharedLines = Arc<Mutex<Vec<String>>>;
 pub struct MemoryStorage {
     logs: Arc<Mutex<HashMap<String, SharedLines>>>,
     blobs: Arc<Mutex<HashMap<ContentHash, Vec<u8>>>>,
+    /// The threshold key that signs the settlement log, by its public key.
     key: [u8; 32],
 }
 
@@ -127,10 +148,11 @@ pub type MemorySnapshot = (
 );
 
 impl MemoryStorage {
-    /// Empty storage whose signing key is made from `key_seed`.
-    pub fn new(key_seed: [u8; 32]) -> Self {
+    /// Empty storage for a control plane whose settlement log a threshold key
+    /// signs, which no one machine holds: `key` is its public key.
+    pub fn new(key: PublicKey) -> Self {
         Self {
-            key: key_seed,
+            key: *key.as_bytes(),
             ..Self::default()
         }
     }
@@ -214,7 +236,7 @@ impl StateStore for MemoryStorage {
         Ok(Blobs::new(Box::new(MemoryBlobs(Arc::clone(&self.blobs)))))
     }
 
-    fn control_key(&mut self) -> io::Result<SigningKey> {
-        Ok(SigningKey::from_seed(self.key))
+    fn control_key(&mut self) -> io::Result<ControlKey> {
+        Ok(ControlKey::Threshold(PublicKey::from_bytes(self.key)))
     }
 }

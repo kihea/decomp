@@ -5,8 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use decomp_control::{BlobBackend, Blobs, Log, StateStore};
-use decomp_core::{ContentHash, SigningKey};
+use decomp_control::{BlobBackend, Blobs, ControlKey, Log, StateStore};
+use decomp_core::ContentHash;
 
 use crate::key;
 use crate::log::FileLog;
@@ -67,7 +67,7 @@ impl StateStore for DataDir {
         })))
     }
 
-    fn control_key(&mut self) -> io::Result<SigningKey> {
-        key::control_key(&self.dir)
+    fn control_key(&mut self) -> io::Result<ControlKey> {
+        key::control_key(&self.dir).map(ControlKey::Held)
     }
 }

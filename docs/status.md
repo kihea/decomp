@@ -48,8 +48,8 @@ Last updated 2026-11-21.
 | Part | Status | Notes |
 | --- | --- | --- |
 | Local devnet | Available | `decomp-devnet` runs the accounts, registry, job board, and receipts services in one process |
-| ICP canisters | In development | The control canister (`canisters/control`) runs every control-plane service from the same library as the devnet (accounts, registry, job board, receipts), over the HTTP gateway with the same signed calls. Leases and audits draw on the Internet Computer's randomness, value keys come from the subnet's threshold key, always-on fallbacks run on an interpreter in the canister, and state survives upgrades; job data stays on storage nodes. `decomp-replica` runs it on a local replica. Still to do: splitting the job board across canisters by class and tier, and signing the settlement log with the subnet's threshold Ed25519 key instead of a key held in the canister |
-| Batched receipts, a signed settlement log, inclusion proofs | Available | Anyone can recompute a batch fingerprint from its receipts |
+| ICP canisters | In development | The control canister (`canisters/control`) runs every control-plane service from the same library as the devnet (accounts, registry, job board, receipts), over the HTTP gateway with the same signed calls. Leases and audits draw on the Internet Computer's randomness, the settlement log is signed by the subnet's threshold Ed25519 key, value keys come from its vetKD key, always-on fallbacks run on an interpreter in the canister, it stops taking new jobs when its cycles run low, and state survives upgrades; job data stays on storage nodes. `decomp-replica` runs it on a local replica. Still to do: splitting the job board across canisters by class and tier |
+| Batched receipts, a signed settlement log, inclusion proofs | Available | Anyone can recompute a batch fingerprint from its receipts. Each batch also fingerprints the draws published since the last, which is what proves a draw |
 | Name registry | Available | Deposits, held brand names, look-alike blocking, expiry, review, and a searchable directory |
 
 ## Data

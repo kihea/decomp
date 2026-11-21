@@ -41,6 +41,25 @@ impl Envelope {
         }
     }
 
+    /// The payload `message` travels as and the bytes a signer signs for it,
+    /// for a key held elsewhere, such as a threshold key, which hands back a
+    /// signature for `with_signature`.
+    pub fn to_sign<T: Serialize>(message: &T) -> (String, Vec<u8>) {
+        let payload = serde_json::to_string(message).expect("protocol messages serialize");
+        let bytes = signing_input(&payload).into_bytes();
+        (payload, bytes)
+    }
+
+    /// An envelope from a payload and a signature made elsewhere. It is not
+    /// checked here; `open` checks it.
+    pub fn with_signature(payload: String, signer: PublicKey, signature: Signature) -> Self {
+        Self {
+            payload,
+            signer,
+            signature,
+        }
+    }
+
     /// Checks the signature, then parses the payload. The payload is never parsed
     /// unless the signature is valid.
     pub fn open<T: DeserializeOwned>(&self) -> Result<T, EnvelopeError> {

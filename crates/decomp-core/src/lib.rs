@@ -87,8 +87,8 @@ pub use request::{
 pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
 pub use seal::{SEAL_OVERHEAD_BYTES, SealingKeys};
 pub use settlement::{
-    BATCH_PERIOD_SECS, Batch, Change, Inclusion, LogEntry, LogError, LogPage, MAX_LOG_PAGE, Posted,
-    SettlementLog, Through, fingerprint,
+    BATCH_PERIOD_SECS, Batch, Change, DrawPage, Inclusion, LogEntry, LogError, LogPage,
+    MAX_LOG_PAGE, Posted, SettlementLog, Through, draw_hash, fingerprint,
 };
 pub use shares::{SHARES, ShareError};
 pub use splits::Splits;

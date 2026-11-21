@@ -8,6 +8,11 @@
 //! entry before it, so anyone who is given the log can check it from the first
 //! entry and ends up with every balance, and anyone can recompute a batch's
 //! fingerprint from its receipts.
+//!
+//! A batch also fingerprints the draws published since the batch before it,
+//! so a draw is proven by the signed batch that holds it, and the control
+//! plane signs once a period rather than once a draw. On the Internet Computer
+//! the signature is the subnet's threshold key's, which no one machine holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,14 +50,16 @@ pub struct Change {
 }
 
 /// How far into the control plane's records a batch reaches: how many account
-/// changes, credit movements, and receipts there had been when it was made.
-/// The receipts a batch combines are those after the batch before it.
+/// changes, credit movements, receipts, and draws there had been when it was
+/// made. The receipts and draws a batch fingerprints are those after the batch
+/// before it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Through {
     pub ops: u64,
     pub entries: u64,
     pub receipts: u64,
+    pub draws: u64,
 }
 
 /// What the receipts canister posts each period (spec section 6, "Batches": it
@@ -67,6 +74,10 @@ pub struct Batch {
     /// were made (see `merkle::list_root`). Each receipt goes in as the hash of
     /// its text.
     pub fingerprint: ContentHash,
+    /// The root of a hash tree over the draws published in the period, in the
+    /// order they were published. Each goes in as the hash of its text (see
+    /// `draw_hash`).
+    pub draws: ContentHash,
     /// One entry for every balance that changed, in order of address.
     pub changes: Vec<Change>,
     pub through: Through,
@@ -105,6 +116,18 @@ pub fn entry_hash(entry: &Envelope) -> ContentHash {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogPage {
     pub entries: Vec<Envelope>,
+}
+
+/// A page of the draws published so far, each as the text it was published
+/// as, which is what a batch fingerprints.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DrawPage {
+    pub draws: Vec<String>,
+}
+
+/// What a draw goes into a batch's fingerprint as: the hash of its text.
+pub fn draw_hash(text: &str) -> ContentHash {
+    merkle::item_hash(text.as_bytes())
 }
 
 /// Proof that a receipt is in a batch (spec section 6: "Any node can check that
@@ -256,6 +279,17 @@ impl SettlementLog {
         Some((start, end))
     }
 
+    /// Where the draws of batch `number` begin and end among all draws.
+    pub fn draws_of(&self, number: u64) -> Option<(u64, u64)> {
+        let index = usize::try_from(number).ok()?;
+        let end = self.batches.get(index)?.through.draws;
+        let start = match index.checked_sub(1) {
+            Some(before) => self.batches[before].through.draws,
+            None => 0,
+        };
+        Some((start, end))
+    }
+
     /// The batch that holds the receipt at place `receipt` among all receipts.
     pub fn batch_holding(&self, receipt: u64) -> Option<&Batch> {
         let index = self
@@ -265,17 +299,19 @@ impl SettlementLog {
     }
 
     /// The batch to post next, or `None` if there is nothing new to post: no
-    /// receipt since the last batch, and no balance that differs from the log's.
-    /// `receipts` are the hashes of the receipts since the last batch, and
-    /// `holdings` is what sits at every ledger address now.
+    /// receipt or draw since the last batch, and no balance that differs from
+    /// the log's. `receipts` and `draws` are the hashes of those since the last
+    /// batch, and `holdings` is what sits at every ledger address now.
     pub fn next_batch(
         &self,
         receipts: &[ContentHash],
+        draws: &[ContentHash],
         holdings: &BTreeMap<LedgerAddress, Credits>,
         through: Through,
     ) -> Option<Batch> {
-        let batch = self.batch_from(receipts, holdings, through);
-        (!receipts.is_empty() || !batch.changes.is_empty()).then_some(batch)
+        let batch = self.batch_from(receipts, draws, holdings, through);
+        let empty = receipts.is_empty() && draws.is_empty() && batch.changes.is_empty();
+        (!empty).then_some(batch)
     }
 
     /// The batch the records give at this point in the log, whether or not
@@ -283,6 +319,7 @@ impl SettlementLog {
     fn batch_from(
         &self,
         receipts: &[ContentHash],
+        draws: &[ContentHash],
         holdings: &BTreeMap<LedgerAddress, Credits>,
         through: Through,
     ) -> Batch {
@@ -303,6 +340,7 @@ impl SettlementLog {
         Batch {
             number: self.batches.len() as u64,
             fingerprint: merkle::list_root(receipts),
+            draws: merkle::list_root(draws),
             changes,
             through,
         }

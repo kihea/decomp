@@ -5,9 +5,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use decomp_core::{
-    BEACON_CHAIN, Beacon, Draw, DrawError, Envelope, EnvelopeError, PublicKey, RandomnessSource,
-};
+use decomp_core::{BEACON_CHAIN, Beacon, Draw, DrawError, RandomnessSource};
 
 /// Where the drand beacon is read.
 const BEACON_HOST: &str = "https://api.drand.sh";
@@ -19,10 +17,8 @@ const BEACON_TIMEOUT: Duration = Duration::from_secs(10);
 /// Why a published draw does not hold.
 #[derive(Debug, thiserror::Error)]
 pub enum DrawFault {
-    #[error(transparent)]
-    Signature(#[from] EnvelopeError),
-    #[error("it is signed by {0}, not by the operator")]
-    NotTheOperator(PublicKey),
+    #[error("it is not a draw: {0}")]
+    NotADraw(String),
     #[error(transparent)]
     Draw(#[from] DrawError),
     #[error("the beacon gave other randomness for round {0} than the draw records")]
@@ -72,15 +68,14 @@ impl Rounds {
         response.body_mut().read_json().map_err(|e| e.to_string())
     }
 
-    /// Checks one published draw: that `operator` signed it, that the rule
-    /// draws the nodes it names from the round it names, that the round was
-    /// the newest when the draw was made, and that the beacon itself gives
-    /// that round the same randomness.
-    pub fn check(&mut self, signed: &Envelope, operator: &PublicKey) -> Result<Draw, DrawFault> {
-        let draw: Draw = signed.open()?;
-        if signed.signer != *operator {
-            return Err(DrawFault::NotTheOperator(signed.signer));
-        }
+    /// Checks one published draw, as the text it was published as: that the
+    /// rule draws the nodes it names from the round it names, that the round
+    /// was the newest when the draw was made, and that the beacon itself gives
+    /// that round the same randomness. That the control plane published it is
+    /// shown by the signed batch that fingerprints it.
+    pub fn check(&mut self, text: &str) -> Result<Draw, DrawFault> {
+        let draw: Draw =
+            serde_json::from_str(text).map_err(|error| DrawFault::NotADraw(error.to_string()))?;
         draw.check()?;
         // The network's own randomness cannot be fetched again; the subnet's
         // consensus stands behind it, so only the rule is checked.

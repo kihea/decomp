@@ -29,4 +29,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - run: npm ci
       - run: npx -y -p typescript@6.0.3 tsc --noEmit -p .

@@ -20,7 +20,8 @@ use decomp_core::{
     Credits, Encrypted, Fallback, Inclusion, JobClass, JobId, JobStatus, MAX_LOG_PAGE,
     MAX_STORAGE_DAYS, Manifest, OpeningKey, Outcome, Pickup, Price, Privacy, PrivateRoute,
     PublicKey, Receipt, Request, SHARES, ShardRef, Share, ShareSet, Split, Sponsorship,
-    Verification, Verify, WorkPreferences, controller, cut, encrypted, merkle, privacy, shares,
+    Verification, Verify, WorkPreferences, controller, cut, draw_hash, encrypted, merkle, privacy,
+    shares,
 };
 
 use decomp_node::beacon::Rounds;
@@ -900,20 +901,23 @@ fn check_receipts(client: &Client, dir: &Path) -> Result<ExitCode, Box<dyn Error
 
 /// Checks every draw the job board has published (spec section 4: "Each draw
 /// is published, so anyone can recheck that nodes were not hand-picked"). Each
-/// must be signed by the key that signs the settlement log, name the beacon
-/// round that was newest when it was made, with the randomness the beacon
-/// itself gives for that round, and grant the lease to the node the rule
-/// draws.
+/// must name the beacon round that was newest when it was made, with the
+/// randomness the beacon itself gives for that round, and grant the lease to
+/// the node the rule draws. Each draw a batch of the settlement log covers
+/// must be among those the batch fingerprints, which shows that the control
+/// plane published it; newer draws are not yet covered.
 fn check_draws(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
-    let signer = client.settlement_log()?.signer();
+    let log = client.settlement_log()?;
     let mut rounds = Rounds::default();
     let (mut from, mut confirming, mut audits, mut filled) = (0, 0, 0, 0);
+    let mut hashes = Vec::new();
     loop {
         let page = client.draws(from)?;
-        for signed in &page.entries {
+        for text in &page.draws {
             let draw = rounds
-                .check(signed, &signer.unwrap_or(signed.signer))
+                .check(text)
                 .map_err(|fault| format!("draw {from} does not hold: {fault}"))?;
+            hashes.push(draw_hash(text));
             let pickup = match draw.pickup {
                 Pickup::First => "first pickup",
                 Pickup::Second => "second pickup",
@@ -936,13 +940,29 @@ fn check_draws(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
             filled += u64::from(draw.bid.is_some());
             from += 1;
         }
-        if page.entries.len() < MAX_LOG_PAGE {
+        if page.draws.len() < MAX_LOG_PAGE {
             break;
         }
+    }
+    let mut covered = 0;
+    for (number, batch) in log.batches().iter().enumerate() {
+        let (start, end) = log.draws_of(number as u64).expect("the batch exists");
+        let Some(drawn) = hashes.get(start as usize..end as usize) else {
+            return fail(&format!(
+                "batch {number} covers draws the control plane did not hand over"
+            ));
+        };
+        if merkle::list_root(drawn) != batch.draws {
+            return fail(&format!(
+                "batch {number} fingerprints other draws than those published"
+            ));
+        }
+        covered = end;
     }
     println!(
         "{from} draws hold: {confirming} second pickups, {audits} audits, {filled} filled bids"
     );
+    println!("{covered} of them are in signed batches of the settlement log");
     Ok(ExitCode::SUCCESS)
 }
 

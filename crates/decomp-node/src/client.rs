@@ -6,10 +6,11 @@ use decomp_core::LogError;
 use decomp_core::{
     AccountId, AccountOp, AccountStatus, Activity, AppManifest, Approval, Bid, BidOrder, Bids,
     Blob, BlobData, BlobRef, Call, CashOut, CashOutAsked, CashOuts, Challenge, ContentHash,
-    Credits, Directory, Envelope, Inclusion, IncomingChannels, JobId, JobResult, JobStatus,
-    LeasesGranted, Located, LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES, Manifest, NameRecord,
-    Placement, PublicKey, PublishedKey, Quote, Rates, Refusal, Request, Resolved, Route,
-    SealingKey, SettlementLog, ShardNow, SigningKey, Standing, Submitted, WorkPreferences, seal,
+    Credits, Directory, DrawPage, Envelope, Inclusion, IncomingChannels, JobId, JobResult,
+    JobStatus, LeasesGranted, Located, LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES, Manifest,
+    NameRecord, Placement, PublicKey, PublishedKey, Quote, Rates, Refusal, Request, Resolved,
+    Route, SealingKey, SettlementLog, ShardNow, SigningKey, Standing, Submitted, WorkPreferences,
+    seal,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -452,7 +453,7 @@ impl Client {
     }
 
     /// A page of the draws the job board has published, from number `from` on.
-    pub fn draws(&self, from: u64) -> Result<LogPage, ClientError> {
+    pub fn draws(&self, from: u64) -> Result<DrawPage, ClientError> {
         self.call(Call::GetDraws { from })
     }
 
