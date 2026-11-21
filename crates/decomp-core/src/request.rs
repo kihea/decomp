@@ -189,6 +189,12 @@ pub enum Call {
     PublishSealingKey { key: SealingKey },
     /// The sealing key a device has published. Answer: `PublishedKey`.
     GetSealingKey { device: PublicKey },
+    /// The key for the signer's account's private values under `label`,
+    /// derived by the network's threshold key and encrypted to
+    /// `transport_key`, a BLS12-381 key the device made for this request (see
+    /// `value_keys`). Only the control canister can answer it. Answer:
+    /// `ValueKey`.
+    GetValueKey { label: String, transport_key: Blob },
     /// Opens a channel to the device `to` through a relay node, for up to `bytes`
     /// bytes, and sets the fee for that much aside (see `relay`). Answer: `Route`.
     OpenRelay { to: PublicKey, bytes: u64 },
@@ -356,6 +362,16 @@ pub struct PublishedKey {
     /// The device's signed request publishing its key, to be read with
     /// `seal::published_key`, or nothing if it has published none.
     pub proof: Option<Envelope>,
+}
+
+/// A value key, as the threshold key gave it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ValueKey {
+    /// The key, encrypted to the request's transport key.
+    pub encrypted_key: Blob,
+    /// The public key it can be checked against: the threshold key's, derived
+    /// for the control canister and the value-key context.
+    pub public_key: Blob,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

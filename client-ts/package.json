@@ -4,5 +4,8 @@
   "description": "TypeScript client for the DeComp control plane: message shapes, signing, and calls.",
   "private": true,
   "main": "src/index.ts",
-  "types": "src/index.ts"
+  "types": "src/index.ts",
+  "dependencies": {
+    "@dfinity/vetkeys": "^0.4.0"
+  }
 }

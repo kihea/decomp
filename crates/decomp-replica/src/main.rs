@@ -117,6 +117,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut replica = PocketIcBuilder::new()
         .with_server_url(server.parse()?)
         .with_application_subnet()
+        // The subnet that holds the threshold keys (vetKD, Schnorr), as on
+        // the network.
+        .with_ii_subnet()
         .build();
     let canister = replica.create_canister();
     replica.add_cycles(canister, CYCLES);

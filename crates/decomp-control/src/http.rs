@@ -11,11 +11,11 @@ use std::io;
 
 use decomp_core::registry::MAX_DIRECTORY_PAGE;
 use decomp_core::{
-    Account, Accounts, Addressed, BidError, Bids, Blob, BlobData, BlobRef, Call, CashOutAsked,
-    CashOuts, ContentHash, Envelope, EnvelopeError, JobError, LedgerEntry, LedgerError,
-    MAX_CLOCK_SKEW_SECS, NameError, OpError, Outcome, PrivacyError, PublicKey, PublishedKey, Rates,
-    RecordError, RecordList, Refusal, RelayError, Request, ShardNow, ShardRef, SponsorError,
-    StorageError, Storing, Submitted,
+    Account, AccountId, Accounts, Addressed, BidError, Bids, Blob, BlobData, BlobRef, Call,
+    CashOutAsked, CashOuts, ContentHash, Envelope, EnvelopeError, JobError, LedgerEntry,
+    LedgerError, MAX_CLOCK_SKEW_SECS, MAX_VALUE_KEY_LABEL_BYTES, NameError, OpError, Outcome,
+    PrivacyError, PublicKey, PublishedKey, Rates, RecordError, RecordList, Refusal, RelayError,
+    Request, ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted, value_key_input,
 };
 use decomp_sandbox::Sandbox;
 use serde::Serialize;
@@ -36,7 +36,9 @@ impl StatusCode {
     pub const FORBIDDEN: Self = Self(403);
     pub const NOT_FOUND: Self = Self(404);
     pub const CONFLICT: Self = Self(409);
+    pub const TOO_MANY_REQUESTS: Self = Self(429);
     pub const INTERNAL_SERVER_ERROR: Self = Self(500);
+    pub const NOT_IMPLEMENTED: Self = Self(501);
     pub const SERVICE_UNAVAILABLE: Self = Self(503);
 }
 
@@ -94,14 +96,7 @@ fn request(
     now: u64,
 ) -> Result<Response, ApiError> {
     let Request { issued_at, call } = envelope.open()?;
-    if now.abs_diff(issued_at) > MAX_CLOCK_SKEW_SECS {
-        let message = "the request's issued_at is too far from the control plane's clock";
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "stale_request",
-            message,
-        ));
-    }
+    check_fresh(issued_at, now)?;
 
     match call {
         // Anyone may resolve a name, read the directory, or fetch a blob by its
@@ -131,6 +126,64 @@ fn request(
             answer(control, sandbox, call, &account, envelope, now)
         }
     }
+}
+
+fn check_fresh(issued_at: u64, now: u64) -> Result<(), ApiError> {
+    if now.abs_diff(issued_at) > MAX_CLOCK_SKEW_SECS {
+        let message = "the request's issued_at is too far from the control plane's clock";
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "stale_request",
+            message,
+        ));
+    }
+    Ok(())
+}
+
+/// A request for a value key that has been checked: signed by a device of
+/// `account`, fresh, and with a label that is not too long.
+pub struct ValueKeyRequest {
+    pub account: AccountId,
+    /// What the threshold key derives the key from (`value_key_input`).
+    pub input: Vec<u8>,
+    pub transport_key: Vec<u8>,
+}
+
+/// If the request for `path` asks for a value key, checks it. The host
+/// derives the key with its threshold key and answers with a `ValueKey`; a
+/// host without one lets `handle` answer that it has none.
+pub fn value_key_request(
+    control: &ControlPlane,
+    path: &str,
+    body: &[u8],
+    now: u64,
+) -> Option<Result<ValueKeyRequest, Response>> {
+    if path != "/v1/request" {
+        return None;
+    }
+    let envelope = serde_json::from_slice::<Envelope>(body).ok()?;
+    let Request { issued_at, call } = envelope.open().ok()?;
+    let Call::GetValueKey {
+        label,
+        transport_key,
+    } = call
+    else {
+        return None;
+    };
+    let checked = (|| {
+        check_fresh(issued_at, now)?;
+        if label.len() > MAX_VALUE_KEY_LABEL_BYTES {
+            let message = format!("a label is at most {MAX_VALUE_KEY_LABEL_BYTES} bytes");
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad_label", message));
+        }
+        let account = member(&control.accounts, &envelope.signer)?.id;
+        Ok(ValueKeyRequest {
+            account,
+            input: value_key_input(&account, &label),
+            transport_key: transport_key.0,
+        })
+    })();
+    Some(checked.map_err(ApiError::into_response))
 }
 
 fn answer(
@@ -314,6 +367,14 @@ fn answer(
         Call::PublishSealingKey { .. } => {
             control.publish_sealing_key(&envelope)?;
             Json(json!({})).into_response()
+        }
+        Call::GetValueKey { .. } => {
+            let message = "value keys come from the network's threshold key, which only the                 control canister has; run the control plane as a canister";
+            return Err(ApiError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "no_threshold_key",
+                message,
+            ));
         }
         Call::GetSealingKey { device } => Json(PublishedKey {
             proof: control.sealing_key_proof(&device),

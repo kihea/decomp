@@ -161,6 +161,8 @@ export type Call =
   | { type: 'get_account' }
   | { type: 'publish_sealing_key'; key: string }
   | { type: 'get_sealing_key'; device: string }
+  /** `transport_key` is base64: the BLS12-381 transport key the answer is encrypted to. */
+  | { type: 'get_value_key'; label: string; transport_key: string }
   | { type: 'open_relay'; to: string; bytes: number }
   | { type: 'list_incoming' }
   | { type: 'store_blob'; root: string; size: number; days: number; to?: string }
@@ -230,6 +232,12 @@ export type Located = { size: number; addresses: string[] };
 
 /** A device's signed request publishing its sealing key, if it has published one. */
 export type PublishedKey = { proof: Envelope | null };
+
+/**
+ * A value key as the threshold key gave it (`ValueKey`), both base64: the key
+ * encrypted to the request's transport key, and the public key to check it by.
+ */
+export type ValueKeyAnswer = { encrypted_key: string; public_key: string };
 
 /** What the sender signs for each frame of a channel (`FrameHeader`). */
 export type FrameHeader = {

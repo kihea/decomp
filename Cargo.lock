@@ -930,9 +930,11 @@ dependencies = [
  "decomp-sandbox",
  "getrandom 0.4.3",
  "ic-cdk",
+ "ic-cdk-management-canister",
  "ic-cdk-timers",
  "serde",
  "serde_bytes",
+ "serde_json",
 ]
 
 [[package]]
@@ -1680,6 +1682,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ic-cdk-management-canister"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c8fb578283e842e9f2c84a4477f751ee2146bea13017a10d227afd952d349a2"
+dependencies = [
+ "candid",
+ "ic-cdk",
+ "ic-management-canister-types 0.11.0",
+ "serde",
+ "serde_bytes",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ic-cdk-timers"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1718,6 +1734,17 @@ name = "ic-management-canister-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3149217e24186df3f13dc45eee14cdb3e5cad07d0b2b67bd53555c1c55462957"
+dependencies = [
+ "candid",
+ "serde",
+ "serde_bytes",
+]
+
+[[package]]
+name = "ic-management-canister-types"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3e3162bdfbdbc6ca3b4bfa8145f9ba19cddaf3eb8d1af8dc7be6a39557b76c2"
 dependencies = [
  "candid",
  "serde",
@@ -2346,7 +2373,7 @@ dependencies = [
  "flate2",
  "hex",
  "ic-certification",
- "ic-management-canister-types",
+ "ic-management-canister-types 0.5.0",
  "ic-transport-types",
  "reqwest",
  "schemars",

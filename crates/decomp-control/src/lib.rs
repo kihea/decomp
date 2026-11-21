@@ -9,6 +9,6 @@ pub mod referee;
 pub mod state;
 pub mod store;
 
-pub use http::{Response, StatusCode, handle};
+pub use http::{Response, StatusCode, ValueKeyRequest, handle, value_key_request};
 pub use state::{ControlPlane, Settings};
 pub use store::{BlobBackend, Blobs, Log, LogBackend, MemorySnapshot, MemoryStorage, StateStore};

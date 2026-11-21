@@ -29,6 +29,7 @@ pub mod shares;
 mod splits;
 mod state;
 mod storage;
+mod value_keys;
 
 pub use account::{Account, AccountOp, Accounts, Device, OpError, Recovery};
 pub use app::{
@@ -81,6 +82,7 @@ pub use request::{
     AccountStatus, Activity, Bids, Blob, BlobData, BlobRef, Call, CashOutAsked, CashOuts,
     Directory, IncomingChannels, LeasesGranted, MAX_CLOCK_SKEW_SECS, MAX_MESSAGE_BYTES, Placement,
     PublishedKey, Quote, Rates, RecordList, Refusal, Request, Resolved, ShardNow, Submitted,
+    ValueKey,
 };
 pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
 pub use seal::{SEAL_OVERHEAD_BYTES, SealingKeys};
@@ -95,3 +97,4 @@ pub use storage::{
     Addressed, Challenge, Located, Storage, StorageEntry, StorageError, StoreOrder, Storing,
     Waiting, placement_order, storage_fee,
 };
+pub use value_keys::{MAX_VALUE_KEY_LABEL_BYTES, VALUE_KEY_CONTEXT, value_key_input};

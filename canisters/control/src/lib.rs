@@ -16,6 +16,9 @@
 //!   posts a batch of receipts each period.
 //! - **Disputes and fallbacks** run in the canister on the interpreter
 //!   (`decomp-sandbox` with `wasmi`).
+//! - **Value keys.** Keys for an account's private values are derived by
+//!   the subnet's threshold key (vetKD) and encrypted to the asking device
+//!   (`decomp_core::value_keys`), so no single party holds them.
 //! - **Persistence.** The control plane's logs live in the heap, are saved to
 //!   stable memory before an upgrade, and are replayed after it.
 //!
@@ -24,15 +27,21 @@
 //! responses.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use candid::{CandidType, Deserialize, Principal};
 use decomp_control::referee::{self, referee};
-use decomp_control::{ControlPlane, MemorySnapshot, MemoryStorage, Settings};
+use decomp_control::{ControlPlane, MemorySnapshot, MemoryStorage, Settings, ValueKeyRequest};
 use decomp_core::{
-    BATCH_PERIOD_SECS, BEACON_PERIOD_SECS, Beacon, ContentHash, RandomnessSource, round_at,
+    AccountId, BATCH_PERIOD_SECS, BEACON_PERIOD_SECS, Beacon, Blob, ContentHash, RandomnessSource,
+    Refusal, VALUE_KEY_CONTEXT, ValueKey, round_at,
 };
 use decomp_sandbox::Sandbox;
+use ic_cdk_management_canister::{
+    VetKDCurve, VetKDDeriveKeyArgs, VetKDKeyId, VetKDPublicKeyArgs, vetkd_derive_key,
+    vetkd_public_key,
+};
 
 /// What the canister is installed with (`control.did`).
 #[derive(CandidType, Deserialize, Clone, Default)]
@@ -52,6 +61,17 @@ const CHALLENGE_INTERVAL_SECS: u64 = 3600;
 /// How often time is let pass for jobs nobody is asking about.
 const TICK: Duration = Duration::from_secs(1);
 
+/// The subnet's threshold key that value keys are derived with: the
+/// network's production key, which a local replica also provides.
+const THRESHOLD_KEY: &str = "key_1";
+
+/// How many value keys one account may ask for in a day. Each costs the
+/// canister cycles; a device keeps the keys it has been given, so it asks
+/// rarely.
+const VALUE_KEYS_PER_ACCOUNT_PER_DAY: u32 = 100;
+
+const SECS_PER_DAY: u64 = 86_400;
+
 struct Canister {
     install: InstallSettings,
     storage: MemoryStorage,
@@ -61,6 +81,11 @@ struct Canister {
 
 thread_local! {
     static CANISTER: RefCell<Option<Canister>> = const { RefCell::new(None) };
+    /// The threshold key's public key for the value-key context, fetched once.
+    static VALUE_KEY_PUBLIC: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// Value keys asked for today, by account: the day and the count.
+    static VALUE_KEYS_ASKED: RefCell<HashMap<AccountId, (u64, u32)>> =
+        RefCell::new(HashMap::new());
 }
 
 fn now() -> u64 {
@@ -207,13 +232,105 @@ fn http_request(http: HttpRequest) -> HttpResponse {
     response(200, b"{}".to_vec(), Some(true))
 }
 
+fn refusal(status_code: u16, error: &str, message: impl Into<String>) -> HttpResponse {
+    let body = Refusal {
+        error: error.into(),
+        message: message.into(),
+    };
+    response(
+        status_code,
+        serde_json::to_vec(&body).expect("refusals serialize"),
+        None,
+    )
+}
+
+fn value_key_key_id() -> VetKDKeyId {
+    VetKDKeyId {
+        curve: VetKDCurve::Bls12_381_G2,
+        name: THRESHOLD_KEY.into(),
+    }
+}
+
+/// Counts a value key asked for by `account`, or refuses it if the account
+/// has asked for as many as it may today.
+fn count_value_key(account: AccountId) -> bool {
+    let day = now() / SECS_PER_DAY;
+    VALUE_KEYS_ASKED.with_borrow_mut(|asked| {
+        asked.retain(|_, (counted_day, _)| *counted_day == day);
+        let (_, count) = asked.entry(account).or_insert((day, 0));
+        if *count >= VALUE_KEYS_PER_ACCOUNT_PER_DAY {
+            return false;
+        }
+        *count += 1;
+        true
+    })
+}
+
+/// Has the threshold key derive a value key, and answers with it.
+async fn value_key(request: ValueKeyRequest) -> HttpResponse {
+    if !count_value_key(request.account) {
+        let message = format!(
+            "an account may ask for {VALUE_KEYS_PER_ACCOUNT_PER_DAY} value keys a day;              keep the keys this device has been given"
+        );
+        return refusal(429, "too_many_value_keys", message);
+    }
+    let derived = vetkd_derive_key(&VetKDDeriveKeyArgs {
+        input: request.input,
+        context: VALUE_KEY_CONTEXT.to_vec(),
+        transport_public_key: request.transport_key,
+        key_id: value_key_key_id(),
+    })
+    .await;
+    let encrypted_key = match derived {
+        Ok(derived) => derived.encrypted_key,
+        Err(error) => return refusal(503, "threshold_key_failed", error.to_string()),
+    };
+    let public_key = match VALUE_KEY_PUBLIC.with_borrow(Clone::clone) {
+        Some(key) => key,
+        None => {
+            let fetched = vetkd_public_key(&VetKDPublicKeyArgs {
+                canister_id: None,
+                context: VALUE_KEY_CONTEXT.to_vec(),
+                key_id: value_key_key_id(),
+            })
+            .await;
+            match fetched {
+                Ok(fetched) => {
+                    VALUE_KEY_PUBLIC.set(Some(fetched.public_key.clone()));
+                    fetched.public_key
+                }
+                Err(error) => return refusal(503, "threshold_key_failed", error.to_string()),
+            }
+        }
+    };
+    let answer = ValueKey {
+        encrypted_key: Blob(encrypted_key),
+        public_key: Blob(public_key),
+    };
+    response(
+        200,
+        serde_json::to_vec(&answer).expect("answers serialize"),
+        None,
+    )
+}
+
 #[ic_cdk::update]
-fn http_request_update(http: HttpRequest) -> HttpResponse {
+async fn http_request_update(http: HttpRequest) -> HttpResponse {
     let path = http.url.split('?').next().unwrap_or_default().to_string();
     if http.method != "POST" {
-        let body =
-            br#"{"error":"not_found","message":"the calls are POST /v1/ops and POST /v1/request"}"#;
-        return response(404, body.to_vec(), None);
+        return refusal(
+            404,
+            "not_found",
+            "the calls are POST /v1/ops and POST /v1/request",
+        );
+    }
+    let asked = with_canister(|canister| {
+        decomp_control::value_key_request(&canister.control, &path, &http.body, now())
+    });
+    match asked {
+        Some(Ok(request)) => return value_key(request).await,
+        Some(Err(answer)) => return response(answer.status.0, answer.body, None),
+        None => {}
     }
     let answer = with_canister(|canister| {
         let answer = decomp_control::handle(
