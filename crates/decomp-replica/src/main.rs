@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use candid::{CandidType, encode_args, encode_one};
 use pocket_ic::PocketIcBuilder;
+use serde::Deserialize;
 
 /// The control canister's install argument (`canisters/control/control.did`).
 #[derive(CandidType)]
@@ -62,6 +63,39 @@ fn list(name: &str) -> Vec<String> {
         .collect()
 }
 
+/// A gateway the PocketIC server is running, as its `/http_gateway` lists it.
+#[derive(Deserialize)]
+struct Gateway {
+    instance_id: u64,
+    port: u16,
+    forward_to: Forward,
+}
+
+#[derive(Deserialize)]
+enum Forward {
+    PocketIcInstance(u64),
+    #[serde(other)]
+    Elsewhere,
+}
+
+/// Stops a gateway left on `port` by an earlier run, and deletes the
+/// instance behind it. The server keeps both after the process that made them
+/// is gone, and the gateway would hold the port.
+fn clear_port(server: &str, port: u16) -> Result<(), Box<dyn Error>> {
+    let gateways: Vec<Gateway> = ureq::get(format!("{server}/http_gateway"))
+        .call()?
+        .body_mut()
+        .read_json()?;
+    for gateway in gateways.iter().filter(|gateway| gateway.port == port) {
+        ureq::post(format!("{server}/http_gateway/{}/stop", gateway.instance_id)).send_empty()?;
+        if let Forward::PocketIcInstance(instance) = gateway.forward_to {
+            ureq::delete(format!("{server}/instances/{instance}")).call()?;
+        }
+        println!("stopped the gateway an earlier run left on port {port}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let server = env::var("POCKET_IC_URL").unwrap_or_else(|_| "http://127.0.0.1:47200".into());
     let wasm_path = env::var("DECOMP_CANISTER_WASM").unwrap_or_else(|_| {
@@ -75,6 +109,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let wasm = read(&wasm_path)?;
     let mut installed = std::fs::metadata(&wasm_path)?.modified()?;
 
+    clear_port(server.trim_end_matches('/'), port)?;
     let mut replica = PocketIcBuilder::new()
         .with_server_url(server.parse()?)
         .with_application_subnet()

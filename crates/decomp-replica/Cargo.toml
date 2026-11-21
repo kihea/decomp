@@ -8,3 +8,5 @@ description = "Runs the control-plane canisters on a local Internet Computer rep
 candid = "0.10.41"
 # The client must match the PocketIC server it drives; dfx 0.32 ships server 13.
 pocket-ic = "=13.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+ureq = { version = "3.5.2", features = ["json"] }

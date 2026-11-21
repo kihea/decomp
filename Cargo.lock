@@ -996,6 +996,8 @@ version = "0.1.0"
 dependencies = [
  "candid",
  "pocket-ic",
+ "serde",
+ "ureq",
 ]
 
 [[package]]
