@@ -55,18 +55,20 @@ mod meter;
 
 use std::collections::HashMap;
 
+use crate::engine::{
+    Caller, Engine, EngineError, Extern, ExternType, HostResult, Linker, Module, Store,
+    StoreLimits, StoreLimitsBuilder, Val,
+};
 use decomp_core::{
     ContentHash, MAX_SPAWNED, OpeningKey, PublicKey, SEAL_OVERHEAD_BYTES, SealingKey, Signature,
     seal,
 };
 use decomp_schema::records::{self, Records, record_bytes};
 use sha2::{Digest, Sha256};
-use wasmtime::{
-    Caller, Config, Engine, Extern, ExternType, Linker, Module, Store, StoreLimits,
-    StoreLimitsBuilder, Trap, Val,
-};
 
 use crate::meter::{COUNTER_EXPORT, HOST_MODULE, METER_IMPORT, add_metering};
+
+mod engine;
 
 /// WebAssembly instructions in one compute unit, the unit jobs are priced in
 /// (spec section 5: "one unit is 1 billion WebAssembly instructions"). At the
@@ -277,6 +279,27 @@ enum Found {
     Bytes(Vec<u8>),
 }
 
+/// Every function a module may import, by module and name: the host functions
+/// and the meter the sandbox adds.
+const HOST_FUNCTIONS: &[(&str, &str)] = &[
+    (HOST_MODULE, "input.len"),
+    (HOST_MODULE, "input.read"),
+    (HOST_MODULE, "output.write"),
+    (HOST_MODULE, "hash"),
+    (HOST_MODULE, "sig.verify"),
+    (HOST_MODULE, "seal"),
+    (HOST_MODULE, "open"),
+    (HOST_MODULE, "rand.seeded"),
+    (HOST_MODULE, "blob.get"),
+    (HOST_MODULE, "blob.put"),
+    (HOST_MODULE, "result.read"),
+    (HOST_MODULE, "kv.get"),
+    (HOST_MODULE, "kv.put"),
+    (HOST_MODULE, "kv.scan"),
+    (HOST_MODULE, "job.spawn"),
+    (HOST_MODULE, METER_IMPORT),
+];
+
 /// A configured engine. Create one and reuse it for every job.
 pub struct Sandbox {
     engine: Engine,
@@ -291,19 +314,7 @@ impl Default for Sandbox {
 
 impl Sandbox {
     pub fn new() -> Self {
-        let mut config = Config::new();
-        config
-            .cranelift_nan_canonicalization(true)
-            .relaxed_simd_deterministic(true)
-            // Features the meter does not account for are switched off, so a module
-            // that uses them is rejected instead of being metered wrongly.
-            .wasm_tail_call(false)
-            .wasm_memory64(false)
-            // Backtraces vary with how a module was compiled and are not part of a result.
-            .wasm_backtrace_max_frames(None);
-        // Threads and exceptions need no setting: this crate builds wasmtime without
-        // the features behind them, so modules that use either are rejected.
-        let engine = Engine::new(&config).expect("the sandbox configuration is valid");
+        let engine = engine::new_engine();
 
         let mut linker = Linker::new(&engine);
         linker
@@ -391,7 +402,7 @@ impl Sandbox {
     fn run_is_possible(&self, module: &[u8]) -> bool {
         add_metering(module)
             .ok()
-            .and_then(|metered| Module::new(&self.engine, metered).ok())
+            .and_then(|metered| Module::new(&self.engine, &metered).ok())
             .is_some_and(|module| check_exports(&module, ENTRY_POINT).is_ok())
     }
 
@@ -411,11 +422,11 @@ impl Sandbox {
         }
         let metered =
             add_metering(job.module).map_err(|e| RunError::InvalidModule(e.to_string()))?;
-        let invalid = |error: wasmtime::Error| RunError::InvalidModule(error.to_string());
-        let module = Module::new(&self.engine, metered).map_err(invalid)?;
+        let invalid = |error: EngineError| RunError::InvalidModule(error.to_string());
+        let module = Module::new(&self.engine, &metered).map_err(invalid)?;
         check_exports(&module, entry_point)?;
         // Resolving imports here means that from now on only the job itself can fail.
-        let ready = self.linker.instantiate_pre(&module).map_err(invalid)?;
+        engine::check_imports(&self.linker, &module, HOST_FUNCTIONS).map_err(invalid)?;
 
         let state = State {
             input: job.input.to_vec(),
@@ -442,11 +453,12 @@ impl Sandbox {
         store.limiter(|state| &mut state.limits);
 
         let mut counter = None;
-        let finished = ready.instantiate(&mut store).and_then(|instance| {
-            counter = instance.get_global(&mut store, COUNTER_EXPORT);
-            let entry = instance.get_typed_func::<(), ()>(&mut store, entry_point)?;
-            entry.call(&mut store, ())
-        });
+        let finished =
+            engine::instantiate(&self.linker, &mut store, &module).and_then(|instance| {
+                counter = instance.get_global(&mut store, COUNTER_EXPORT);
+                let entry = instance.get_typed_func::<(), ()>(&mut store, entry_point)?;
+                entry.call(&mut store, ())
+            });
 
         // The meter last counted when the module last called it; add what the
         // module has executed since, which is what its counter has gone down by.
@@ -496,17 +508,13 @@ fn check_exports(module: &Module, entry_point: &str) -> Result<(), RunError> {
     Ok(())
 }
 
-fn failure_of(error: &wasmtime::Error) -> Failure {
-    if let Some(Halt::CapReached | Halt::CheckpointReached) = error.downcast_ref::<Halt>() {
+fn failure_of(error: &EngineError) -> Failure {
+    if let Some(Halt::CapReached | Halt::CheckpointReached) = engine::host_error::<Halt>(error) {
         // A run stopped at a checkpoint is reported like one that ran out of
         // budget; `Sandbox::checkpoint` only reads the checkpoint.
         return Failure::ComputeCapExceeded;
     }
-    match error.downcast_ref::<Trap>() {
-        Some(trap) => Failure::Trapped(trap.to_string()),
-        // A host function refused a call, or the engine enforced a limit.
-        None => Failure::Trapped(error.root_cause().to_string()),
-    }
+    Failure::Trapped(engine::trap_message(error))
 }
 
 /// The module's memory, alongside the job state, for a host function to work on.
@@ -555,7 +563,7 @@ fn charge_for_bytes(state: &mut State, bytes: usize) -> Result<(), Halt> {
 /// Called by the module when its instruction counter runs out. Counts what was
 /// executed, takes a checkpoint, and returns the counter's new value: the
 /// instructions the job may execute before it must call again.
-fn meter(mut caller: Caller<'_, State>, left: i64) -> wasmtime::Result<i64> {
+fn meter(mut caller: Caller<'_, State>, left: i64) -> HostResult<i64> {
     let (memory, state) = memory_and_state(&mut caller);
     // `left` is zero or negative: the module ran `granted - left` instructions.
     state.used = state
@@ -582,14 +590,14 @@ fn input_len(caller: Caller<'_, State>) -> u32 {
     caller.data().input.len() as u32
 }
 
-fn input_read(mut caller: Caller<'_, State>, dest: u32) -> wasmtime::Result<()> {
+fn input_read(mut caller: Caller<'_, State>, dest: u32) -> HostResult<()> {
     let (memory, state) = memory_and_state(&mut caller);
     charge_for_bytes(state, state.input.len())?;
     range_mut(memory, dest, state.input.len())?.copy_from_slice(&state.input);
     Ok(())
 }
 
-fn output_write(mut caller: Caller<'_, State>, src: u32, len: u32) -> wasmtime::Result<()> {
+fn output_write(mut caller: Caller<'_, State>, src: u32, len: u32) -> HostResult<()> {
     let (memory, state) = memory_and_state(&mut caller);
     charge_for_bytes(state, len as usize)?;
     make_room(state, len as usize)?;
@@ -610,7 +618,7 @@ fn make_room(state: &State, more: usize) -> Result<(), Halt> {
     }
 }
 
-fn blob_get(mut caller: Caller<'_, State>, hash: u32) -> wasmtime::Result<i64> {
+fn blob_get(mut caller: Caller<'_, State>, hash: u32) -> HostResult<i64> {
     let (memory, state) = memory_and_state(&mut caller);
     let hash = ContentHash::from_bytes(range(memory, hash, 32)?.try_into().expect("32 bytes"));
     let len = state.blobs.get(&hash).map(Vec::len);
@@ -618,7 +626,7 @@ fn blob_get(mut caller: Caller<'_, State>, hash: u32) -> wasmtime::Result<i64> {
     Ok(len.map_or(-1, |len| len as i64))
 }
 
-fn result_read(mut caller: Caller<'_, State>, dest: u32) -> wasmtime::Result<()> {
+fn result_read(mut caller: Caller<'_, State>, dest: u32) -> HostResult<()> {
     let (memory, state) = memory_and_state(&mut caller);
     let found = state.found.take().ok_or(Halt::NothingToRead)?;
     let bytes = match &found {
@@ -637,7 +645,7 @@ fn job_spawn(
     input: u32,
     len: u32,
     compute_cap: i64,
-) -> wasmtime::Result<()> {
+) -> HostResult<()> {
     let (memory, state) = memory_and_state(&mut caller);
     charge_for_bytes(state, len as usize)?;
     make_room(state, len as usize)?;
@@ -663,7 +671,7 @@ fn key(memory: &[u8], start: u32, len: u32) -> Result<&[u8], Halt> {
     range(memory, start, len as usize)
 }
 
-fn kv_get(mut caller: Caller<'_, State>, at: u32, len: u32) -> wasmtime::Result<i64> {
+fn kv_get(mut caller: Caller<'_, State>, at: u32, len: u32) -> HostResult<i64> {
     let (memory, state) = memory_and_state(&mut caller);
     let records = state.records.as_ref().ok_or(Halt::NoState)?;
     let value = records.get(key(memory, at, len)?).cloned();
@@ -679,7 +687,7 @@ fn kv_put(
     len: u32,
     value: u32,
     value_len: u32,
-) -> wasmtime::Result<()> {
+) -> HostResult<()> {
     let (memory, state) = memory_and_state(&mut caller);
     charge_for_bytes(state, len as usize + value_len as usize)?;
     let key = key(memory, at, len)?.to_vec();
@@ -697,7 +705,7 @@ fn kv_put(
     Ok(())
 }
 
-fn kv_scan(mut caller: Caller<'_, State>, at: u32, len: u32) -> wasmtime::Result<i64> {
+fn kv_scan(mut caller: Caller<'_, State>, at: u32, len: u32) -> HostResult<i64> {
     let (memory, state) = memory_and_state(&mut caller);
     let records = state.records.as_ref().ok_or(Halt::NoState)?;
     let prefix = key(memory, at, len)?;
@@ -713,7 +721,7 @@ fn kv_scan(mut caller: Caller<'_, State>, at: u32, len: u32) -> wasmtime::Result
     Ok(len)
 }
 
-fn blob_put(mut caller: Caller<'_, State>, src: u32, len: u32, dest: u32) -> wasmtime::Result<()> {
+fn blob_put(mut caller: Caller<'_, State>, src: u32, len: u32, dest: u32) -> HostResult<()> {
     let (memory, state) = memory_and_state(&mut caller);
     charge_for_bytes(state, len as usize)?;
     make_room(state, len as usize)?;
@@ -724,7 +732,7 @@ fn blob_put(mut caller: Caller<'_, State>, src: u32, len: u32, dest: u32) -> was
     Ok(())
 }
 
-fn hash(mut caller: Caller<'_, State>, src: u32, len: u32, dest: u32) -> wasmtime::Result<()> {
+fn hash(mut caller: Caller<'_, State>, src: u32, len: u32, dest: u32) -> HostResult<()> {
     let (memory, state) = memory_and_state(&mut caller);
     charge_for_bytes(state, len as usize)?;
     let digest = Sha256::digest(range(memory, src, len as usize)?);
@@ -738,7 +746,7 @@ fn sig_verify(
     message: u32,
     len: u32,
     signature: u32,
-) -> wasmtime::Result<u32> {
+) -> HostResult<u32> {
     let (memory, state) = memory_and_state(&mut caller);
     charge(state, SIGNATURE_CHECK_INSTRUCTIONS)?;
     charge_for_bytes(state, len as usize)?;
@@ -756,7 +764,7 @@ fn seal_message(
     src: u32,
     len: u32,
     dest: u32,
-) -> wasmtime::Result<u32> {
+) -> HostResult<u32> {
     let (memory, state) = memory_and_state(&mut caller);
     charge(state, SEAL_INSTRUCTIONS)?;
     charge_for_bytes(state, len as usize)?;
@@ -771,7 +779,7 @@ fn seal_message(
 
 /// Opens a sealed message with the key the job was given to open with, if it
 /// was given one, for `result.read` to copy.
-fn open_message(mut caller: Caller<'_, State>, src: u32, len: u32) -> wasmtime::Result<i64> {
+fn open_message(mut caller: Caller<'_, State>, src: u32, len: u32) -> HostResult<i64> {
     let (memory, state) = memory_and_state(&mut caller);
     charge(state, SEAL_INSTRUCTIONS)?;
     charge_for_bytes(state, len as usize)?;
@@ -787,7 +795,7 @@ fn open_message(mut caller: Caller<'_, State>, src: u32, len: u32) -> wasmtime::
 
 /// Fills the module's buffer from the job's random stream: block `n` of the
 /// stream is the SHA-256 hash of the seed followed by `n`.
-fn rand_seeded(mut caller: Caller<'_, State>, dest: u32, len: u32) -> wasmtime::Result<()> {
+fn rand_seeded(mut caller: Caller<'_, State>, dest: u32, len: u32) -> HostResult<()> {
     let (memory, state) = memory_and_state(&mut caller);
     charge_for_bytes(state, len as usize)?;
     for chunk in range_mut(memory, dest, len as usize)?.chunks_mut(32) {

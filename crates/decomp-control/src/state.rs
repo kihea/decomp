@@ -1,7 +1,6 @@
-//! Everything the local network's control plane knows, and where each part
-//! is kept. On the Internet Computer each part lives in the stable memory of
-//! the canister that owns it (spec, "Planes and components"); here each is a
-//! log file in the data directory.
+//! Everything the control plane knows, and the log each part is kept in. A
+//! host supplies the logs (see `store`): files on the devnet, and heap memory
+//! saved to stable memory in a canister (spec, "Planes and components").
 //!
 //! | Part | Canister | Kept in | Survives a restart |
 //! | --- | --- | --- | --- |
@@ -23,9 +22,7 @@
 //! | Open jobs, leases, commitments, nodes asking, unanswered challenges | Job board | Memory | No, by design (spec, "Data management") |
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
 use std::io;
-use std::path::Path;
 
 use decomp_core::Records as AccountRecords;
 use decomp_core::market::{BALANCED_LOOKBACK_SECS, fallback_rate};
@@ -46,13 +43,13 @@ use decomp_core::{
 use decomp_sandbox::Sandbox;
 use decomp_schema::records::{self, Records};
 use decomp_schema::{Mismatch, Signature};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::blobs::Blobs;
-use crate::key;
-use crate::log::Log;
 use crate::referee::{Case, Verdict};
+use crate::store::{Blobs, Log, StateStore};
 
 /// Why a blob was not accepted for storage.
 #[derive(Debug, thiserror::Error)]
@@ -147,6 +144,11 @@ pub struct Settings {
     pub reviewers: Vec<AccountId>,
     /// Brand names held until a reviewer assigns them.
     pub reserved_names: Vec<String>,
+    /// Randomness to seed the control plane's own draws with: the choice of
+    /// known-answer jobs, storage challenges, and relays. The devnet passes
+    /// the operating system's; a canister passes the network's, and reseeds
+    /// as it goes (`reseed`).
+    pub entropy: [u8; 32],
 }
 
 /// What `market.jsonl` records: changes to work preferences and bids.
@@ -244,54 +246,56 @@ pub struct ControlPlane {
     sealing_log: Log,
     /// How long a stored blob goes between challenges, in seconds.
     challenge_interval: u64,
+    /// The control plane's own source of randomness (see `Settings::entropy`).
+    rng: StdRng,
 }
 
 impl ControlPlane {
-    pub fn open(data_dir: &Path, settings: Settings) -> io::Result<Self> {
+    pub fn open(store: &mut dyn StateStore, settings: Settings) -> io::Result<Self> {
         let Settings {
             challenge_interval,
             recovery_wait,
             reviewers,
             reserved_names,
+            entropy,
         } = settings;
-        fs::create_dir_all(data_dir)?;
 
         let mut accounts = Accounts::waiting(recovery_wait);
         let mut ledger = Ledger::default();
-        let ops = replay(&data_dir.join("ops.jsonl"), |envelope: Envelope| {
+        let ops = replay(store, "ops", |envelope: Envelope| {
             let account = accounts.apply(&envelope).map_err(|e| e.to_string())?;
             ledger.open(account.id);
             Ok(())
         })?;
-        let mut ledger_log = replay(&data_dir.join("ledger.jsonl"), |entry: LedgerEntry| {
+        let mut ledger_log = replay(store, "ledger", |entry: LedgerEntry| {
             ledger.apply(&entry).map_err(|e| e.to_string())
         })?;
         let mut scores = Scores::default();
-        let scores_log = replay(&data_dir.join("scores.jsonl"), |event: ScoreEvent| {
+        let scores_log = replay(store, "scores", |event: ScoreEvent| {
             scores.apply(&event);
             Ok(())
         })?;
 
         let mut storage = Storage::default();
-        let storage_log = replay(&data_dir.join("storage.jsonl"), |entry: StorageEntry| {
+        let storage_log = replay(store, "storage", |entry: StorageEntry| {
             storage.apply(&entry);
             Ok(())
         })?;
 
         let mut relays = Relays::default();
-        let relays_log = replay(&data_dir.join("relays.jsonl"), |entry: RelayEntry| {
+        let relays_log = replay(store, "relays", |entry: RelayEntry| {
             relays.apply(&entry);
             Ok(())
         })?;
 
         let mut states = States::default();
-        let states_log = replay(&data_dir.join("state.jsonl"), |entry: StateEntry| {
+        let states_log = replay(store, "state", |entry: StateEntry| {
             states.apply(&entry);
             Ok(())
         })?;
 
         let mut sealing_keys = SealingKeys::default();
-        let sealing_log = replay(&data_dir.join("sealing.jsonl"), |proof: Envelope| {
+        let sealing_log = replay(store, "sealing", |proof: Envelope| {
             sealing_keys.apply(&proof).map_err(|e| e.to_string())?;
             Ok(())
         })?;
@@ -300,19 +304,19 @@ impl ControlPlane {
         for name in reserved_names {
             registry.apply(&RegistryEntry::Reserve { name });
         }
-        let registry_log = replay(&data_dir.join("registry.jsonl"), |entry: RegistryEntry| {
+        let registry_log = replay(store, "registry", |entry: RegistryEntry| {
             registry.apply(&entry);
             Ok(())
         })?;
 
         let mut records = AccountRecords::default();
-        let records_log = replay(&data_dir.join("records.jsonl"), |record: Record| {
+        let records_log = replay(store, "records", |record: Record| {
             records.apply(record);
             Ok(())
         })?;
 
         let mut jobs = Jobs::default();
-        let market_log = replay(&data_dir.join("market.jsonl"), |entry: MarketEntry| {
+        let market_log = replay(store, "market", |entry: MarketEntry| {
             match entry {
                 MarketEntry::Preferences {
                     device,
@@ -339,7 +343,7 @@ impl ControlPlane {
 
         let mut created = HashMap::new();
         let mut activity = Vec::new();
-        let activity_log = replay(&data_dir.join("activity.jsonl"), |entry: ActivityEntry| {
+        let activity_log = replay(store, "activity", |entry: ActivityEntry| {
             if let ActivityEntry::Created { account, at } = entry {
                 created.insert(account, at);
             } else {
@@ -348,7 +352,7 @@ impl ControlPlane {
             Ok(())
         })?;
 
-        let receipts = Log::open(&data_dir.join("receipts.jsonl"))?;
+        let receipts = store.log("receipts")?;
         let mut receipt_hashes = Vec::new();
         let mut receipt_of = HashMap::new();
         for line in receipts.lines()? {
@@ -359,8 +363,7 @@ impl ControlPlane {
         }
 
         let mut settlement = SettlementLog::default();
-        let settlement_path = data_dir.join("settlement.jsonl");
-        let settlement_log = replay(&settlement_path, |entry: Envelope| {
+        let settlement_log = replay(store, "settlement", |entry: Envelope| {
             settlement.apply(&entry).map_err(|e| e.to_string())
         })?;
         let Through {
@@ -370,10 +373,7 @@ impl ControlPlane {
         } = settlement.through();
         if posted_ops > ops.len() || entries > ledger_log.len() || posted_receipts > receipts.len()
         {
-            let message = format!(
-                "{} reaches further than the records it was made from",
-                settlement_path.display()
-            );
+            let message = "the settlement log reaches further than the records it was made from";
             return Err(io::Error::new(io::ErrorKind::InvalidData, message));
         }
 
@@ -394,7 +394,7 @@ impl ControlPlane {
             ledger_log,
             scores,
             scores_log,
-            blobs: Blobs::open(data_dir.join("blobs"))?,
+            blobs: store.blobs()?,
             jobs,
             sponsored: Sponsored::default(),
             splits: Splits::default(),
@@ -402,10 +402,10 @@ impl ControlPlane {
             receipts,
             receipt_hashes,
             receipt_of,
-            control: key::control_key(data_dir)?,
+            control: store.control_key()?,
             settlement,
             settlement_log,
-            draws_log: Log::open(&data_dir.join("draws.jsonl"))?,
+            draws_log: store.log("draws")?,
             registry,
             registry_log,
             records,
@@ -427,7 +427,18 @@ impl ControlPlane {
             sealing_keys,
             sealing_log,
             challenge_interval,
+            rng: StdRng::from_seed(entropy),
         })
+    }
+
+    /// Mixes fresh randomness into the control plane's own draws.
+    pub fn reseed(&mut self, entropy: [u8; 32]) {
+        let mut seed = [0; 32];
+        self.rng.fill_bytes(&mut seed);
+        for (byte, fresh) in seed.iter_mut().zip(entropy) {
+            *byte ^= fresh;
+        }
+        self.rng = StdRng::from_seed(seed);
     }
 
     /// The key that signs the settlement log and draws, which is also the
@@ -632,6 +643,9 @@ impl ControlPlane {
         self.hosts.seen(node, account, address, now);
         let interval = self.challenge_interval;
         let mut jobs = std::mem::take(&mut self.jobs);
+        // The closures below borrow the rest of the control plane, so the
+        // jobs and the generator are taken out while they run.
+        let mut rng = std::mem::replace(&mut self.rng, StdRng::from_seed([0; 32]));
         let granted = {
             let node_standing = |node: &PublicKey, account: &AccountId| {
                 self.scores
@@ -646,9 +660,10 @@ impl ControlPlane {
             // already include what every settled job left behind.
             let states = &self.states;
             let contents = |shard: &ShardRef| states.contents(shard);
-            jobs.request_lease(node, account, now, &mut rand::rng(), &standings, &contents)
+            jobs.request_lease(node, account, now, &mut rng, &standings, &contents)
         };
         self.jobs = jobs;
+        self.rng = rng;
         LeasesGranted {
             leases: granted.leases,
             reveal: granted.reveal,
@@ -656,7 +671,7 @@ impl ControlPlane {
             drop: self.storage.take_drops(&node),
             challenge: self
                 .storage
-                .challenge_for(node, now, interval, &mut rand::rng()),
+                .challenge_for(node, now, interval, &mut self.rng),
             relay: self.relays.orders_for(&node, now),
         }
     }
@@ -924,7 +939,7 @@ impl ControlPlane {
         now: u64,
     ) -> Result<(), JobError> {
         self.jobs
-            .commit_result(node, job_id, commitment, now, &mut rand::rng())
+            .commit_result(node, job_id, commitment, now, &mut self.rng)
     }
 
     /// Takes a node's revealed result.
@@ -1218,7 +1233,7 @@ impl ControlPlane {
             bytes,
         };
         let online = self.hosts.online(now);
-        let (opened, escrow) = self.relays.open(opening, &online, now, &mut rand::rng())?;
+        let (opened, escrow) = self.relays.open(opening, &online, now, &mut self.rng)?;
         self.record(escrow)?;
         let RelayEntry::Opened { relay, .. } = &opened else {
             unreachable!("opening a channel yields an Opened entry");
@@ -1592,16 +1607,17 @@ struct Named {
 
 /// Opens a log and applies every entry already in it.
 fn replay<T: DeserializeOwned>(
-    path: &Path,
+    store: &mut dyn StateStore,
+    name: &str,
     mut apply: impl FnMut(T) -> Result<(), String>,
 ) -> io::Result<Log> {
-    let log = Log::open(path)?;
+    let log = store.log(name)?;
     for (index, line) in log.lines()?.enumerate() {
         let applied = serde_json::from_str(&line?)
             .map_err(|e| e.to_string())
             .and_then(&mut apply);
         applied.map_err(|reason| {
-            let message = format!("{}, line {}: {reason}", path.display(), index + 1);
+            let message = format!("the {name} log, line {}: {reason}", index + 1);
             io::Error::new(io::ErrorKind::InvalidData, message)
         })?;
     }

@@ -19,12 +19,10 @@
 //! - `DECOMP_RESERVED_NAMES`: names, comma-separated, held for their brands'
 //!   owners (default none)
 
-mod api;
 mod blobs;
 mod key;
 mod log;
-mod referee;
-mod state;
+mod server;
 
 use std::env;
 use std::error::Error;
@@ -34,7 +32,9 @@ use std::time::Duration;
 use decomp_core::{AccountId, BATCH_PERIOD_SECS, RECOVERY_WAIT_SECS};
 use tokio::net::TcpListener;
 
-use crate::state::{ControlPlane, Settings};
+use decomp_control::{ControlPlane, Settings};
+
+use crate::blobs::DataDir;
 
 /// How long a stored blob goes between challenges unless set otherwise. Shorter
 /// catches a node that dropped a blob sooner; longer costs nodes less traffic.
@@ -72,13 +72,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         recovery_wait: seconds("DECOMP_RECOVERY_WAIT_SECS", RECOVERY_WAIT_SECS)?,
         reviewers,
         reserved_names: list("DECOMP_RESERVED_NAMES"),
+        entropy: rand::random(),
     };
     let batch_period = Duration::from_secs(seconds("DECOMP_BATCH_SECS", BATCH_PERIOD_SECS)?);
 
-    let control = ControlPlane::open(Path::new(&data_dir), settings)?;
+    let control = ControlPlane::open(&mut DataDir::open(Path::new(&data_dir))?, settings)?;
     let listener = TcpListener::bind(&addr).await?;
     println!("decomp devnet listening on http://{addr}, data in {data_dir}/");
     println!("control-plane key (treasury): {}", control.control_key());
-    axum::serve(listener, api::router(control, batch_period)).await?;
+    axum::serve(listener, server::router(control, batch_period)).await?;
     Ok(())
 }

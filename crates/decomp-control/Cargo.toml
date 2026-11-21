@@ -1,0 +1,21 @@
+[package]
+name = "decomp-control"
+version = "0.1.0"
+edition.workspace = true
+description = "The DeComp control plane's services (accounts, registry, job board, receipts) and their interface, for any host: the devnet or a canister."
+
+[features]
+default = ["wasmtime"]
+# The sandbox engine disputes and fallbacks run on: wasmtime on a computer,
+# wasmi inside a canister.
+wasmtime = ["decomp-sandbox/wasmtime"]
+wasmi = ["decomp-sandbox/wasmi"]
+
+[dependencies]
+decomp-core = { version = "0.1.0", path = "../decomp-core", default-features = false }
+decomp-sandbox = { version = "0.1.0", path = "../decomp-sandbox", default-features = false }
+decomp-schema = { version = "0.1.0", path = "../decomp-schema" }
+rand = "0.10.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"

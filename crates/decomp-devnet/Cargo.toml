@@ -6,14 +6,11 @@ description = "A local DeComp network: the control plane's services (accounts, r
 
 [dependencies]
 axum = "0.8.9"
+decomp-control = { version = "0.1.0", path = "../decomp-control" }
 decomp-core = { version = "0.1.0", path = "../decomp-core" }
 # For reading the public randomness beacon, as a node does to check a draw.
 decomp-node = { version = "0.1.0", path = "../decomp-node" }
 decomp-sandbox = { version = "0.1.0", path = "../decomp-sandbox" }
-decomp-schema = { version = "0.1.0", path = "../decomp-schema" }
 rand = "0.10.4"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time"] }
 tower-http = { version = "0.7.1", features = ["cors"] }

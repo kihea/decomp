@@ -1,171 +1,99 @@
-//! The local network's HTTP API: the control plane's interface (spec,
-//! "Interfaces"). Every request body is a signed envelope; there are no
-//! sessions or tokens, so who is asking is always proven by the signature. On
-//! the Internet Computer the same calls are the canisters' methods.
+//! The control plane's interface (spec, "Interfaces"), independent of how it
+//! is served: the devnet serves it over HTTP, and a canister over the
+//! Internet Computer's HTTP gateway. Every request body is a signed envelope;
+//! there are no sessions or tokens, so who is asking is always proven by the
+//! signature.
 //!
 //! - `POST /v1/ops` takes an `AccountOp`: a change to an account, which is logged.
 //! - `POST /v1/request` takes a `Request`: everything else.
 
 use std::io;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::{Json, Router};
 use decomp_core::registry::MAX_DIRECTORY_PAGE;
 use decomp_core::{
-    Account, AccountStatus, Accounts, Addressed, BEACON_PERIOD_SECS, BidError, Bids, Blob,
-    BlobData, BlobRef, Call, CashOutAsked, CashOuts, ContentHash, Envelope, EnvelopeError,
-    JobError, LedgerEntry, LedgerError, MAX_CLOCK_SKEW_SECS, MAX_MESSAGE_BYTES, NameError, OpError,
-    Outcome, PrivacyError, PublicKey, PublishedKey, Rates, RecordError, RecordList, Refusal,
-    RelayError, Request, ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted,
+    Account, Accounts, Addressed, BidError, Bids, Blob, BlobData, BlobRef, Call, CashOutAsked,
+    CashOuts, ContentHash, Envelope, EnvelopeError, JobError, LedgerEntry, LedgerError,
+    MAX_CLOCK_SKEW_SECS, NameError, OpError, Outcome, PrivacyError, PublicKey, PublishedKey, Rates,
+    RecordError, RecordList, Refusal, RelayError, Request, ShardNow, ShardRef, SponsorError,
+    StorageError, Storing, Submitted,
 };
-use decomp_node::beacon::Rounds;
 use decomp_sandbox::Sandbox;
+use serde::Serialize;
 use serde_json::json;
-use tower_http::cors::CorsLayer;
 
-use crate::referee::{self, referee};
 use crate::state::{
     ControlPlane, InclusionError, OpenRelayError, RegistryError, StoreError, SubmitError,
 };
 
-struct App {
-    control: Mutex<ControlPlane>,
-    /// For refereeing disputes and running always-on fallbacks, which means
-    /// running the job.
-    sandbox: Sandbox,
+/// An HTTP status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatusCode(pub u16);
+
+impl StatusCode {
+    pub const OK: Self = Self(200);
+    pub const BAD_REQUEST: Self = Self(400);
+    pub const PAYMENT_REQUIRED: Self = Self(402);
+    pub const FORBIDDEN: Self = Self(403);
+    pub const NOT_FOUND: Self = Self(404);
+    pub const CONFLICT: Self = Self(409);
+    pub const INTERNAL_SERVER_ERROR: Self = Self(500);
+    pub const SERVICE_UNAVAILABLE: Self = Self(503);
 }
 
-/// How often time is let pass for jobs nobody is asking about: windows close,
-/// leases lapse, and holds are released.
-const TICK_SECS: u64 = 1;
-
-/// The control plane's API, the clock that posts a batch to the settlement log
-/// every `batch_period`, the one that fetches each round of public randomness,
-/// and the one that lets time pass.
-pub fn router(control: ControlPlane, batch_period: Duration) -> Router {
-    let app = Arc::new(App {
-        control: Mutex::new(control),
-        sandbox: Sandbox::new(),
-    });
-    tokio::spawn(post_batches(Arc::clone(&app), batch_period));
-    tokio::spawn(follow_beacon(Arc::clone(&app)));
-    tokio::spawn(tick(Arc::clone(&app)));
-    Router::new()
-        .route("/v1/ops", post(submit_op))
-        .route("/v1/request", post(request))
-        .layer(DefaultBodyLimit::max(MAX_MESSAGE_BYTES))
-        // Requests carry no cookies or credentials, so any web origin may call.
-        .layer(CorsLayer::permissive())
-        .with_state(app)
+/// An answer: a status and a JSON body.
+pub struct Response {
+    pub status: StatusCode,
+    pub body: Vec<u8>,
 }
 
-/// Fetches the beacon's newest round every time there is a new one. Nodes are
-/// drawn for jobs from it (spec section 6: "Assignment draws on public
-/// randomness"), so while the beacon cannot be reached, jobs wait.
-async fn follow_beacon(app: Arc<App>) {
-    let rounds = Arc::new(Rounds::default());
-    let mut ticks = tokio::time::interval(Duration::from_secs(BEACON_PERIOD_SECS));
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut reached = true;
-    loop {
-        ticks.tick().await;
-        let beacon = Arc::clone(&rounds);
-        let fetched = tokio::task::spawn_blocking(move || beacon.latest()).await;
-        match fetched.expect("fetching a round does not panic") {
-            Ok(beacon) => {
-                let mut control = app.control.lock().expect("control plane lock");
-                control.set_beacon(beacon);
-                reached = true;
-            }
-            // Said once each time the beacon is lost, not every three seconds.
-            Err(error) if reached => {
-                eprintln!("no public randomness, so jobs wait: {error}");
-                reached = false;
-            }
-            Err(_) => {}
+/// A value answered as JSON with status 200.
+struct Json<T>(T);
+
+impl<T: Serialize> Json<T> {
+    fn into_response(self) -> Response {
+        Response {
+            status: StatusCode::OK,
+            body: serde_json::to_vec(&self.0).expect("answers serialize"),
         }
     }
 }
 
-async fn post_batches(app: Arc<App>, period: Duration) {
-    let mut ticks = tokio::time::interval(period);
-    loop {
-        ticks.tick().await;
-        let mut control = app.control.lock().expect("control plane lock");
-        control.post_batch(unix_now());
-    }
+/// Answers a request for `path`, with `body` as it arrived, at time `now`.
+/// After it, the host settles the control plane and runs any disputes and
+/// fallbacks it has queued (`take_cases`, `take_fall_backs`).
+pub fn handle(
+    control: &mut ControlPlane,
+    sandbox: &Sandbox,
+    path: &str,
+    body: &[u8],
+    now: u64,
+) -> Response {
+    let Ok(envelope) = serde_json::from_slice::<Envelope>(body) else {
+        let message = "the body is not a signed envelope";
+        return ApiError::new(StatusCode::BAD_REQUEST, "bad_payload", message).into_response();
+    };
+    let answer = match path {
+        "/v1/ops" => control
+            .apply_op(&envelope, now)
+            .map(|status| Json(status).into_response())
+            .map_err(ApiError::from),
+        "/v1/request" => request(control, sandbox, envelope, now),
+        _ => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "the calls are POST /v1/ops and POST /v1/request",
+        )),
+    };
+    answer.unwrap_or_else(ApiError::into_response)
 }
 
-async fn tick(app: Arc<App>) {
-    let mut ticks = tokio::time::interval(Duration::from_secs(TICK_SECS));
-    loop {
-        ticks.tick().await;
-        let work = {
-            let mut control = app.control.lock().expect("control plane lock");
-            control.settle(unix_now());
-            (control.take_cases(), control.take_fall_backs())
-        };
-        run_aside(&app, work);
-    }
-}
-
-/// Refereeing and fallbacks run the job, which can take as long as the job
-/// did, so they happen off to the side and the control plane stays free.
-fn run_aside(
-    app: &Arc<App>,
-    (cases, fall_backs): (
-        Vec<referee::Case>,
-        Vec<(decomp_core::JobId, decomp_core::FallBackJob, referee::Case)>,
-    ),
-) {
-    for case in cases {
-        let app = Arc::clone(app);
-        tokio::task::spawn_blocking(move || {
-            let verdict = referee(&app.sandbox, &case);
-            let mut control = app.control.lock().expect("control plane lock");
-            control.resolve(&case, &verdict, unix_now());
-        });
-    }
-    for (job_id, _, case) in fall_backs {
-        let app = Arc::clone(app);
-        tokio::task::spawn_blocking(move || {
-            let (result, produced) = referee::run(&app.sandbox, &case, job_id);
-            let mut control = app.control.lock().expect("control plane lock");
-            control.fell_back(job_id, result, produced, unix_now());
-        });
-    }
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock is after 1970")
-        .as_secs()
-}
-
-async fn submit_op(
-    State(app): State<Arc<App>>,
-    Json(envelope): Json<Envelope>,
-) -> Result<Json<AccountStatus>, ApiError> {
-    let status = app
-        .control
-        .lock()
-        .expect("control plane lock")
-        .apply_op(&envelope, unix_now())?;
-    Ok(Json(status))
-}
-
-async fn request(
-    State(app): State<Arc<App>>,
-    Json(envelope): Json<Envelope>,
+fn request(
+    control: &mut ControlPlane,
+    sandbox: &Sandbox,
+    envelope: Envelope,
+    now: u64,
 ) -> Result<Response, ApiError> {
     let Request { issued_at, call } = envelope.open()?;
-    let now = unix_now();
     if now.abs_diff(issued_at) > MAX_CLOCK_SKEW_SECS {
         let message = "the request's issued_at is too far from the control plane's clock";
         return Err(ApiError::new(
@@ -175,44 +103,34 @@ async fn request(
         ));
     }
 
-    let (answer, work) = {
-        let mut control = app.control.lock().expect("control plane lock");
-        let answer = match call {
-            // Anyone may resolve a name, read the directory, or fetch a blob by its
-            // hash, signed in or not.
-            Call::ResolveName { name } => control
-                .resolve_name(&name)
-                .map(|resolved| Json(resolved).into_response())
-                .map_err(ApiError::from),
-            Call::ListDirectory {
-                verified_only,
-                query,
-                from,
-                limit,
-            } => {
-                let limit = limit.map_or(MAX_DIRECTORY_PAGE, |limit| limit as usize);
-                let page =
-                    control.directory(verified_only, query.as_deref(), from.as_deref(), limit);
-                Ok(Json(page).into_response())
-            }
-            Call::GetBlob { hash } => control
-                .blobs
-                .get(&hash)
-                .map_err(ApiError::from)
-                .and_then(|bytes| bytes.ok_or_else(|| unknown_blob(&hash)))
-                .map(|bytes| Json(BlobData { data: Blob(bytes) }).into_response()),
-            call => {
-                let account = member(&control.accounts, &envelope.signer)?.clone();
-                answer(&mut control, &app.sandbox, call, &account, envelope, now)
-            }
-        };
-        // Any call can find that a job's window or deadline has passed, so
-        // settle after each.
-        control.settle(now);
-        (answer, (control.take_cases(), control.take_fall_backs()))
-    };
-    run_aside(&app, work);
-    answer
+    match call {
+        // Anyone may resolve a name, read the directory, or fetch a blob by its
+        // hash, signed in or not.
+        Call::ResolveName { name } => control
+            .resolve_name(&name)
+            .map(|resolved| Json(resolved).into_response())
+            .map_err(ApiError::from),
+        Call::ListDirectory {
+            verified_only,
+            query,
+            from,
+            limit,
+        } => {
+            let limit = limit.map_or(MAX_DIRECTORY_PAGE, |limit| limit as usize);
+            let page = control.directory(verified_only, query.as_deref(), from.as_deref(), limit);
+            Ok(Json(page).into_response())
+        }
+        Call::GetBlob { hash } => control
+            .blobs
+            .get(&hash)
+            .map_err(ApiError::from)
+            .and_then(|bytes| bytes.ok_or_else(|| unknown_blob(&hash)))
+            .map(|bytes| Json(BlobData { data: Blob(bytes) }).into_response()),
+        call => {
+            let account = member(&control.accounts, &envelope.signer)?.clone();
+            answer(control, sandbox, call, &account, envelope, now)
+        }
+    }
 }
 
 fn answer(
@@ -550,13 +468,16 @@ impl ApiError {
     }
 }
 
-impl IntoResponse for ApiError {
+impl ApiError {
     fn into_response(self) -> Response {
         let body = Refusal {
             error: self.code.into(),
             message: self.message,
         };
-        (self.status, Json(body)).into_response()
+        Response {
+            status: self.status,
+            body: serde_json::to_vec(&body).expect("refusals serialize"),
+        }
     }
 }
 
