@@ -5,7 +5,7 @@ This page tracks each part of DeComp against it. **Available** means built
 and running on a local devnet. **In development** means work has started.
 **Not started** means nothing is built yet, and the reason is given.
 
-Last updated 2026-11-18.
+Last updated 2026-11-21.
 
 ## Accounts and identity
 
@@ -62,7 +62,7 @@ Last updated 2026-11-18.
 | Records with versioned writes | Available | `write_record`, `get_record`, `list_records` |
 | Relays | Available | |
 | Job inputs and outputs travelling only between clients and nodes | In development | The devnet still holds a copy of job inputs and outputs |
-| Threshold keys for private values (ICP vetKeys) | Not started | Needs the canisters |
+| Threshold keys for private values (ICP vetKeys) | Available | Value keys from the control canister's threshold key (vetKD): every device of an account gets the same key for a label, and no single party holds it. The devnet has no threshold key |
 
 ## Beyond the core
 

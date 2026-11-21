@@ -701,6 +701,25 @@ canonical bit pattern, so they count and compute the same. An update call has
 an instruction limit, so a dispute over a large job cannot yet be refereed in
 the canister.
 
+## Value keys
+
+**What a key is derived from.** The account's ID followed by the label, in
+the context `decomp/value-keys/v1`. The account comes from the signature, so
+no device can ask for another account's key, and the label lets an app keep
+values apart (a key per space, say) without any further rule.
+
+**The production key everywhere.** The canister asks for the subnet key
+`key_1`, which a local replica with the threshold-key subnet also provides,
+so the same build runs locally and on the network.
+
+**A daily limit, not a fee.** Each derivation costs the canister cycles. The
+spec sets no price for it, so instead of charging, an account may ask for 100
+keys a day, counted in the canister's memory, and clients keep the keys they
+are given.
+
+**Only the canister.** The devnet has no threshold key, and holding one key in
+its place would defeat the point, so it refuses the call.
+
 ## Open questions
 
 - **Passkey sign-in speed.** A device approved by a passkey waits the full
