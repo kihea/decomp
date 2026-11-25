@@ -162,9 +162,8 @@ impl Model {
             .ok_or(ModelError::NotAModel)?;
         let config: Config =
             serde_json::from_slice(&rest[..end]).map_err(|_| ModelError::NotAModel)?;
-        let mut floats = rest[end + 1..]
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")));
+        let (words, _) = rest[end + 1..].as_chunks::<4>();
+        let mut floats = words.iter().map(|word| f32::from_le_bytes(*word));
         let tensors = shapes(&config)
             .into_iter()
             .map(|n| floats.by_ref().take(n).collect())
