@@ -325,6 +325,11 @@ export type Manifest = {
    * handed this job.
    */
   apart_from?: string[];
+  /**
+   * The approved models the job may call, by ID. An inference job names at
+   * least one; no other job names any.
+   */
+  models?: string[];
 };
 
 /** Which share of which private job a job is (`Share`). */
@@ -444,7 +449,7 @@ export type ShardNow = { contents: string | null };
 export type Submitted = { job_id: string };
 
 /** Why a job produced no output (`Failure`). */
-export type Failure = 'compute_cap_exceeded' | 'trapped' | 'invalid_job';
+export type Failure = 'compute_cap_exceeded' | 'trapped' | 'invalid_job' | 'proof_rejected';
 
 /** How a job ended (`Outcome`), as far as this client reads it. */
 export type Outcome =

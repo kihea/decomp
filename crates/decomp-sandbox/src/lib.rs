@@ -36,9 +36,17 @@
 //! | `kv.get` | `(key, len) -> len` | Looks up the record whose key is the `len` bytes at `key`, in the shard of state the job was handed, and returns its value's length as a 64-bit integer, or -1 if there is no such record. `result.read` then copies the value |
 //! | `kv.put` | `(key, key_len, value, value_len)` | Sets the record with that key to that value. The change is kept only if the job completes |
 //! | `kv.scan` | `(prefix, len) -> len` | Gathers the records whose keys start with the `len` bytes at `prefix`, in the byte form `decomp_schema::records` defines, and returns its length as a 64-bit integer. `result.read` then copies it |
-//! | `result.read` | `(dest)` | Copies what the last `open`, `blob.get`, `kv.get`, or `kv.scan` found into memory at `dest` |
+//! | `model.generate` | `(model, prompt, len, max_tokens, temperature) -> len` | Has the approved model whose ID is the 32 bytes at `model`, one the job's manifest names, generate `max_tokens` tokens after the `len` bytes of prompt at `prompt`, sampling at `temperature` thousandths (0 takes the likeliest token), and returns the output's length in bytes as a 64-bit integer, or -1 if the manifest does not name the model. `result.read` then copies the output |
+//! | `model.embed` | `(model, text, len) -> len` | Has that model embed the `len` bytes at `text`, and returns the length of the embedding, little-endian 32-bit floats, as a 64-bit integer, or -1 if the manifest does not name the model. `result.read` then copies it |
+//! | `result.read` | `(dest)` | Copies what the last `open`, `blob.get`, `kv.get`, `kv.scan`, `model.generate`, or `model.embed` found into memory at `dest` |
 //!
 //! The three `kv` functions end a job that was handed no shard.
+//!
+//! The model functions are answered by the host's models (`Models`): the
+//! first node generates, and a node that checks its result replays the job
+//! against the first node's transcript (see `decomp_core::inference`). A
+//! model call is charged its tokens, prompt and output, at the model's cost
+//! per token, so two nodes that agree on the output charge the same.
 //!
 //! `seal` must give every node the same bytes, so it draws nothing at random:
 //! what it does is fixed by the job's seed, the key, and the message (see
@@ -59,6 +67,9 @@ use crate::engine::{
     Caller, Engine, EngineError, Extern, ExternType, HostResult, Linker, Module, Store,
     StoreLimits, StoreLimitsBuilder, Val,
 };
+use std::sync::Arc;
+
+use decomp_core::inference::{Sampling, approved, call_seed};
 use decomp_core::{
     ContentHash, MAX_SPAWNED, OpeningKey, PublicKey, SEAL_OVERHEAD_BYTES, SealingKey, Signature,
     seal,
@@ -123,7 +134,7 @@ const MEMORY_EXPORT: &str = "memory";
 pub type Checkpoint = [u8; 32];
 
 /// A job to run.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Job<'a> {
     pub module: &'a [u8],
     pub input: &'a [u8],
@@ -141,6 +152,54 @@ pub struct Job<'a> {
     /// a private job of its own user. A node is given no user's key, and neither
     /// is anyone who re-runs a job to check one, so they give `None`.
     pub opening_key: Option<&'a OpeningKey>,
+    /// The approved models the job may call: those its manifest names.
+    pub models: &'a [ContentHash],
+    /// What answers the job's model calls. `None` where no model runs, which
+    /// ends a job that calls one.
+    pub model_host: Option<Arc<dyn Models>>,
+}
+
+/// One call a job made to a model.
+pub struct ModelCall<'a> {
+    /// The call's place among the job's model calls, counting from zero.
+    pub index: u32,
+    pub model: ContentHash,
+    pub request: ModelRequest<'a>,
+}
+
+pub enum ModelRequest<'a> {
+    Generate {
+        prompt: &'a [u8],
+        max_tokens: u32,
+        sampling: Sampling,
+    },
+    Embed {
+        text: &'a [u8],
+    },
+}
+
+/// What a model call came to: its output, and the tokens it processed,
+/// prompt and output together, which it is charged for.
+pub struct ModelAnswer {
+    pub output: Vec<u8>,
+    pub tokens: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {
+    /// The call cannot be run: its prompt is too long for the model, say.
+    /// Every node finds the same.
+    #[error("{0}")]
+    Unrunnable(String),
+    /// The node checking another node's result found that the transcript's
+    /// answer to this call does not hold up.
+    #[error("{0}")]
+    Rejected(String),
+}
+
+/// What answers a job's model calls on a node.
+pub trait Models {
+    fn call(&self, call: ModelCall<'_>) -> Result<ModelAnswer, ModelError>;
 }
 
 /// Blobs by the hash of their contents.
@@ -219,6 +278,7 @@ impl Finding {
             units: self.units,
             outcome,
             checkpoints: ContentHash::of(&self.checkpoints),
+            transcript: None,
         }
     }
 
@@ -244,6 +304,9 @@ pub enum Failure {
     /// The module hit a trap, or a host function refused one of its calls.
     #[error("{0}")]
     Trapped(String),
+    /// A model call in the transcript this node was checking did not hold up.
+    #[error("a model call in the transcript did not hold up: {0}")]
+    ProofRejected(String),
 }
 
 /// A job that could not be started.
@@ -281,6 +344,12 @@ enum Halt {
         "a follow-up job runs one of the blobs the job was given to read, on a compute cap of at least 1, and a job may ask for at most {MAX_SPAWNED}"
     )]
     BadFollowUp,
+    #[error("no model runs here")]
+    NoModels,
+    #[error("the model call cannot be run: {0}")]
+    Unrunnable(String),
+    #[error("a model call in the transcript did not hold up: {0}")]
+    ProofRejected(String),
 }
 
 /// Per-job state the host functions work on.
@@ -314,6 +383,11 @@ struct State {
     random_blocks_drawn: u64,
     /// The key `open` opens with, if the job was given one.
     opening_key: Option<OpeningKey>,
+    /// The models the job may call, what answers them, and how many calls
+    /// the job has made.
+    models: Vec<ContentHash>,
+    model_host: Option<Arc<dyn Models>>,
+    model_calls: u32,
 }
 
 /// What `result.read` copies next.
@@ -342,6 +416,8 @@ const HOST_FUNCTIONS: &[(&str, &str)] = &[
     (HOST_MODULE, "kv.put"),
     (HOST_MODULE, "kv.scan"),
     (HOST_MODULE, "job.spawn"),
+    (HOST_MODULE, "model.generate"),
+    (HOST_MODULE, "model.embed"),
     (HOST_MODULE, METER_IMPORT),
 ];
 
@@ -378,6 +454,8 @@ impl Sandbox {
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "kv.put", kv_put))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "kv.scan", kv_scan))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "job.spawn", job_spawn))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "model.generate", model_generate))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "model.embed", model_embed))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, METER_IMPORT, meter))
             .expect("host function names are unique");
         Self { engine, linker }
@@ -398,6 +476,7 @@ impl Sandbox {
                 produced: run.result.map_err(|failure| match failure {
                     Failure::ComputeCapExceeded => decomp_core::Failure::ComputeCapExceeded,
                     Failure::Trapped(_) => decomp_core::Failure::Trapped,
+                    Failure::ProofRejected(_) => decomp_core::Failure::ProofRejected,
                 }),
                 checkpoints: run.checkpoints.concat(),
             },
@@ -428,6 +507,8 @@ impl Sandbox {
             blobs: &Blobs::new(),
             state: None,
             opening_key: None,
+            models: &[],
+            model_host: None,
         };
         match self.execute(&job, SIGNATURE_EXPORT, None) {
             Ok(run) => Ok(run.result.ok().map(|produced| produced.output)),
@@ -493,6 +574,9 @@ impl Sandbox {
             seed: job.seed,
             random_blocks_drawn: 0,
             opening_key: job.opening_key.map(|key| OpeningKey::from_seed(key.seed())),
+            models: job.models.to_vec(),
+            model_host: job.model_host.clone(),
+            model_calls: 0,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -554,10 +638,12 @@ fn check_exports(module: &Module, entry_point: &str) -> Result<(), RunError> {
 }
 
 fn failure_of(error: &EngineError) -> Failure {
-    if let Some(Halt::CapReached | Halt::CheckpointReached) = engine::host_error::<Halt>(error) {
+    match engine::host_error::<Halt>(error) {
         // A run stopped at a checkpoint is reported like one that ran out of
         // budget; `Sandbox::checkpoint` only reads the checkpoint.
-        return Failure::ComputeCapExceeded;
+        Some(Halt::CapReached | Halt::CheckpointReached) => return Failure::ComputeCapExceeded,
+        Some(Halt::ProofRejected(reason)) => return Failure::ProofRejected(reason.clone()),
+        _ => {}
     }
     Failure::Trapped(engine::trap_message(error))
 }
@@ -841,6 +927,73 @@ fn open_message(mut caller: Caller<'_, State>, src: u32, len: u32) -> HostResult
 
 /// Fills the module's buffer from the job's random stream: block `n` of the
 /// stream is the SHA-256 hash of the seed followed by `n`.
+/// Runs one model call for the job, charges it, and keeps its output for
+/// `result.read`. Returns the output's length, or -1 if the job's manifest
+/// does not name the model.
+fn call_model(state: &mut State, model: ContentHash, request: ModelRequest<'_>) -> HostResult<i64> {
+    if !state.models.contains(&model) {
+        return Ok(-1);
+    }
+    let host = state.model_host.clone().ok_or(Halt::NoModels)?;
+    let per_token = approved(&model).map_or(0, |model| model.instructions_per_token);
+    let index = state.model_calls;
+    state.model_calls += 1;
+    let answer = host
+        .call(ModelCall {
+            index,
+            model,
+            request,
+        })
+        .map_err(|error| match error {
+            ModelError::Unrunnable(reason) => Halt::Unrunnable(reason),
+            ModelError::Rejected(reason) => Halt::ProofRejected(reason),
+        })?;
+    charge(state, answer.tokens.saturating_mul(per_token))?;
+    charge_for_bytes(state, answer.output.len())?;
+    make_room(state, 0)?;
+    let len = answer.output.len();
+    state.found = Some(Found::Bytes(answer.output));
+    Ok(len as i64)
+}
+
+fn model_id(memory: &[u8], at: u32) -> Result<ContentHash, Halt> {
+    Ok(ContentHash::from_bytes(
+        range(memory, at, 32)?.try_into().expect("32 bytes"),
+    ))
+}
+
+fn model_generate(
+    mut caller: Caller<'_, State>,
+    model: u32,
+    prompt: u32,
+    len: u32,
+    max_tokens: u32,
+    temperature_milli: u32,
+) -> HostResult<i64> {
+    let (memory, state) = memory_and_state(&mut caller);
+    charge_for_bytes(state, len as usize)?;
+    let model = model_id(memory, model)?;
+    let prompt = range(memory, prompt, len as usize)?.to_vec();
+    let sampling = Sampling {
+        temperature_milli,
+        seed: call_seed(&state.seed, state.model_calls),
+    };
+    let request = ModelRequest::Generate {
+        prompt: &prompt,
+        max_tokens,
+        sampling,
+    };
+    call_model(state, model, request)
+}
+
+fn model_embed(mut caller: Caller<'_, State>, model: u32, text: u32, len: u32) -> HostResult<i64> {
+    let (memory, state) = memory_and_state(&mut caller);
+    charge_for_bytes(state, len as usize)?;
+    let model = model_id(memory, model)?;
+    let text = range(memory, text, len as usize)?.to_vec();
+    call_model(state, model, ModelRequest::Embed { text: &text })
+}
+
 fn rand_seeded(mut caller: Caller<'_, State>, dest: u32, len: u32) -> HostResult<()> {
     let (memory, state) = memory_and_state(&mut caller);
     charge_for_bytes(state, len as usize)?;

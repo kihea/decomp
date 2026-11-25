@@ -168,13 +168,17 @@ pub const SLOT_MEMORY_MB: u64 = 512;
 /// What a device says its hardware is (spec section 1, "Node profile":
 /// hardware fit is measured by "declared specs, confirmed by benchmark jobs").
 /// The agent reads it from the system. It bounds the slots a device is offered,
-/// and only a device with a GPU is offered inference jobs.
+/// and an inference job is offered only to a device that holds every model the
+/// job calls, and has a GPU if one of them needs it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hardware {
     pub cores: u32,
     pub memory_mb: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpus: Vec<Gpu>,
+    /// The approved models the device holds and can run, by ID.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ContentHash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

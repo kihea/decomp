@@ -144,6 +144,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         share: None,
                         keep_from: Vec::new(),
                         apart_from: Vec::new(),
+                        models: Vec::new(),
                     };
                     let submit = client.quote(manifest.clone()).and_then(|quote| {
                         manifest.max_fee = quote.highest_fee;

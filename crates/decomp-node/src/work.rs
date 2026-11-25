@@ -1,13 +1,15 @@
 //! Running a leased job, committing to its result, and revealing it later; and
 //! the pace a node keeps between requests.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use decomp_core::{ContentHash, Failure, JobResult, Lease, Outcome, merkle, privacy};
-use decomp_sandbox::{Blobs, Job, Sandbox};
+use decomp_core::{ContentHash, Failure, JobResult, Lease, Outcome, Transcript, merkle, privacy};
+use decomp_sandbox::{Blobs, Job, Models, Sandbox};
 use decomp_schema::records::{self, Records};
 
 use crate::client::{Client, ClientError};
+use crate::models::{Generator, Replayer};
 use crate::store;
 
 /// How often a node asks for work. Must stay well under the job board's
@@ -70,9 +72,36 @@ pub fn work(client: &Client, sandbox: &Sandbox, lease: &Lease) -> Result<Committ
                 failure: Failure::InvalidJob,
             },
             checkpoints: ContentHash::of(&[]),
+            transcript: lease.transcript,
         };
         return commit(client, lease, result);
     }
+    // A job that calls models: the first node generates and keeps a
+    // transcript; a node after it replays the first node's transcript.
+    let role = match lease.transcript {
+        _ if manifest.models.is_empty() => Role::NoModels,
+        None => Role::Generate(Arc::new(Generator::default())),
+        Some(root) => match serde_json::from_slice::<Transcript>(&fetch(root)?) {
+            Ok(transcript) => Role::Replay(Arc::new(Replayer::new(transcript))),
+            Err(_) => {
+                let result = JobResult {
+                    job_id: lease.job_id,
+                    units: 0,
+                    outcome: Outcome::Failed {
+                        failure: Failure::ProofRejected,
+                    },
+                    checkpoints: ContentHash::of(&[]),
+                    transcript: Some(root),
+                };
+                return commit(client, lease, result);
+            }
+        },
+    };
+    let model_host: Option<Arc<dyn Models>> = match &role {
+        Role::NoModels => None,
+        Role::Generate(generator) => Some(Arc::clone(generator) as Arc<dyn Models>),
+        Role::Replay(replayer) => Some(Arc::clone(replayer) as Arc<dyn Models>),
+    };
     let finding = sandbox.find(&Job {
         module: &module,
         input: &input,
@@ -82,12 +111,42 @@ pub fn work(client: &Client, sandbox: &Sandbox, lease: &Lease) -> Result<Committ
         state: shard.as_deref(),
         // A node opens nothing: it holds no key of the user whose job this is.
         opening_key: None,
+        models: &manifest.models,
+        model_host,
     });
+    let mut result = finding.result(lease.job_id);
+    let mut transcript_bytes = None;
+    match &role {
+        Role::NoModels => {}
+        Role::Generate(generator) => {
+            let bytes =
+                serde_json::to_vec(&generator.transcript()).expect("a transcript serializes");
+            result.transcript = Some(merkle::root(&bytes));
+            transcript_bytes = Some(bytes);
+        }
+        Role::Replay(replayer) => {
+            result.transcript = lease.transcript;
+            if !replayer.used_all()
+                && result.outcome
+                    != (Outcome::Failed {
+                        failure: Failure::ProofRejected,
+                    })
+            {
+                result.outcome = Outcome::Failed {
+                    failure: Failure::ProofRejected,
+                };
+            }
+        }
+    }
 
     // What the job produced goes to storage nodes, paid by the job's payer,
     // before the result is committed to. A node that ran the job second
     // finds it already stored.
-    for bytes in finding.produced_blobs() {
+    let produced = finding
+        .produced_blobs()
+        .into_iter()
+        .chain(transcript_bytes.as_deref());
+    for bytes in produced {
         let root = merkle::root(bytes);
         let placement = client.store_produced(lease.job_id, root, bytes.len() as u64)?;
         if !placement.addresses.is_empty() && store::upload_to(&placement, &root, bytes) == 0 {
@@ -96,14 +155,21 @@ pub fn work(client: &Client, sandbox: &Sandbox, lease: &Lease) -> Result<Committ
             )));
         }
     }
-    commit(client, lease, finding.result(lease.job_id))
+    commit(client, lease, result)
+}
+
+/// How a run answers the job's model calls.
+enum Role {
+    NoModels,
+    Generate(Arc<Generator>),
+    Replay(Arc<Replayer>),
 }
 
 /// Commits to a result, keeping the salt to reveal it with later.
 fn commit(client: &Client, lease: &Lease, result: JobResult) -> Result<Committed, WorkError> {
     let salt = ContentHash::from_bytes(rand::random());
     let commitment = result.commitment(&client.device_key(), &salt);
-    client.commit_result(lease.job_id, commitment)?;
+    client.commit_result(lease.job_id, commitment, result.transcript)?;
     Ok(Committed { result, salt })
 }
 

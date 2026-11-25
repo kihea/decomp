@@ -30,6 +30,9 @@ pub fn run(sandbox: &Sandbox, run: &FallBackRun, job_id: JobId) -> (JobResult, V
         blobs: &run.blobs,
         state: run.shard.as_deref(),
         opening_key: None,
+        // Inference jobs cannot fall back, so no fallback calls a model.
+        models: &[],
+        model_host: None,
     });
     let produced = finding
         .produced_blobs()

@@ -101,7 +101,14 @@ pub struct Manifest {
     /// told which jobs a job names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apart_from: Vec<JobId>,
+    /// The approved models the job may call, by ID (see `inference`). An
+    /// inference job names at least one; no other job names any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ContentHash>,
 }
+
+/// The most models one job may call.
+pub const MAX_MODELS: usize = 4;
 
 /// How a job's result is confirmed (spec, "Verification follows supply").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +236,11 @@ pub struct JobResult {
     /// another. If nodes disagree, the first checkpoint where their lists differ
     /// shows how far the job must be re-run to find out which is right.
     pub checkpoints: ContentHash,
+    /// For a job that called models: the root of the transcript of its calls
+    /// (`inference::Transcript`), which the first node made and every node
+    /// after it checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<ContentHash>,
 }
 
 impl JobResult {
@@ -295,6 +307,9 @@ pub enum Failure {
     Trapped,
     /// The module or its input cannot be run at all.
     InvalidJob,
+    /// A model call in the transcript the node was handed did not hold up when
+    /// the node checked it (see `inference`).
+    ProofRejected,
 }
 
 impl fmt::Display for Failure {
@@ -303,6 +318,7 @@ impl fmt::Display for Failure {
             Self::ComputeCapExceeded => "the job used its whole compute cap",
             Self::Trapped => "the job trapped",
             Self::InvalidJob => "the module or its input cannot be run",
+            Self::ProofRejected => "a model call in the transcript did not hold up",
         })
     }
 }
@@ -325,6 +341,11 @@ pub struct Lease {
     /// out. `None` if the job is handed no shard, or the shard was empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard: Option<ContentHash>,
+    /// For a job that calls models, run by any node but the first: the
+    /// transcript of the first node's calls, which this node replays the job
+    /// against and checks (see `inference`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<ContentHash>,
 }
 
 /// The verification level a result got; every receipt states it. The first of

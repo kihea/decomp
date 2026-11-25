@@ -11,10 +11,12 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
+use decomp_core::{APPROVED_MODELS, ICRC_TRANSFER_FEE, IcrcAccount, Subaccount, Tokens};
 use decomp_core::{
     AccountId, AccountStatus, AppManifest, Approval, BidOrder, Call, ContentHash, Controller,
     Credits, Encrypted, Fallback, Inclusion, JobClass, JobId, JobStatus, MAX_LOG_PAGE,
@@ -23,11 +25,11 @@ use decomp_core::{
     Verification, Verify, WorkPreferences, controller, cut, draw_hash, encrypted, merkle, privacy,
     shares,
 };
-use decomp_core::{ICRC_TRANSFER_FEE, IcrcAccount, Subaccount, Tokens};
 
 use decomp_node::beacon::Rounds;
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::deliver::{self, Delivered};
+use decomp_node::models::Generator;
 use decomp_node::relay;
 use decomp_node::store;
 
@@ -465,6 +467,11 @@ struct JobArgs {
     /// Compute units the job may use before it is stopped.
     #[arg(long)]
     compute_cap: u64,
+    /// An approved model the job may call, by name (such as tiny-1) or ID.
+    /// Repeat for each one. A job that calls models is of the inference
+    /// class.
+    #[arg(long = "model", value_parser = parse_model)]
+    models: Vec<ContentHash>,
 }
 
 fn main() -> ExitCode {
@@ -1399,6 +1406,7 @@ fn submit(
         share: None,
         keep_from,
         apart_from,
+        models: job.models.clone(),
     };
     // Set aside the most the job can cost at the rate posted now, and what its
     // follow-ups may; what is not spent comes back.
@@ -1529,6 +1537,7 @@ fn submit_shares(
             share: Some(Share { set, index }),
             keep_from: limits.keep_from.clone(),
             apart_from: limits.apart_from.clone(),
+            models: job.models.clone(),
         };
         manifest.max_fee = client.quote(manifest.clone())?.highest_fee;
         jobs.push(client.submit_job(manifest)?);
@@ -1614,6 +1623,8 @@ fn submit_encrypted(
         share: None,
         keep_from: limits.keep_from,
         apart_from: limits.apart_from,
+        // The encrypted route computes on encrypted values, which no model reads.
+        models: Vec::new(),
     };
     manifest.max_fee = client.quote(manifest.clone())?.highest_fee;
     println!("module  {}", manifest.module);
@@ -1790,6 +1801,11 @@ fn run_here(
         // Nor is there any state to hand it.
         state: None,
         opening_key: opening_key.as_ref(),
+        models: &job.models,
+        // Off the network there is no one to check the models' answers, so
+        // they are generated here.
+        model_host: (!job.models.is_empty())
+            .then(|| Arc::new(Generator::default()) as Arc<dyn decomp_sandbox::Models>),
     })?;
     let took = started.elapsed();
 
@@ -1876,6 +1892,17 @@ fn parse_verify(text: &str) -> Result<Verify, String> {
         "none" => Ok(Verify::None),
         _ => Err("verify is opportunistic, required, or none".into()),
     }
+}
+
+fn parse_model(text: &str) -> Result<ContentHash, String> {
+    APPROVED_MODELS
+        .iter()
+        .find(|model| model.name == text || model.id.to_string() == text)
+        .map(|model| model.id)
+        .ok_or_else(|| {
+            let names: Vec<&str> = APPROVED_MODELS.iter().map(|model| model.name).collect();
+            format!("the approved models are {}", names.join(", "))
+        })
 }
 
 fn parse_class(text: &str) -> Result<JobClass, String> {

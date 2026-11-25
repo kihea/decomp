@@ -29,7 +29,7 @@ Last updated 2026-11-21.
 | Splitting, tiers, follow-up jobs | Available | |
 | Node scores | Available | Reliability, availability, hardware fit (known-answer jobs and audits timed by the job board, with declared cores, memory, and GPUs), and bandwidth (timed transfers of test data between nodes). GPUs are declared once the agent runs inference |
 | Always-on fallback | Available | The module runs in the control canister, on data the submitter left there |
-| Inference class with TOPLOC | Not started | Needs the approved model list and a runtime for it, and GPU nodes |
+| Inference class with TOPLOC | In development | `model.generate` and `model.embed`, TOPLOC proofs and checks (`decomp_core::toploc`), transcripts that every node after the first replays and checks, disputes, and a rerun after a rejected transcript, on the tiny approved models (`decomp-inference`). The runtime for large models on GPUs, split across devices, is next |
 | Attested nodes (Intel TDX, AMD SEV-SNP) | Not started | Needs nodes on that hardware |
 
 ## Market and rewards

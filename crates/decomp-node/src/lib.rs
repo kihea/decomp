@@ -6,6 +6,7 @@ pub mod beacon;
 pub mod client;
 pub mod deliver;
 pub mod hardware;
+pub mod models;
 mod peer;
 pub mod relay;
 pub mod schedule;

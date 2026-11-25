@@ -12,6 +12,7 @@ mod draw;
 pub mod encrypted;
 mod envelope;
 mod hosts;
+pub mod inference;
 mod job;
 mod jobs;
 mod keys;
@@ -32,6 +33,7 @@ mod splits;
 mod state;
 mod storage;
 pub mod token;
+pub mod toploc;
 mod value_keys;
 
 pub use account::{Account, AccountOp, Accounts, Device, OpError, Recovery};
@@ -50,10 +52,14 @@ pub use draw::{
 pub use encrypted::{EncryptError, Encrypted, EncryptionKey};
 pub use envelope::{Envelope, EnvelopeError};
 pub use hosts::{Host, Hosts};
+pub use inference::{
+    APPROVED_MODELS, ApprovedModel, MAX_GENERATED_TOKENS, RecordedAnswer, RecordedCall, Sampling,
+    Transcript,
+};
 pub use job::{
     Failure, Fallback, JobResult, JobStatus, Lease, MAX_APART_FROM, MAX_JOB_SLOTS, MAX_KEPT_FROM,
-    MAX_PIECES, MAX_READS, MAX_RUNS, MAX_SPAWNED, MAX_TIER, Manifest, Outcome, Receipt, Share,
-    Spawn, Split, Verification, Verify, cut,
+    MAX_MODELS, MAX_PIECES, MAX_READS, MAX_RUNS, MAX_SPAWNED, MAX_TIER, Manifest, Outcome, Receipt,
+    Share, Spawn, Split, Verification, Verify, cut,
 };
 pub use jobs::{
     CONFIRMATION_WINDOW_SECS, ClosedJob, Closure, FallBackJob, FollowUps, Granted, JobError, Jobs,

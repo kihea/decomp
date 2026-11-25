@@ -258,8 +258,19 @@ impl Client {
     }
 
     /// Commits to a result for a leased job.
-    pub fn commit_result(&self, job_id: JobId, commitment: ContentHash) -> Result<(), ClientError> {
-        self.call::<IgnoredAny>(Call::CommitResult { job_id, commitment })?;
+    /// Commits to a result, naming the transcript of its model calls if it
+    /// made any.
+    pub fn commit_result(
+        &self,
+        job_id: JobId,
+        commitment: ContentHash,
+        transcript: Option<ContentHash>,
+    ) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::CommitResult {
+            job_id,
+            commitment,
+            transcript,
+        })?;
         Ok(())
     }
 

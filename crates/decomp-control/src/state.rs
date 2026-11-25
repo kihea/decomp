@@ -1145,10 +1145,11 @@ impl ControlPlane {
         node: PublicKey,
         job_id: JobId,
         commitment: ContentHash,
+        transcript: Option<ContentHash>,
         now: u64,
     ) -> Result<(), JobError> {
         self.jobs
-            .commit_result(node, job_id, commitment, now, &mut self.rng)
+            .commit_result(node, job_id, commitment, transcript, now, &mut self.rng)
     }
 
     /// Takes a node's revealed result.

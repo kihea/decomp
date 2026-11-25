@@ -122,6 +122,11 @@ pub enum Call {
     CommitResult {
         job_id: JobId,
         commitment: ContentHash,
+        /// For a job that called models: the root of the transcript of its
+        /// calls, stored before the commitment, for the nodes that check the
+        /// result. The revealed result must name the same.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcript: Option<ContentHash>,
     },
     /// A node revealing the result it committed to, with the salt it committed
     /// with. Answer: an empty object.

@@ -1,0 +1,31 @@
+//! Runs DeComp's approved models on a node (spec section 2, "Inference"; section
+//! 4, "TOPLOC proof"): generates text with TOPLOC proofs, and checks the text
+//! and proofs another node handed back by running the model once over them.
+//!
+//! The proof format and the rules of the check are protocol rules and live in
+//! `decomp_core::toploc` and `decomp_core::inference`; this crate holds the
+//! models and the arithmetic. It runs on the CPU, which is enough for the tiny
+//! approved models (`tiny`).
+
+mod generate;
+mod model;
+pub mod tiny;
+
+pub use generate::{
+    Generated, Rejection, embed, generate, proof_count, validate, validate_embedding,
+};
+pub use model::{Config, Model, ModelError, Session, Step};
+
+use decomp_core::{ContentHash, inference::ApprovedModel, merkle};
+
+/// The model's ID: the root of its weights file.
+pub fn id_of(model: &Model) -> ContentHash {
+    merkle::root(&model.to_bytes())
+}
+
+/// Builds the approved model `approved`, if this crate can, and checks that it
+/// is the model the approved list names.
+pub fn load(approved: &ApprovedModel) -> Option<Model> {
+    let model = tiny::build(approved.name)?;
+    (id_of(&model) == approved.id).then_some(model)
+}

@@ -35,9 +35,10 @@ use rand::{Rng, RngExt};
 
 use crate::draw::{Beacon, Draw, Eligible, Pickup, WEIGHT_SCALE, is_audited};
 use crate::envelope::Envelope;
+use crate::inference::approved;
 use crate::job::{
-    Fallback, JobResult, JobStatus, Lease, MAX_JOB_SLOTS, MAX_TIER, Manifest, Outcome, Receipt,
-    Spawn, Verification, Verify,
+    Failure, Fallback, JobResult, JobStatus, Lease, MAX_JOB_SLOTS, MAX_MODELS, MAX_TIER, Manifest,
+    Outcome, Receipt, Spawn, Verification, Verify,
 };
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, ShareSet};
 use crate::ledger::{Credits, FeeSplit, HOLDBACK_PERCENT, HOLDBACK_SECS, Payout, compute_fee};
@@ -109,6 +110,12 @@ pub enum JobError {
     Bid(#[from] BidError),
     #[error("{0}")]
     BadPreferences(&'static str),
+    #[error(
+        "an inference job names between 1 and {MAX_MODELS} approved models, and no other job names any"
+    )]
+    BadModels,
+    #[error("an inference job cannot fall back to the control plane, which runs no models")]
+    InferenceFallback,
 }
 
 /// A job that has just closed, for the caller to settle.
@@ -255,6 +262,18 @@ struct Job {
     closed_at: Option<u64>,
 }
 
+/// Whether a node with `hardware` can run every model in `models`.
+fn runs_models(hardware: Option<&Hardware>, models: &[ContentHash]) -> bool {
+    models.iter().all(|id| {
+        let Some(hardware) = hardware else {
+            return false;
+        };
+        let gpu_ready =
+            approved(id).is_some_and(|model| !model.needs_gpu) || !hardware.gpus.is_empty();
+        hardware.models.contains(id) && gpu_ready
+    })
+}
+
 /// A node that may be drawn for a lease: its entry in the draw, its account,
 /// its account's taper, and the bid it would fill, if any.
 type Candidate = (Eligible, AccountId, u64, Option<ContentHash>);
@@ -275,6 +294,9 @@ struct Held {
     granted_at: u64,
     committed_at: u64,
     commitment: Option<ContentHash>,
+    /// The transcript of the node's model calls, which it named when it
+    /// committed.
+    transcript: Option<ContentHash>,
     revealed: Option<(JobResult, Envelope)>,
 }
 
@@ -322,6 +344,19 @@ impl Jobs {
         }
         if self.jobs.contains_key(id) {
             return Err(JobError::JobExists);
+        }
+        let inference = manifest.class == JobClass::Inference;
+        let models_fit = if inference {
+            (1..=MAX_MODELS).contains(&manifest.models.len())
+                && manifest.models.iter().all(|id| approved(id).is_some())
+        } else {
+            manifest.models.is_empty()
+        };
+        if !models_fit {
+            return Err(JobError::BadModels);
+        }
+        if inference && manifest.fallback.is_some() {
+            return Err(JobError::InferenceFallback);
         }
         Ok(())
     }
@@ -498,6 +533,7 @@ impl Jobs {
         node: PublicKey,
         job_id: JobId,
         commitment: ContentHash,
+        transcript: Option<ContentHash>,
         now: u64,
         rng: &mut impl Rng,
     ) -> Result<(), JobError> {
@@ -515,6 +551,7 @@ impl Jobs {
             return Err(JobError::AlreadyCommitted);
         }
         held.commitment = Some(commitment);
+        held.transcript = transcript;
         held.committed_at = now;
         self.events.push(ScoreEvent {
             node,
@@ -530,9 +567,14 @@ impl Jobs {
         let committed = job.committed();
         if committed == 1 && job.confirm_until.is_none() {
             // A first result from a node on probation is paid only once a
-            // second pickup confirms it, so it waits for one until the deadline.
-            let waits_to_deadline =
-                job.manifest.verify == Verify::Required || !job.leases[0].proven;
+            // second pickup confirms it, so it waits for one until the
+            // deadline. So does an inference result, which is confirmed only
+            // by a node that checks its proofs (spec section 4, "TOPLOC proof").
+            let checked_inference =
+                job.manifest.class == JobClass::Inference && job.manifest.verify != Verify::None;
+            let waits_to_deadline = job.manifest.verify == Verify::Required
+                || checked_inference
+                || !job.leases[0].proven;
             job.confirm_until = Some(if waits_to_deadline {
                 job.manifest.deadline
             } else {
@@ -566,7 +608,9 @@ impl Jobs {
             .iter_mut()
             .find(|held| held.node == node)
             .ok_or(JobError::NotLeased)?;
-        if held.commitment != Some(result.commitment(&node, &salt)) {
+        if held.commitment != Some(result.commitment(&node, &salt))
+            || held.transcript != result.transcript
+        {
             return Err(JobError::NotTheCommitment);
         }
         held.revealed = Some((result, envelope));
@@ -1072,6 +1116,42 @@ impl Jobs {
             return;
         };
 
+        // The first node's model calls did not hold up, so no node has the
+        // job's real output: checkers only replay a transcript. The job is
+        // run again from the start, kept from the accounts found wrong, while
+        // its deadline allows; those found right are paid as checkers are.
+        let rejected = Outcome::Failed {
+            failure: Failure::ProofRejected,
+        };
+        if result.outcome == rejected && now < job.manifest.deadline {
+            for held in &standing {
+                let reward = compute_fee(result.units, job.rate).percent(85);
+                self.closed.push(ClosedJob {
+                    job_id,
+                    how: Closure::CheckPassed {
+                        account: held.account,
+                        reward,
+                    },
+                });
+            }
+            let wrong: Vec<AccountId> = job
+                .leases
+                .iter()
+                .filter(|held| !right.contains(&held.node))
+                .map(|held| held.account)
+                .collect();
+            job.kept_from.extend(wrong);
+            job.leases.clear();
+            job.refereeing = None;
+            job.confirm_until = None;
+            job.phase = Phase::Open;
+            job.status = JobStatus::Submitted;
+            if !self.open.contains(&job_id) {
+                self.open.push_back(job_id);
+            }
+            return;
+        }
+
         let verified = match (disputed, standing.len()) {
             (true, _) => Verification::Refereed,
             (false, 1) => Verification::Unconfirmed,
@@ -1367,13 +1447,9 @@ impl Jobs {
                 if !may_take(&standing, &job.manifest, job.rate) {
                     continue;
                 }
-                // Inference runs on a GPU (spec section 2), so only a node that
-                // has one is offered it.
-                let has_gpu = self
-                    .hardware
-                    .get(key)
-                    .is_some_and(|hardware| !hardware.gpus.is_empty());
-                if class == JobClass::Inference && !has_gpu {
+                // A job that calls models is offered only to a node that
+                // holds them all, and has a GPU if one of them needs it.
+                if !runs_models(self.hardware.get(key), &job.manifest.models) {
                     continue;
                 }
                 let account_standing = (standings.account)(account);
@@ -1493,6 +1569,7 @@ impl Jobs {
                 granted_at: now,
                 committed_at: 0,
                 commitment: None,
+                transcript: None,
                 revealed: None,
             });
             job.draws.push(draw);
@@ -1565,6 +1642,7 @@ impl Jobs {
             granted_at: now,
             committed_at: 0,
             commitment: None,
+            transcript: None,
             revealed: None,
         });
         job.status = JobStatus::Leased;
@@ -1753,9 +1831,15 @@ impl Job {
     }
 
     fn lease_for(&self, job_id: JobId, held: &Held) -> Lease {
-        let seed = match &self.kind {
-            Kind::KnownAnswer { expected } | Kind::Audit { expected, .. } => expected.seed,
-            Kind::Submitted { .. } => job_id,
+        let (seed, transcript) = match &self.kind {
+            Kind::KnownAnswer { expected } | Kind::Audit { expected, .. } => {
+                (expected.seed, expected.result.transcript)
+            }
+            // Every node after the first replays the first node's model calls.
+            Kind::Submitted { .. } => {
+                let first = self.leases.first().filter(|first| first.node != held.node);
+                (job_id, first.and_then(|first| first.transcript))
+            }
         };
         Lease {
             job_id,
@@ -1764,6 +1848,7 @@ impl Job {
             manifest: self.manifest.as_handed(),
             seed,
             shard: self.shard,
+            transcript,
         }
     }
 

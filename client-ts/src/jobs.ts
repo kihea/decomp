@@ -78,4 +78,5 @@ const FAILURES: Record<Failure, string> = {
   compute_cap_exceeded: 'The job used its whole compute cap.',
   trapped: 'The job trapped.',
   invalid_job: 'The module or its input cannot be run.',
+  proof_rejected: 'A model call in the transcript did not hold up.',
 };

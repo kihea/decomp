@@ -35,6 +35,7 @@ and what is built today in
 | `crates/decomp-devnet` | A local network: `decomp-control` in one process, with files for storage, behind an HTTP server. |
 | `crates/decomp-node` | The node agent and command-line client: create or join an account, contribute compute, submit jobs, store and send files, and check receipts and draws. Its library is shared with desktop apps. |
 | `crates/decomp-sandbox` | The metered, deterministic WebAssembly sandbox jobs run in. |
+| `crates/decomp-inference` | Runs the approved models on a node: generation with TOPLOC proofs, and checking another node's generation by prefill. |
 | `crates/decomp-schema` | How a job's input and output types are described and checked. |
 | `client-ts` | `@decomp/client`, the TypeScript client for browsers and desktop web views. |
 | `docs` | The spec, status, and design notes. |
@@ -113,6 +114,19 @@ settled, how long jobs took, and the cycles the canister spent on each:
 ```bash
 DECOMP_CONTROL_URL="http://localhost:4943?canisterId=<canister id>"   cargo run --release -p decomp-replica --bin decomp-load -- module.wasm --jobs 200 --accounts 10
 ```
+
+### Checking inference
+
+`toploc` shows TOPLOC at work on the tiny approved models: it prints their IDs,
+generates text with proofs, and has the proofs checked against the right model,
+against models a dishonest node might use instead, and against changed text:
+
+```bash
+cargo run --release -p decomp-inference --bin toploc -- tiny-2 512
+```
+
+An inference job names the models it calls: `decomp-node submit job.wasm
+--class inference --model tiny-1 ...`.
 
 ### Devnet settings
 

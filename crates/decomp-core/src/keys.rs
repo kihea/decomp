@@ -14,7 +14,7 @@ macro_rules! hex_newtype {
         pub struct $name([u8; $len]);
 
         impl $name {
-            pub fn from_bytes(bytes: [u8; $len]) -> Self {
+            pub const fn from_bytes(bytes: [u8; $len]) -> Self {
                 Self(bytes)
             }
 

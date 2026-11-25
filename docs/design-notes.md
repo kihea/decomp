@@ -698,6 +698,76 @@ second, bound by the three nodes. Taking jobs is bound by update calls to one
 canister, so the split, or the spec's batching of leases and results, is what
 raises that ceiling when real load nears it.
 
+## Inference and TOPLOC
+
+**The proof is the paper's.** TOPLOC (Ong et al., 2025) keeps the 128 largest
+values of the last hidden state for the prompt and for every 32 generated
+tokens, rounded to bfloat16, and commits to a polynomial through them: 258
+bytes per chunk. The prime is 65,521, the largest below 2^16, so each
+coefficient fits two bytes, and positions are reduced modulo the largest number
+up to that prime that keeps them apart, so they stay distinct in the field. The
+tolerances are the paper's for bfloat16 (38 exponent mismatches, mean 10 and
+median 8 mantissa units). They live in `decomp-core` because every checker must
+apply the same ones.
+
+**Sampling is checked too.** TOPLOC checks hidden states, not the choice of
+tokens. Sampling uses Gumbel noise drawn from the job's seed and the call's
+place, so a checker recomputes each token's score from its own logits and
+accepts a token within 0.05 of the best. This also narrows the attack the paper
+names, text from a cheap model proved by the right one: such text fails the
+sampling check at its first token.
+
+**Checkers replay a transcript.** The first node generates; every node after it
+(second pickup, referee, known-answer check) is handed the root of the first
+node's transcript in its lease and replays the job against it, checking each
+call by one pass of the model over the prompt and output. So the job's output
+does not depend on which machine generated, and a checker's result matches the
+first node's exactly when every call holds up. A call that does not hold up is
+the failure `proof_rejected`, which the existing dispute path settles. The
+transcript's root is public from the commitment on, since a checker needs it
+before it runs; the commitment still hides the result.
+
+**Every inference job waits for a checker.** Unless its verify mode is
+`none`, an inference job is not accepted on one result: it waits for a second
+pickup until its deadline, as `required` does (spec section 4: TOPLOC "for
+inference" in place of the second pickup's hash comparison).
+
+**A rejected transcript reruns the job.** Checkers never generate, so when the
+transcript is found wrong no node holds the job's real output. The job board
+then opens the job again, kept from the accounts found wrong, while its deadline
+allows; the checkers found right are paid as checkers are, and the wrong node
+pays the dispute's cost as in any dispute.
+
+**Inference is billed in compute units.** The spec meters inference by "Tokens
+processed, by model". Each approved model has a cost per token in instructions,
+so a call is charged its prompt and output tokens at that cost, and inference
+is priced at its class's posted rate like everything else. Two nodes that agree
+on the output charge the same.
+
+**Approved models are listed by the root of their weights.** The list is a
+constant in `decomp-core`; a node builds or fetches each model and holds it only
+if its root is the listed ID, and declares the models it holds with its
+hardware. A job names the models it calls, and is offered only to nodes that
+hold them all (and have a GPU, if one of them needs it), so a node never
+leases a job it cannot run.
+
+**The first approved models are tiny and seeded.** `tiny-1` and `tiny-2` are
+small transformers whose weights are drawn from a published seed, so anyone can
+rebuild them and check their roots, with no download. Weights drawn at random
+attend to every token almost evenly, which leaves hidden states barely
+dependent on the context; there, a changed prompt or coarsely rounded weights
+passed the check. Embeddings drawn small and query and key weights drawn four
+times larger give sharp attention, as in a trained model, and with them every
+such change is caught.
+
+**Inference jobs cannot fall back.** The control canister runs no models, so a
+job that calls models and asks for the always-on fallback is refused.
+
+**Open: checkers are trusted to check.** Known-answer jobs replay transcripts
+already agreed, so they show that a checker accepts good work, not that it
+rejects bad work. Transcripts made wrong on purpose, as known-answer checks of
+checkers, would close this; the spec does not say how.
+
 ## Node scores
 
 **Hardware fit is timed by the job board.** The spec confirms declared specs "by
@@ -902,8 +972,6 @@ device may do it.
 - **Unconfirmed shares are never audited.** A share cannot be reissued as a spot
   check, so a share accepted unconfirmed is not checked later. Should
   private-totals jobs default to `verify: required`?
-- **Local route fit.** A device is taken to fit one compute unit until its
-  hardware-fit score is measured. Is one unit the right starting value?
 - **TFHE-rs licensing.** The library's licence is BSD-3-Clause-Clear, which grants
   no patent rights, and its maker asks companies to buy a patent licence before
   using it commercially. This must be settled before the encrypted route is

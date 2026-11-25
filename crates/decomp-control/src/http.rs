@@ -266,8 +266,12 @@ fn answer(
             control.report_probe(&signer, seed, millis, digest, now)?;
             Json(json!({})).into_response()
         }
-        Call::CommitResult { job_id, commitment } => {
-            control.commit_result(signer, job_id, commitment, now)?;
+        Call::CommitResult {
+            job_id,
+            commitment,
+            transcript,
+        } => {
+            control.commit_result(signer, job_id, commitment, transcript, now)?;
             Json(json!({})).into_response()
         }
         Call::RevealResult { result, salt } => {
@@ -642,6 +646,8 @@ impl From<JobError> for ApiError {
             JobError::NotTheCommitment => (StatusCode::BAD_REQUEST, "not_the_commitment"),
             JobError::UnitsOverCap => (StatusCode::BAD_REQUEST, "units_over_cap"),
             JobError::BadPreferences(_) => (StatusCode::BAD_REQUEST, "bad_preferences"),
+            JobError::BadModels => (StatusCode::BAD_REQUEST, "bad_models"),
+            JobError::InferenceFallback => (StatusCode::BAD_REQUEST, "inference_fallback"),
             JobError::Bid(inner) => {
                 let code = match inner {
                     BidError::UnknownBid => "unknown_bid",
