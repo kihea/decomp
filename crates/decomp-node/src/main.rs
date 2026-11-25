@@ -29,7 +29,7 @@ use decomp_core::{
 use decomp_node::beacon::Rounds;
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::deliver::{self, Delivered};
-use decomp_node::models::Generator;
+use decomp_node::models::{CallContext, Generator};
 use decomp_node::relay;
 use decomp_node::store;
 
@@ -237,6 +237,11 @@ enum Command {
         /// http://203.0.113.5:9000. Without it, http:// and the listen address.
         #[arg(long, requires = "listen")]
         public_url: Option<String>,
+        /// Hold part of a stored model, fetched from storage nodes: NAME for
+        /// all of it, NAME:ends to run jobs with it, or NAME:stage-N to run
+        /// that stage for other nodes (which needs --listen). Repeat for each.
+        #[arg(long = "hold")]
+        hold: Vec<String>,
     },
     /// Pay to have a file held by nodes, and upload it to them.
     Store {
@@ -564,12 +569,16 @@ fn main() -> ExitCode {
             create_account(&cli.dir, &cli.control, &account_key)
         }
         Command::NewAccountKey { account_key } => new_account_key(&account_key),
-        Command::Start { listen, public_url } => {
+        Command::Start {
+            listen,
+            public_url,
+            hold,
+        } => {
             let public_url =
                 public_url.or_else(|| listen.as_ref().map(|at| format!("http://{at}")));
             let reachable = listen.as_deref().zip(public_url.as_deref());
             let reachable = reachable.map(|(listen, public_url)| Reachable { listen, public_url });
-            agent::start(&cli.dir, &cli.control, reachable).map(|()| ExitCode::SUCCESS)
+            agent::start(&cli.dir, &cli.control, reachable, &hold).map(|()| ExitCode::SUCCESS)
         }
         Command::Store { file, days } => connect().and_then(|client| store(&client, &file, days)),
         Command::Delete { root } => connect().and_then(|client| {
@@ -993,10 +1002,13 @@ fn check_draws(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
                 .map_err(|fault| format!("draw {from} does not hold: {fault}"))?;
             hashes.push(draw_hash(text));
             let pickup = match draw.pickup {
-                Pickup::First => "first pickup",
-                Pickup::Second => "second pickup",
-                Pickup::Audit => "audit",
-                Pickup::Referee => "referee for a dispute",
+                Pickup::First => "first pickup".to_string(),
+                Pickup::Second => "second pickup".to_string(),
+                Pickup::Audit => "audit".to_string(),
+                Pickup::Referee => "referee for a dispute".to_string(),
+                Pickup::Stage { lease, stage, .. } => {
+                    format!("stage {stage} for lease {lease}")
+                }
             };
             let market = if draw.bid.is_some() {
                 ", filling a bid"
@@ -1804,8 +1816,10 @@ fn run_here(
         models: &job.models,
         // Off the network there is no one to check the models' answers, so
         // they are generated here.
-        model_host: (!job.models.is_empty())
-            .then(|| Arc::new(Generator::default()) as Arc<dyn decomp_sandbox::Models>),
+        model_host: (!job.models.is_empty()).then(|| {
+            let context = CallContext::local(&decomp_core::SigningKey::generate());
+            Arc::new(Generator::new(context)) as Arc<dyn decomp_sandbox::Models>
+        }),
     })?;
     let took = started.elapsed();
 

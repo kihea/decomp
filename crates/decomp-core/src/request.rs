@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::account::Account;
 use crate::app::AppManifest;
 use crate::envelope::Envelope;
+use crate::inference::StageLease;
 use crate::job::{JobResult, Lease, Manifest};
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, SealingKey};
 use crate::ledger::{Balance, CashOut, Credits};
@@ -393,6 +394,9 @@ pub struct LeasesGranted {
     /// A measurement of another node's bandwidth to make.
     #[serde(default)]
     pub probe: Option<Probe>,
+    /// Stages of models the node was drawn to run for other nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<StageLease>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

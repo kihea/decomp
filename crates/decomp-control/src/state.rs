@@ -767,7 +767,11 @@ impl ControlPlane {
     ) -> LeasesGranted {
         let serves_data = address.is_some();
         self.hosts.seen(node, account, address, now);
-        if let Some(hardware) = hardware {
+        if let Some(mut hardware) = hardware {
+            // Only a node other nodes can reach runs stages for them.
+            if !serves_data {
+                hardware.stages.clear();
+            }
             self.jobs.declare_hardware(node, hardware);
         }
         let probe = self.probe_for(node, account, serves_data, now);
@@ -796,8 +800,16 @@ impl ControlPlane {
         };
         self.jobs = jobs;
         self.rng = rng;
+        let mut leases = granted.leases;
+        for stage in leases
+            .iter_mut()
+            .flat_map(|lease| lease.pipeline.iter_mut())
+        {
+            stage.address = self.hosts.address(&stage.node);
+        }
         LeasesGranted {
-            leases: granted.leases,
+            leases,
+            stages: granted.stages,
             reveal: granted.reveal,
             store: self.storage.orders_for(&node),
             drop: self.storage.take_drops(&node),

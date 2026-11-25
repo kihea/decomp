@@ -29,7 +29,7 @@ Last updated 2026-11-21.
 | Splitting, tiers, follow-up jobs | Available | |
 | Node scores | Available | Reliability, availability, hardware fit (known-answer jobs and audits timed by the job board, with declared cores, memory, and GPUs), and bandwidth (timed transfers of test data between nodes). GPUs are declared once the agent runs inference |
 | Always-on fallback | Available | The module runs in the control canister, on data the submitter left there |
-| Inference class with TOPLOC | In development | `model.generate` and `model.embed`, TOPLOC proofs and checks (`decomp_core::toploc`), transcripts that every node after the first replays and checks, disputes, and a rerun after a rejected transcript, on the tiny approved models (`decomp-inference`). The runtime for large models on GPUs, split across devices, is next |
+| Inference class with TOPLOC | In development | `model.generate` and `model.embed`, TOPLOC proofs and checks (`decomp_core::toploc`), transcripts that every node after the first replays and checks, disputes, and a rerun after a rejected transcript, on the tiny approved models and on Qwen3-0.6B (`decomp-inference`). Stored models of the Llama family (Qwen2, Qwen3, Llama, Mistral) are cut into stages on storage nodes and run as a pipeline across nodes the job board draws. Mixture-of-experts models, Gemma 4, Whisper, Stable Diffusion, and Wan 2.2 are next, and models run on the CPU until the agent declares GPUs |
 | Attested nodes (Intel TDX, AMD SEV-SNP) | Not started | Needs nodes on that hardware |
 
 ## Market and rewards

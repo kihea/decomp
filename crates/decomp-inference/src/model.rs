@@ -233,6 +233,10 @@ pub struct Session<'a> {
 }
 
 impl Session<'_> {
+    pub fn model(&self) -> &Model {
+        self.model
+    }
+
     /// Tokens fed so far.
     pub fn len(&self) -> usize {
         self.length

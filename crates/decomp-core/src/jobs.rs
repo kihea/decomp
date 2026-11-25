@@ -35,7 +35,7 @@ use rand::{Rng, RngExt};
 
 use crate::draw::{Beacon, Draw, Eligible, Pickup, WEIGHT_SCALE, is_audited};
 use crate::envelope::Envelope;
-use crate::inference::approved;
+use crate::inference::{PipelineStage, StageLease, StageRef, approved, stage_share_ppm};
 use crate::job::{
     Failure, Fallback, JobResult, JobStatus, Lease, MAX_JOB_SLOTS, MAX_MODELS, MAX_TIER, Manifest,
     Outcome, Receipt, Spawn, Verification, Verify,
@@ -191,6 +191,8 @@ struct Refereeing {
 pub struct Granted {
     /// Every lease the node holds and has not committed a result for.
     pub leases: Vec<Lease>,
+    /// Stages the node was drawn to run for nodes holding leases.
+    pub stages: Vec<StageLease>,
     /// Jobs whose commitment window has closed, whose results the node should
     /// reveal now.
     pub reveal: Vec<JobId>,
@@ -262,6 +264,15 @@ struct Job {
     closed_at: Option<u64>,
 }
 
+/// A node drawn to run one stage of a model for a node holding a lease.
+#[derive(Clone, Copy)]
+struct Assigned {
+    model: ContentHash,
+    stage: u32,
+    node: PublicKey,
+    account: AccountId,
+}
+
 /// Whether a node with `hardware` can run every model in `models`.
 fn runs_models(hardware: Option<&Hardware>, models: &[ContentHash]) -> bool {
     models.iter().all(|id| {
@@ -297,6 +308,9 @@ struct Held {
     /// The transcript of the node's model calls, which it named when it
     /// committed.
     transcript: Option<ContentHash>,
+    /// The nodes drawn to run the stages of the job's models that this node
+    /// does not hold. Each takes a slot until this node commits.
+    pipeline: Vec<Assigned>,
     revealed: Option<(JobResult, Envelope)>,
 }
 
@@ -522,6 +536,22 @@ impl Jobs {
                 (Phase::Open, None, _) => granted.leases.push(job.lease_for(*job_id, held)),
                 (Phase::Revealing { .. }, Some(_), None) => granted.reveal.push(*job_id),
                 _ => {}
+            }
+        }
+        for (job_id, job) in &self.jobs {
+            if job.closed_at.is_some() {
+                continue;
+            }
+            for held in job.leases.iter().filter(|held| held.commitment.is_none()) {
+                for assigned in held.pipeline.iter().filter(|a| a.node == node) {
+                    granted.stages.push(StageLease {
+                        job_id: *job_id,
+                        model: assigned.model,
+                        stage: assigned.stage,
+                        head: held.node,
+                        expires_at: held.expires_at,
+                    });
+                }
             }
         }
         granted
@@ -1174,19 +1204,35 @@ impl Jobs {
             .collect();
         let (split, pay) = FeeSplit::of_runs(&runs);
         let unconfirmed = verified == Verification::Unconfirmed;
-        let payouts: Vec<Payout> = paid
-            .iter()
-            .zip(pay)
-            .map(|(held, amount)| Payout {
+        let holdback = |amount: Credits| {
+            if unconfirmed {
+                amount.percent(HOLDBACK_PERCENT)
+            } else {
+                Credits::ZERO
+            }
+        };
+        // Each node drawn to run a stage for a paid run gets its share of it.
+        let share = stage_share_ppm(&job.manifest.models);
+        let mut payouts: Vec<Payout> = Vec::new();
+        for (held, amount) in paid.iter().zip(pay) {
+            let mut left = amount;
+            for assigned in &held.pipeline {
+                let part = Credits::from_micros(
+                    (u128::from(amount.micros()) * u128::from(share) / 1_000_000) as u64,
+                );
+                left = left - part;
+                payouts.push(Payout {
+                    account: assigned.account,
+                    amount: part,
+                    held: holdback(part),
+                });
+            }
+            payouts.push(Payout {
                 account: held.account,
-                amount,
-                held: if unconfirmed {
-                    amount.percent(HOLDBACK_PERCENT)
-                } else {
-                    Credits::ZERO
-                },
-            })
-            .collect();
+                amount: left,
+                held: holdback(left),
+            });
+        }
         let envelopes = standing
             .iter()
             .map(|held| held.revealed.as_ref().expect("revealed").1.clone())
@@ -1331,12 +1377,86 @@ impl Jobs {
             })
             .map(|job| job.manifest.slots)
             .sum();
+        // A stage a node runs for another takes one slot until that node commits.
+        let stages = self
+            .jobs
+            .values()
+            .filter(|job| job.closed_at.is_none())
+            .flat_map(|job| &job.leases)
+            .filter(|held| held.commitment.is_none())
+            .flat_map(|held| &held.pipeline)
+            .filter(|assigned| assigned.node == *node)
+            .count() as u32;
+        let used = used + stages;
         // A node offers no more slots than its hardware runs.
         let offered = match self.hardware.get(node) {
             Some(hardware) => self.preferences(node).slots.min(hardware.slots()),
             None => self.preferences(node).slots,
         };
         offered.saturating_sub(used)
+    }
+
+    /// The stages of `models` a node does not hold itself, each with its
+    /// model's place among them.
+    fn missing_stages(
+        &self,
+        node: &PublicKey,
+        models: &[ContentHash],
+    ) -> Vec<(u32, ContentHash, u32)> {
+        let held = self
+            .hardware
+            .get(node)
+            .map(|h| h.stages.as_slice())
+            .unwrap_or(&[]);
+        let mut missing = Vec::new();
+        for (index, id) in models.iter().enumerate() {
+            let stages = approved(id).map_or(0, |model| model.stages);
+            for stage in 0..stages {
+                let wanted = StageRef { model: *id, stage };
+                if !held.contains(&wanted) {
+                    missing.push((index as u32, *id, stage));
+                }
+            }
+        }
+        missing
+    }
+
+    /// The nodes that could be drawn to run `stage` of `model`: asking for
+    /// work, with a free slot, holding the stage, taking inference work, and
+    /// of no account in `barred`. In order of node key, with their accounts.
+    fn stage_pool(
+        &self,
+        free: &BTreeMap<PublicKey, (AccountId, u32)>,
+        model: &ContentHash,
+        stage: u32,
+        barred: &HashSet<AccountId>,
+        standings: &Standings,
+    ) -> Vec<(Eligible, AccountId)> {
+        let wanted = StageRef {
+            model: *model,
+            stage,
+        };
+        free.iter()
+            .filter(|(_, (account, slots))| *slots > 0 && !barred.contains(account))
+            .filter(|(key, _)| {
+                self.hardware
+                    .get(key)
+                    .is_some_and(|hardware| hardware.stages.contains(&wanted))
+            })
+            .filter(|(key, _)| {
+                let preferences = self.preferences(key);
+                preferences.contributing && preferences.classes.contains(&JobClass::Inference)
+            })
+            .map(|(key, (account, _))| {
+                let standing = (standings.node)(key, account);
+                let eligible = Eligible {
+                    node: *key,
+                    weight: (standing.weight(JobClass::Inference) * WEIGHT_SCALE).round() as u64,
+                    balanced: (standings.account)(account).balanced,
+                };
+                (eligible, *account)
+            })
+            .collect()
     }
 
     /// Grants a lease on each open job that needs one, to a node drawn from the
@@ -1452,6 +1572,18 @@ impl Jobs {
                 if !runs_models(self.hardware.get(key), &job.manifest.models) {
                     continue;
                 }
+                let mut barred_here = barred.clone();
+                barred_here.insert(*account);
+                let stages_drawable = self.missing_stages(key, &job.manifest.models).iter().all(
+                    |(_, model, stage)| {
+                        !self
+                            .stage_pool(&free, model, *stage, &barred_here, standings)
+                            .is_empty()
+                    },
+                );
+                if !stages_drawable {
+                    continue;
+                }
                 let account_standing = (standings.account)(account);
                 let cap = share_cap_ppm(&account_standing, now);
                 let share = shares.get(account).copied().unwrap_or(0);
@@ -1542,6 +1674,51 @@ impl Jobs {
                     micros_per_unit: job.rate,
                 },
             };
+            // Draw a node for each stage of the job's models the node lacks.
+            let lease = job.leases.len() as u32;
+            let mut barred_here = barred.clone();
+            barred_here.insert(account);
+            let mut pipeline = Vec::new();
+            let mut stage_draws = Vec::new();
+            for (model_index, model, stage) in self.missing_stages(&node, &job.manifest.models) {
+                let pool = self.stage_pool(&free, &model, stage, &barred_here, standings);
+                let eligible: Vec<Eligible> = pool.iter().map(|(e, _)| *e).collect();
+                let pickup = Pickup::Stage {
+                    lease,
+                    model: model_index,
+                    stage,
+                };
+                let Some(draw) = Draw::make(id, pickup, now, beacon, eligible, None) else {
+                    break;
+                };
+                let stage_account = pool
+                    .iter()
+                    .find(|(e, _)| e.node == draw.node)
+                    .map(|(_, a)| *a)
+                    .expect("the drawn node was eligible");
+                if let Some((_, slots)) = free.get_mut(&draw.node) {
+                    *slots = slots.saturating_sub(1);
+                }
+                pipeline.push(Assigned {
+                    model,
+                    stage,
+                    node: draw.node,
+                    account: stage_account,
+                });
+                stage_draws.push(draw);
+            }
+            if pipeline.len() < self.missing_stages(&node, &job.manifest.models).len() {
+                // A stage node ran out of slots to an earlier stage; try again
+                // next round.
+                for assigned in &pipeline {
+                    if let Some((_, slots)) = free.get_mut(&assigned.node) {
+                        *slots += 1;
+                    }
+                }
+                still_open.push_back(id);
+                continue;
+            }
+            let job = self.jobs.get(&id).expect("open jobs exist");
             let proven = (standings.node)(&node, &account).proven;
             if let Some((_, slots)) = free.get_mut(&node) {
                 *slots = slots.saturating_sub(job.manifest.slots);
@@ -1570,9 +1747,11 @@ impl Jobs {
                 committed_at: 0,
                 commitment: None,
                 transcript: None,
+                pipeline,
                 revealed: None,
             });
             job.draws.push(draw);
+            job.draws.extend(stage_draws);
             if matches!(job.status, JobStatus::Submitted) {
                 job.status = JobStatus::Leased;
             }
@@ -1643,6 +1822,7 @@ impl Jobs {
             committed_at: 0,
             commitment: None,
             transcript: None,
+            pipeline: Vec::new(),
             revealed: None,
         });
         job.status = JobStatus::Leased;
@@ -1849,6 +2029,16 @@ impl Job {
             seed,
             shard: self.shard,
             transcript,
+            pipeline: held
+                .pipeline
+                .iter()
+                .map(|assigned| PipelineStage {
+                    model: assigned.model,
+                    stage: assigned.stage,
+                    node: assigned.node,
+                    address: None,
+                })
+                .collect(),
         }
     }
 

@@ -4,17 +4,24 @@
 //!
 //! The proof format and the rules of the check are protocol rules and live in
 //! `decomp_core::toploc` and `decomp_core::inference`; this crate holds the
-//! models and the arithmetic. It runs on the CPU, which is enough for the tiny
-//! approved models (`tiny`).
+//! models and the arithmetic: the tiny approved models (`tiny`), and stored
+//! models of the Llama family (`decoder`), cut into files (`card`) and run as
+//! a pipeline whose stages may be on other nodes (`runner`).
 
+pub mod card;
+pub mod decoder;
 mod generate;
 mod model;
+pub mod runner;
 pub mod tiny;
 
 pub use generate::{
-    Generated, Rejection, embed, generate, proof_count, validate, validate_embedding,
+    Generated, Rejection, embed, fits, generate, proof_count, validate, validate_embedding,
 };
 pub use model::{Config, Model, ModelError, Session, Step};
+pub use runner::{LocalStage, Pipeline, Runner, StageLink};
+/// The tokenizer library stored models' tokenizers are read with.
+pub use tokenizers;
 
 use decomp_core::{ContentHash, inference::ApprovedModel, merkle};
 

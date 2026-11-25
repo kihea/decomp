@@ -128,6 +128,17 @@ cargo run --release -p decomp-inference --bin toploc -- tiny-2 512
 An inference job names the models it calls: `decomp-node submit job.wasm
 --class inference --model tiny-1 ...`.
 
+A model too large for one device is published in stages. `decomp-model pack`
+cuts a Hugging Face model into a card and files, `decomp-node store` stores
+each, and nodes hold parts with `decomp-node start --listen ADDR --hold
+qwen3-0.6b:ends` (to run jobs with it) or `--hold qwen3-0.6b:stage-1` (to run
+that stage for other nodes). `decomp-model try` runs a packed model here:
+
+```bash
+cargo run --release -p decomp-inference --bin decomp-model -- pack ./Qwen3-0.6B --name qwen3-0.6b --stages 2 --out ./qwen3-packed
+cargo run --release -p decomp-inference --bin decomp-model -- try ./qwen3-packed --prompt "The capital of France is"
+```
+
 ### Devnet settings
 
 | Variable | Default | Meaning |

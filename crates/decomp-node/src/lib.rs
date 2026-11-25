@@ -11,6 +11,7 @@ mod peer;
 pub mod relay;
 pub mod schedule;
 pub mod server;
+pub mod stages;
 pub mod store;
 mod work;
 

@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::keys::ContentHash;
+use crate::keys::{ContentHash, JobId, PublicKey};
 use crate::request::Blob;
 
 /// A model jobs may call: identified by the root (`merkle::root`) of its
@@ -36,6 +36,81 @@ pub struct ApprovedModel {
     /// Whether the model needs a GPU to run in reasonable time. A job that
     /// calls one is offered only to nodes that declare a GPU.
     pub needs_gpu: bool,
+    /// How many stages the model is cut into, so that it runs across nodes
+    /// (see `decomp_inference::card`). Zero for a model that runs whole on
+    /// one node.
+    pub stages: u32,
+}
+
+/// One stage of a stored model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StageRef {
+    pub model: ContentHash,
+    pub stage: u32,
+}
+
+/// A node drawn to run one stage of a model for the node holding a lease:
+/// what that node is told in its lease.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineStage {
+    pub model: ContentHash,
+    pub stage: u32,
+    pub node: PublicKey,
+    /// Where the node takes activations, filled in by the control plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+/// A stage this node was drawn to run, for the node holding a lease on a
+/// job: what this node is told when it asks for work. It runs the stage for
+/// requests signed by `head` until `expires_at`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageLease {
+    pub job_id: JobId,
+    pub model: ContentHash,
+    pub stage: u32,
+    pub head: PublicKey,
+    pub expires_at: u64,
+}
+
+/// Where a node that runs stages takes activations: `POST` a `StageRequest`
+/// signed by the node holding the lease, and the answer is a `StageAnswer`.
+pub const STAGE_PATH: &str = "/v1/stage";
+
+/// Activations for a stage to run over: the next `tokens` tokens of model
+/// call number `call` of a job, after `start` tokens already sent, as
+/// `tokens` rows of the model's hidden width, little-endian 32-bit floats.
+/// A call starts with `start` 0; the stage keeps the keys and values of the
+/// tokens before.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StageRequest {
+    pub job_id: JobId,
+    pub model: ContentHash,
+    pub stage: u32,
+    pub call: u32,
+    pub start: u64,
+    pub tokens: u32,
+    pub activations: Blob,
+}
+
+/// What a stage computed from a `StageRequest`'s activations: the same shape.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StageAnswer {
+    pub activations: Blob,
+}
+
+/// The part of a run's pay that goes to each node drawn to run a stage for
+/// it, in millionths: one share for the node holding the lease, which runs
+/// the ends, and one for each stage of the job's models, as if each stage
+/// were the same work. The node holding the lease keeps the shares of the
+/// stages it runs itself.
+pub fn stage_share_ppm(models: &[ContentHash]) -> u64 {
+    let stages: u64 = models
+        .iter()
+        .filter_map(approved)
+        .map(|model| u64::from(model.stages))
+        .sum();
+    1_000_000 / (1 + stages)
 }
 
 /// The approved models.
@@ -50,14 +125,28 @@ pub const APPROVED_MODELS: &[ApprovedModel] = &[
         name: "tiny-1",
         instructions_per_token: 2_000_000,
         needs_gpu: false,
+        stages: 0,
     },
     ApprovedModel {
         id: hash_const(TINY_2_ID),
         name: "tiny-2",
         instructions_per_token: 10_000_000,
         needs_gpu: false,
+        stages: 0,
+    },
+    // Qwen3-0.6B (Apache 2.0), cut into two stages of 14 layers by
+    // `decomp-model pack --stages 2`. It runs on a CPU at about 170 ms a
+    // token, which is what its cost per token is set to.
+    ApprovedModel {
+        id: hash_const(QWEN3_0_6B_ID),
+        name: "qwen3-0.6b",
+        instructions_per_token: 170_000_000,
+        needs_gpu: false,
+        stages: 2,
     },
 ];
+
+const QWEN3_0_6B_ID: &str = "7c0933222465ab718c4d6c1d60ab9fa9c58098104815e4342aaa194d53ca439b";
 
 const TINY_1_ID: &str = "db50495579d7cda34584c112f1d2954e37dd492aa5628b31f35c052a63718ba8";
 const TINY_2_ID: &str = "067fa04bc2289b203b55c173407f7a2419c65375a4c31e0a4a9a501292147c18";

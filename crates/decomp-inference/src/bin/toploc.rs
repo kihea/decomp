@@ -58,7 +58,8 @@ fn main() {
     let plain = started.elapsed();
 
     let started = Instant::now();
-    let generated = generate(&model, &prompt, tokens, &sampling).expect("the call fits");
+    let generated =
+        generate(&mut model.session(), &prompt, tokens, &sampling).expect("the call fits");
     let proved = started.elapsed();
     let proof_bytes = generated.proofs.len() * toploc::PROOF_BYTES;
     println!(
@@ -69,7 +70,7 @@ fn main() {
     );
 
     let started = Instant::now();
-    let honest = validate(&model, &prompt, tokens, &sampling, &generated);
+    let honest = validate(&mut model.session(), &prompt, tokens, &sampling, &generated);
     println!(
         "checked by prefill in {:.1} ms\n",
         started.elapsed().as_secs_f64() * 1e3
@@ -79,7 +80,7 @@ fn main() {
     let check = |what: &str, other: &Model| {
         report(
             what,
-            validate(other, &prompt, tokens, &sampling, &generated),
+            validate(&mut other.session(), &prompt, tokens, &sampling, &generated),
         );
     };
     let other_seed = tiny::seeded(model.config, "a different seed");
@@ -99,21 +100,28 @@ fn main() {
     changed.tokens[tokens as usize / 2] ^= 1;
     report(
         "the right model, one output token changed",
-        validate(&model, &prompt, tokens, &sampling, &changed),
+        validate(&mut model.session(), &prompt, tokens, &sampling, &changed),
     );
     let mut other_prompt = prompt.clone();
     other_prompt[0] ^= 1;
     report(
         "the right model, the prompt changed",
-        validate(&model, &other_prompt, tokens, &sampling, &generated),
+        validate(
+            &mut model.session(),
+            &other_prompt,
+            tokens,
+            &sampling,
+            &generated,
+        ),
     );
     // A node that generates with a cheap model and proves with the right one.
-    let cheap = generate(&other_seed, &prompt, tokens, &sampling).expect("the call fits");
+    let cheap =
+        generate(&mut other_seed.session(), &prompt, tokens, &sampling).expect("the call fits");
     let proofs = generate_proofs(&model, &prompt, &cheap.tokens);
     report(
         "text from another model, proved by the right one",
         validate(
-            &model,
+            &mut model.session(),
             &prompt,
             tokens,
             &sampling,

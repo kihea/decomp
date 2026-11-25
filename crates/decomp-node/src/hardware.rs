@@ -9,8 +9,8 @@ use sysinfo::System;
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
-/// This device's cores and memory, and the approved models it holds. GPUs
-/// are listed once the agent runs models on them.
+/// This device's cores and memory, and the approved models and stages it
+/// holds. GPUs are listed once the agent runs models on them.
 pub fn read() -> Hardware {
     let mut system = System::new();
     system.refresh_memory();
@@ -19,5 +19,6 @@ pub fn read() -> Hardware {
         memory_mb: system.total_memory() / BYTES_PER_MB,
         gpus: Vec::new(),
         models: crate::models::held().ids(),
+        stages: crate::models::held().stages(),
     }
 }

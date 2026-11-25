@@ -95,6 +95,34 @@ pub enum Pickup {
     /// A further run of a job whose results disagreed, to settle which was
     /// right.
     Referee,
+    /// A node to run one stage of a model for the node holding lease number
+    /// `lease` on the job (counting from zero): stage `stage` of the job's
+    /// model number `model` (see `inference`).
+    Stage { lease: u32, model: u32, stage: u32 },
+}
+
+impl Pickup {
+    /// What the pickup puts into a draw's seed, so that each lease and each
+    /// stage is drawn with numbers of its own.
+    fn seed_bytes(self) -> Vec<u8> {
+        match self {
+            Pickup::First => vec![0],
+            Pickup::Second => vec![1],
+            Pickup::Audit => vec![2],
+            Pickup::Referee => vec![3],
+            Pickup::Stage {
+                lease,
+                model,
+                stage,
+            } => {
+                let mut bytes = vec![4];
+                bytes.extend(lease.to_le_bytes());
+                bytes.extend(model.to_le_bytes());
+                bytes.extend(stage.to_le_bytes());
+                bytes
+            }
+        }
+    }
 }
 
 /// A node that could have been granted the lease: it asked for work, may take
@@ -237,7 +265,7 @@ impl Numbers {
         hasher.update(b"decomp/draw/v2\n");
         hasher.update(beacon.randomness.as_bytes());
         hasher.update(job_id.as_bytes());
-        hasher.update([pickup as u8]);
+        hasher.update(pickup.seed_bytes());
         for node in eligible {
             hasher.update(node.node.as_bytes());
             hasher.update(node.weight.to_le_bytes());

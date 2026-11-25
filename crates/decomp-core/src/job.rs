@@ -6,6 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::Envelope;
+use crate::inference::PipelineStage;
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, ShareSet};
 use crate::ledger::{Credits, FeeSplit};
 use crate::market::{JobClass, LeasePrice};
@@ -346,6 +347,10 @@ pub struct Lease {
     /// against and checks (see `inference`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<ContentHash>,
+    /// For a job that calls a model cut into stages: the nodes drawn to run
+    /// the stages this node does not hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipeline: Vec<PipelineStage>,
 }
 
 /// The verification level a result got; every receipt states it. The first of

@@ -53,7 +53,8 @@ pub use encrypted::{EncryptError, Encrypted, EncryptionKey};
 pub use envelope::{Envelope, EnvelopeError};
 pub use hosts::{Host, Hosts};
 pub use inference::{
-    APPROVED_MODELS, ApprovedModel, MAX_GENERATED_TOKENS, RecordedAnswer, RecordedCall, Sampling,
+    APPROVED_MODELS, ApprovedModel, MAX_GENERATED_TOKENS, PipelineStage, RecordedAnswer,
+    RecordedCall, STAGE_PATH, Sampling, StageAnswer, StageLease, StageRef, StageRequest,
     Transcript,
 };
 pub use job::{

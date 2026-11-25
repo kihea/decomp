@@ -5,8 +5,12 @@ edition.workspace = true
 description = "Runs DeComp's approved models on a node: generation with TOPLOC proofs, and validation by prefill."
 
 [dependencies]
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
 decomp-core = { version = "0.1.0", path = "../decomp-core", default-features = false }
+safetensors = "0.8.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }

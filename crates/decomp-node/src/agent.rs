@@ -8,10 +8,13 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use decomp_core::{Blob, Challenge, Hardware, JobId, LeasesGranted, WorkPreferences, merkle};
+use decomp_core::{
+    Blob, Challenge, ContentHash, Hardware, JobId, LeasesGranted, WorkPreferences, merkle,
+};
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::relay::Relay;
 use decomp_node::schedule::{Conditions, Event, Worker, may_work};
+use decomp_node::stages::StageService;
 use decomp_node::store::Store;
 use decomp_node::{IDLE_POLL, RETRY_DELAY, server};
 use decomp_sandbox::Sandbox;
@@ -84,6 +87,7 @@ pub fn start(
     dir: &Path,
     control_url: &str,
     reachable: Option<Reachable<'_>>,
+    hold: &[String],
 ) -> Result<(), Box<dyn Error>> {
     let key = device::load(dir)?.ok_or(crate::NO_KEY)?;
     let client = Arc::new(Client::new(control_url, key));
@@ -94,11 +98,17 @@ pub fn start(
         account.id
     );
 
+    let stages = StageService::new();
     let store = Store::open(dir.join("stored"))?;
     let relay = Relay::new();
     let address = match &reachable {
         Some(reachable) => {
-            server::serve(reachable.listen, store.clone(), relay.clone())?;
+            server::serve(
+                reachable.listen,
+                store.clone(),
+                relay.clone(),
+                stages.clone(),
+            )?;
             println!(
                 "holding and relaying data for the network at {}",
                 reachable.public_url
@@ -107,6 +117,11 @@ pub fn start(
         }
         None => None,
     };
+    // The parts of stored models the owner chose to hold, fetched once this
+    // node serves what it stores, so that nodes holding parts for each other
+    // can start together, and before it declares what it holds.
+    let local = |root: &ContentHash| store.holds(root).then(|| store.read(root).ok()).flatten();
+    decomp_node::models::hold(&client, hold, &local)?;
 
     let worker = Worker::new(Arc::clone(&client), Arc::new(Sandbox::new()));
     let hardware = decomp_node::hardware::read();
@@ -129,7 +144,9 @@ pub fn start(
         let pause = if !allowed && !worker.has_unrevealed() && worker.running() == 0 {
             IDLE_POLL
         } else {
-            match turn(&client, &worker, &store, &relay, address, &hardware) {
+            match turn(
+                &client, &worker, &store, &relay, &stages, address, &hardware,
+            ) {
                 Ok(()) => IDLE_POLL,
                 // Removed from its account: there is no more work for this key.
                 Err(error) if error.is("device_revoked") || error.is("not_linked") => {
@@ -154,11 +171,13 @@ fn turn(
     worker: &Worker,
     store: &Store,
     relay: &Relay,
+    stages: &StageService,
     address: Option<&str>,
     hardware: &Hardware,
 ) -> Result<(), ClientError> {
     let granted: LeasesGranted = client.request_lease(address, hardware)?;
     let now = unix_now();
+    stages.update(granted.stages.clone());
     worker.handle(&granted);
     if let Some(probe) = &granted.probe {
         match decomp_node::measure(probe) {

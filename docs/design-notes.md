@@ -768,6 +768,60 @@ already agreed, so they show that a checker accepts good work, not that it
 rejects bad work. Transcripts made wrong on purpose, as known-answer checks of
 checkers, would close this; the spec does not say how.
 
+## Models across devices
+
+**A stored model is cut into files on storage nodes.** The owner asked that
+models not need to fit on one device. `decomp-model pack` cuts a Hugging Face
+model into the tokenizer, the ends (embeddings, final normalization, output
+layer), and stages of layers, each a slice of the original weights file, and
+writes a card naming each by its root. The card's root is the model's ID in
+the approved list, so a node that holds a part can show it is the approved
+one. Parts are stored like any blob; keeping them stored is the publisher's
+cost.
+
+**The node with the lease heads the pipeline.** It holds the tokenizer and
+the ends, embeds tokens, sends activations through each stage, and applies
+the final normalization, whose output is the hidden state TOPLOC proves, and
+the output layer, so sampling happens where the proofs are made. Stage nodes
+keep each call's keys and values, so only new tokens' activations travel.
+
+**Stage nodes are drawn, not chosen.** When the job board grants a lease on a
+job whose models are cut into stages, it draws, for each stage the node lacks,
+a node of another account that holds it, takes work of the inference class,
+can be reached, and has a free slot, and publishes each draw (`Pickup::Stage`,
+seeded by the lease, the model, and the stage). A node is granted the lease
+only if every stage it lacks can be drawn. A stage node learns of its stage
+when it next asks for work, and runs it only for requests signed by the node
+it was drawn for, until that node's lease ends.
+
+**A checker runs its own pipeline.** A second pickup's lease draws its own
+stage nodes, so the check runs on different machines from the generation
+where nodes allow, and TOPLOC's tolerance covers the difference. A checker
+reads the whole text in one pass through its pipeline.
+
+**Stage nodes are paid a share of the run.** Each run's pay is split into one
+share for the node with the lease and one per stage of the job's models, as
+if every stage were the same work; the node with the lease keeps the shares of
+the stages it runs itself. Splitting by bytes held or by measured time would
+be fairer to uneven stages; equal shares are what can be known before the
+run.
+
+**A stage node that does not answer is no finding.** If a stage cannot be
+reached, the node with the lease reports nothing (`ModelError::Unavailable`),
+its lease lapses, and the job is granted again with a new draw.
+
+**Open: a wrong stage is blamed on the lease's node.** TOPLOC checks the last
+hidden state, which every stage feeds, so a stage node that computes wrongly
+makes its pipeline's result fail the check, and the node with the lease is
+found wrong. Hashes of each stage's activations in the transcript would let a
+referee find the stage at fault; the spec says nothing of pipelines, and this
+is not built.
+
+**Inference is priced by the time a token takes.** Qwen3-0.6B's cost per token
+is set to what a token takes on a CPU core, 170 ms, as compute units are
+priced by time on a reference core. So an eight-token answer is a tier-1 job,
+which only proven nodes take.
+
 ## Node scores
 
 **Hardware fit is timed by the job board.** The spec confirms declared specs "by

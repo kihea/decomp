@@ -130,7 +130,7 @@ Every kind of data has one owner, one home, and a stated consistency level.
 
 The network has three roles: nodes that run jobs, applications that submit jobs, and a control plane that matches them.
 
-**Slots.** The unit of supply is one slot: a sandbox with 1 CPU core, 512 MB of memory, and a metered compute budget. A phone might offer 1 slot and a desktop 8. A job states how many slots it needs at once on one machine, so an inference job can require 10 free slots plus a GPU.
+**Slots.** The unit of supply is one slot: a sandbox with 1 CPU core, 512 MB of memory, and a metered compute budget. A phone might offer 1 slot and a desktop 8. A job states how many slots it needs at once on one machine, so an inference job can require 10 free slots plus a GPU. A model need not fit on one device: a model too large for one is cut into stages of layers stored on the network, and the job board draws nodes holding the stages a job's node lacks, which run them for it as a pipeline.
 
 **Node agent.** Each device runs a small agent that registers slots, pulls jobs, runs them in the sandbox, and returns results. The owner sets contribution rules in the agent: hours of the day, maximum slots, battery and metered-network limits, and which job classes to accept.
 

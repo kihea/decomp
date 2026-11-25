@@ -1,7 +1,7 @@
 //! The web server other devices reach a node through: for the blobs it holds and
 //! the channels it relays. Only a node that other devices can connect to runs one.
 
-use decomp_core::{ContentHash, PROBE_BYTES, PROBE_PATH, probe};
+use decomp_core::{ContentHash, PROBE_BYTES, PROBE_PATH, STAGE_PATH, probe};
 use std::io::{self, Read};
 use std::sync::Arc;
 use std::thread;
@@ -9,6 +9,7 @@ use std::thread;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::relay::{self, Relay};
+use crate::stages::{self, StageService};
 use crate::store::{self, Store};
 
 /// How many requests the server works on at once. One slow upload or download
@@ -17,14 +18,20 @@ const SERVER_THREADS: usize = 4;
 
 /// Starts the server at the local address `listen`. It runs on its own threads
 /// for as long as the program does.
-pub fn serve(listen: &str, store: Arc<Store>, relay: Arc<Relay>) -> io::Result<()> {
+pub fn serve(
+    listen: &str,
+    store: Arc<Store>,
+    relay: Arc<Relay>,
+    stages: Arc<StageService>,
+) -> io::Result<()> {
     let server = Arc::new(Server::http(listen).map_err(io::Error::other)?);
     for _ in 0..SERVER_THREADS {
-        let (server, store, relay) = (server.clone(), store.clone(), relay.clone());
+        let (server, store, relay, stages) =
+            (server.clone(), store.clone(), relay.clone(), stages.clone());
         thread::spawn(move || {
             for request in server.incoming_requests() {
                 // A device that hangs up mid-answer is its own problem.
-                let _ = route(&store, &relay, request);
+                let _ = route(&store, &relay, &stages, request);
             }
         });
     }
@@ -70,7 +77,7 @@ fn serve_probe(path: &str, request: Request) -> io::Result<()> {
     }
 }
 
-fn route(store: &Store, relay: &Relay, request: Request) -> io::Result<()> {
+fn route(store: &Store, relay: &Relay, stages: &StageService, request: Request) -> io::Result<()> {
     // A browser asks first whether a page may make the request it is about to.
     if *request.method() == Method::Options {
         return respond(request, Response::empty(204));
@@ -82,6 +89,8 @@ fn route(store: &Store, relay: &Relay, request: Request) -> io::Result<()> {
         relay::answer(relay, path, request)
     } else if let Some(path) = url.strip_prefix(PROBE_PATH) {
         serve_probe(path, request)
+    } else if url == STAGE_PATH {
+        stages::answer(stages, request)
     } else {
         respond(
             request,

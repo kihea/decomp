@@ -195,6 +195,11 @@ pub enum ModelError {
     /// answer to this call does not hold up.
     #[error("{0}")]
     Rejected(String),
+    /// This node cannot answer the call now: a node running a stage of the
+    /// model did not answer, say. That is no finding about the job, so the
+    /// run is reported as unavailable, not as a result.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 /// What answers a job's model calls on a node.
@@ -248,6 +253,10 @@ pub struct Finding {
     pub produced: Result<Produced, decomp_core::Failure>,
     /// The job's checkpoints, one 32-byte hash after another.
     pub checkpoints: Vec<u8>,
+    /// Why this node could not finish the run, if it could not for a reason
+    /// of its own (`ModelError::Unavailable`). Such a run has no result to
+    /// report.
+    pub unavailable: Option<String>,
 }
 
 impl Finding {
@@ -307,6 +316,9 @@ pub enum Failure {
     /// A model call in the transcript this node was checking did not hold up.
     #[error("a model call in the transcript did not hold up: {0}")]
     ProofRejected(String),
+    /// This node could not answer a model call for a reason of its own.
+    #[error("a model call could not be answered here: {0}")]
+    Unavailable(String),
 }
 
 /// A job that could not be started.
@@ -350,6 +362,8 @@ enum Halt {
     Unrunnable(String),
     #[error("a model call in the transcript did not hold up: {0}")]
     ProofRejected(String),
+    #[error("a model call could not be answered here: {0}")]
+    Unavailable(String),
 }
 
 /// Per-job state the host functions work on.
@@ -471,19 +485,29 @@ impl Sandbox {
     /// same, so it is that job's result.
     pub fn find(&self, job: &Job<'_>) -> Finding {
         match self.run(job) {
-            Ok(run) => Finding {
-                units: run.units,
-                produced: run.result.map_err(|failure| match failure {
-                    Failure::ComputeCapExceeded => decomp_core::Failure::ComputeCapExceeded,
-                    Failure::Trapped(_) => decomp_core::Failure::Trapped,
-                    Failure::ProofRejected(_) => decomp_core::Failure::ProofRejected,
-                }),
-                checkpoints: run.checkpoints.concat(),
-            },
+            Ok(run) => {
+                let unavailable = match &run.result {
+                    Err(Failure::Unavailable(reason)) => Some(reason.clone()),
+                    _ => None,
+                };
+                Finding {
+                    units: run.units,
+                    produced: run.result.map_err(|failure| match failure {
+                        Failure::ComputeCapExceeded => decomp_core::Failure::ComputeCapExceeded,
+                        Failure::Trapped(_) | Failure::Unavailable(_) => {
+                            decomp_core::Failure::Trapped
+                        }
+                        Failure::ProofRejected(_) => decomp_core::Failure::ProofRejected,
+                    }),
+                    checkpoints: run.checkpoints.concat(),
+                    unavailable,
+                }
+            }
             Err(_) => Finding {
                 units: 0,
                 produced: Err(decomp_core::Failure::InvalidJob),
                 checkpoints: Vec::new(),
+                unavailable: None,
             },
         }
     }
@@ -643,6 +667,7 @@ fn failure_of(error: &EngineError) -> Failure {
         // budget; `Sandbox::checkpoint` only reads the checkpoint.
         Some(Halt::CapReached | Halt::CheckpointReached) => return Failure::ComputeCapExceeded,
         Some(Halt::ProofRejected(reason)) => return Failure::ProofRejected(reason.clone()),
+        Some(Halt::Unavailable(reason)) => return Failure::Unavailable(reason.clone()),
         _ => {}
     }
     Failure::Trapped(engine::trap_message(error))
@@ -947,6 +972,7 @@ fn call_model(state: &mut State, model: ContentHash, request: ModelRequest<'_>) 
         .map_err(|error| match error {
             ModelError::Unrunnable(reason) => Halt::Unrunnable(reason),
             ModelError::Rejected(reason) => Halt::ProofRejected(reason),
+            ModelError::Unavailable(reason) => Halt::Unavailable(reason),
         })?;
     charge(state, answer.tokens.saturating_mul(per_token))?;
     charge_for_bytes(state, answer.output.len())?;

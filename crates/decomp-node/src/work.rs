@@ -9,7 +9,7 @@ use decomp_sandbox::{Blobs, Job, Models, Sandbox};
 use decomp_schema::records::{self, Records};
 
 use crate::client::{Client, ClientError};
-use crate::models::{Generator, Replayer};
+use crate::models::{CallContext, Generator, Replayer};
 use crate::store;
 
 /// How often a node asks for work. Must stay well under the job board's
@@ -80,9 +80,12 @@ pub fn work(client: &Client, sandbox: &Sandbox, lease: &Lease) -> Result<Committ
     // transcript; a node after it replays the first node's transcript.
     let role = match lease.transcript {
         _ if manifest.models.is_empty() => Role::NoModels,
-        None => Role::Generate(Arc::new(Generator::default())),
+        None => Role::Generate(Arc::new(Generator::new(CallContext::new(client, lease)))),
         Some(root) => match serde_json::from_slice::<Transcript>(&fetch(root)?) {
-            Ok(transcript) => Role::Replay(Arc::new(Replayer::new(transcript))),
+            Ok(transcript) => Role::Replay(Arc::new(Replayer::new(
+                transcript,
+                CallContext::new(client, lease),
+            ))),
             Err(_) => {
                 let result = JobResult {
                     job_id: lease.job_id,
@@ -114,6 +117,11 @@ pub fn work(client: &Client, sandbox: &Sandbox, lease: &Lease) -> Result<Committ
         models: &manifest.models,
         model_host,
     });
+    // A model call this node could not answer, for a reason of its own, is no
+    // result: the lease lapses and the job is granted again.
+    if let Some(reason) = &finding.unavailable {
+        return Err(WorkError::Data(reason.clone()));
+    }
     let mut result = finding.result(lease.job_id);
     let mut transcript_bytes = None;
     match &role {

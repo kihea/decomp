@@ -27,6 +27,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+use crate::inference::StageRef;
+
 use crate::keys::{AccountId, ContentHash};
 use crate::ledger::Credits;
 
@@ -176,9 +178,14 @@ pub struct Hardware {
     pub memory_mb: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpus: Vec<Gpu>,
-    /// The approved models the device holds and can run, by ID.
+    /// The approved models the device holds and can run a job with, by ID:
+    /// whole, or, for a model cut into stages, its tokenizer and ends.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ContentHash>,
+    /// The stages of stored models the device holds and runs for other
+    /// nodes. Only a device other devices can reach is drawn for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<StageRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

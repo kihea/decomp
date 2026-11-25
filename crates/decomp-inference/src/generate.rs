@@ -5,7 +5,8 @@
 use decomp_core::inference::{MAX_GENERATED_TOKENS, Sampling, embedding_close, sample, sampled};
 use decomp_core::toploc::{self, CHUNK_TOKENS, Comparison, Proof};
 
-use crate::model::{Model, Step};
+use crate::model::Step;
+use crate::runner::Runner;
 
 /// What a model generated, and the proofs of it: one of the prompt, then one
 /// per `CHUNK_TOKENS` tokens.
@@ -28,6 +29,8 @@ pub enum Rejection {
     TooManyTokens,
     #[error("no proof could be made of a chunk")]
     Unprovable,
+    #[error("the model could not be run: {0}")]
+    Unavailable(String),
     #[error("the output is not as long as was asked for")]
     WrongLength,
     #[error("the proofs do not cover the prompt and every chunk of the output")]
@@ -43,49 +46,51 @@ pub enum Rejection {
     WrongEmbedding,
 }
 
-fn check_call(model: &Model, prompt: &[u32], max_tokens: u32) -> Result<(), Rejection> {
-    let config = &model.config;
+/// Whether a call fits the model: a prompt, within its vocabulary, and with
+/// the tokens to generate, within its length.
+pub fn fits(runner: &dyn Runner, prompt: &[u32], max_tokens: u32) -> Result<(), Rejection> {
     if prompt.is_empty() {
         return Err(Rejection::EmptyPrompt);
     }
     if max_tokens > MAX_GENERATED_TOKENS {
         return Err(Rejection::TooManyTokens);
     }
-    if prompt.len() + max_tokens as usize > config.positions {
+    if prompt.len() + max_tokens as usize > runner.positions() {
         return Err(Rejection::TooLong);
     }
-    if prompt.iter().any(|&t| t as usize >= config.vocab) {
+    if prompt.iter().any(|&t| t as usize >= runner.vocab()) {
         return Err(Rejection::UnknownToken);
     }
     Ok(())
 }
 
-/// Feeds the prompt, and returns the hidden states of its tokens, one after
-/// another, and the logits of the first token to generate.
-fn read_prompt(session: &mut crate::model::Session<'_>, prompt: &[u32]) -> (Vec<f32>, Vec<f32>) {
-    let mut hidden = Vec::new();
-    let mut logits = Vec::new();
-    for &token in prompt {
-        let Step {
-            hidden: h,
-            logits: l,
-        } = session.feed(token);
-        hidden.extend(h);
-        logits = l;
-    }
-    (hidden, logits)
+fn feed(runner: &mut dyn Runner, tokens: &[u32]) -> Result<Vec<Step>, Rejection> {
+    runner.feed(tokens).map_err(Rejection::Unavailable)
+}
+
+/// Feeds the prompt in one pass, and returns the hidden states of its tokens,
+/// one after another, and the logits of the first token to generate.
+fn read_prompt(runner: &mut dyn Runner, prompt: &[u32]) -> Result<(Vec<f32>, Vec<f32>), Rejection> {
+    let steps = feed(runner, prompt)?;
+    let logits = steps
+        .last()
+        .map(|step| step.logits.clone())
+        .unwrap_or_default();
+    Ok((
+        steps.into_iter().flat_map(|step| step.hidden).collect(),
+        logits,
+    ))
 }
 
 /// Generates `max_tokens` tokens after `prompt`, and proves them.
 pub fn generate(
-    model: &Model,
+    runner: &mut dyn Runner,
     prompt: &[u32],
     max_tokens: u32,
     sampling: &Sampling,
 ) -> Result<Generated, Rejection> {
-    check_call(model, prompt, max_tokens)?;
-    let mut session = model.session();
-    let (prompt_hidden, mut logits) = read_prompt(&mut session, prompt);
+    fits(runner, prompt, max_tokens)?;
+    let (prompt_hidden, mut logits) = read_prompt(runner, prompt)?;
     let mut proofs = vec![toploc::prove(&prompt_hidden).ok_or(Rejection::Unprovable)?];
     let mut tokens = Vec::with_capacity(max_tokens as usize);
     let mut chunk = Vec::new();
@@ -94,7 +99,9 @@ pub fn generate(
         tokens.push(token);
         // Each generated token is fed too, so that it has a hidden state to
         // prove, and the logits of the token after it.
-        let fed = session.feed(token);
+        let fed = feed(runner, &[token])?
+            .pop()
+            .ok_or_else(|| Rejection::Unavailable("no step came back".into()))?;
         chunk.extend(fed.hidden);
         logits = fed.logits;
         if tokens.len() % CHUNK_TOKENS == 0 || tokens.len() == max_tokens as usize {
@@ -112,26 +119,23 @@ pub fn proof_count(tokens: usize) -> usize {
 
 /// Checks another node's call: that its proofs hold of this model's own
 /// hidden states over the prompt and the output, and that each token is one
-/// the model could have sampled. One pass over the text, as a prompt is read.
+/// the model could have sampled. The prompt and the output are each read in
+/// one pass, which is what makes checking cheaper than generating.
 pub fn validate(
-    model: &Model,
+    runner: &mut dyn Runner,
     prompt: &[u32],
     max_tokens: u32,
     sampling: &Sampling,
     claimed: &Generated,
 ) -> Result<(), Rejection> {
-    check_call(model, prompt, max_tokens)?;
+    fits(runner, prompt, max_tokens)?;
     if claimed.tokens.len() != max_tokens as usize {
         return Err(Rejection::WrongLength);
     }
     if claimed.proofs.len() != proof_count(claimed.tokens.len()) {
         return Err(Rejection::WrongProofCount);
     }
-    if claimed
-        .tokens
-        .iter()
-        .any(|&t| t as usize >= model.config.vocab)
-    {
+    if claimed.tokens.iter().any(|&t| t as usize >= runner.vocab()) {
         return Err(Rejection::UnknownToken);
     }
     let check = |chunk: usize, hidden: &[f32]| {
@@ -142,17 +146,20 @@ pub fn validate(
             Err(Rejection::ProofFails { chunk, comparison })
         }
     };
-    let mut session = model.session();
-    let (prompt_hidden, mut logits) = read_prompt(&mut session, prompt);
+    let (prompt_hidden, first_logits) = read_prompt(runner, prompt)?;
     check(0, &prompt_hidden)?;
+    if claimed.tokens.is_empty() {
+        return Ok(());
+    }
+    let steps = feed(runner, &claimed.tokens)?;
+    let mut logits = &first_logits;
     let mut chunk = Vec::new();
-    for (step, &token) in claimed.tokens.iter().enumerate() {
-        if !sampled(&logits, sampling, step as u32, token) {
+    for (step, (&token, fed)) in claimed.tokens.iter().zip(&steps).enumerate() {
+        if !sampled(logits, sampling, step as u32, token) {
             return Err(Rejection::NotSampled { step });
         }
-        let fed = session.feed(token);
-        chunk.extend(fed.hidden);
-        logits = fed.logits;
+        chunk.extend_from_slice(&fed.hidden);
+        logits = &fed.logits;
         let done = step + 1;
         if done % CHUNK_TOKENS == 0 || done == claimed.tokens.len() {
             check(done.div_ceil(CHUNK_TOKENS), &chunk)?;
@@ -163,35 +170,41 @@ pub fn validate(
 }
 
 /// The mean of the last hidden states of `text`, and the proof of them.
-pub fn embed(model: &Model, text: &[u32]) -> Result<(Vec<f32>, Proof), Rejection> {
-    check_call(model, text, 0)?;
-    let mut session = model.session();
-    let (hidden, _) = read_prompt(&mut session, text);
+pub fn embed(runner: &mut dyn Runner, text: &[u32]) -> Result<(Vec<f32>, Proof), Rejection> {
+    fits(runner, text, 0)?;
+    let steps = feed(runner, text)?;
+    let hidden: Vec<f32> = steps
+        .iter()
+        .flat_map(|s| s.hidden.iter().copied())
+        .collect();
     let proof = toploc::prove(&hidden).ok_or(Rejection::Unprovable)?;
-    Ok((mean(&hidden, model.config.dim), proof))
+    Ok((mean(&steps), proof))
 }
 
-fn mean(hidden: &[f32], dim: usize) -> Vec<f32> {
-    let rows = (hidden.len() / dim) as f32;
-    let mut sum = vec![0.0; dim];
-    for row in hidden.chunks_exact(dim) {
-        for (s, v) in sum.iter_mut().zip(row) {
+fn mean(steps: &[Step]) -> Vec<f32> {
+    let width = steps.first().map_or(0, |s| s.hidden.len());
+    let mut sum = vec![0.0; width];
+    for step in steps {
+        for (s, v) in sum.iter_mut().zip(&step.hidden) {
             *s += v;
         }
     }
-    sum.iter().map(|s| s / rows).collect()
+    sum.iter().map(|s| s / steps.len() as f32).collect()
 }
 
 /// Checks another node's embedding of `text`, and its proof.
 pub fn validate_embedding(
-    model: &Model,
+    runner: &mut dyn Runner,
     text: &[u32],
     embedding: &[f32],
     proof: &Proof,
 ) -> Result<(), Rejection> {
-    check_call(model, text, 0)?;
-    let mut session = model.session();
-    let (hidden, _) = read_prompt(&mut session, text);
+    fits(runner, text, 0)?;
+    let steps = feed(runner, text)?;
+    let hidden: Vec<f32> = steps
+        .iter()
+        .flat_map(|s| s.hidden.iter().copied())
+        .collect();
     let comparison = toploc::compare(proof, &hidden);
     if !comparison.holds() {
         return Err(Rejection::ProofFails {
@@ -199,7 +212,7 @@ pub fn validate_embedding(
             comparison,
         });
     }
-    if !embedding_close(embedding, &mean(&hidden, model.config.dim)) {
+    if !embedding_close(embedding, &mean(&steps)) {
         return Err(Rejection::WrongEmbedding);
     }
     Ok(())

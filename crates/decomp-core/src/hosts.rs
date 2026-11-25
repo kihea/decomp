@@ -26,6 +26,13 @@ pub struct Hosts {
 }
 
 impl Hosts {
+    /// Where `node` is reached, if it said.
+    pub fn address(&self, node: &PublicKey) -> Option<String> {
+        self.last_seen
+            .get(node)
+            .map(|(host, _)| host.address.clone())
+    }
+
     /// Notes that a node checked in, and whether other devices can reach it.
     pub fn seen(&mut self, node: PublicKey, account: AccountId, address: Option<String>, now: u64) {
         match address {
