@@ -6,11 +6,11 @@ use decomp_core::LogError;
 use decomp_core::{
     AccountId, AccountOp, AccountStatus, Activity, AppManifest, Approval, Bid, BidOrder, Bids,
     Blob, BlobData, BlobRef, Call, CashOut, CashOutAsked, CashOuts, Challenge, ContentHash,
-    Credits, Directory, DrawPage, Envelope, Inclusion, IncomingChannels, JobId, JobResult,
-    JobStatus, LeasesGranted, Located, LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES, Manifest,
-    NameRecord, Placement, PublicKey, PublishedKey, Quote, Rates, Refusal, Request, Resolved,
-    Route, SealingKey, SettlementLog, ShardNow, SigningKey, Standing, Submitted, WorkPreferences,
-    seal,
+    Credits, Directory, DrawPage, Envelope, Hardware, Inclusion, IncomingChannels, JobId,
+    JobResult, JobStatus, LeasesGranted, Located, LogPage, MAX_LOG_PAGE, MAX_MESSAGE_BYTES,
+    Manifest, NameRecord, Placement, PublicKey, PublishedKey, Quote, Rates, Refusal, Request,
+    Resolved, Route, SealingKey, SettlementLog, ShardNow, SigningKey, Standing, Submitted,
+    WorkPreferences, seal,
 };
 use serde::de::{DeserializeOwned, IgnoredAny};
 
@@ -229,10 +229,31 @@ impl Client {
     /// results to reveal, blobs to take in, a storage challenge, and channels
     /// to carry. `address` is where other devices can connect to it, if they
     /// can.
-    pub fn request_lease(&self, address: Option<&str>) -> Result<LeasesGranted, ClientError> {
+    pub fn request_lease(
+        &self,
+        address: Option<&str>,
+        hardware: &Hardware,
+    ) -> Result<LeasesGranted, ClientError> {
         self.call(Call::RequestLease {
             address: address.map(String::from),
+            hardware: Some(hardware.clone()),
         })
+    }
+
+    /// Reports a measurement of another node's bandwidth this node was asked
+    /// to make.
+    pub fn report_probe(
+        &self,
+        seed: ContentHash,
+        millis: u64,
+        digest: ContentHash,
+    ) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::ReportProbe {
+            seed,
+            millis,
+            digest,
+        })?;
+        Ok(())
     }
 
     /// Commits to a result for a leased job.

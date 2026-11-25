@@ -680,6 +680,30 @@ out, as is pay held back for a spot check. So putting up stake, taking it back,
 and setting credits aside change no balance on the log. Paying for a job does,
 and so does a forfeit.
 
+## Node scores
+
+**Hardware fit is timed by the job board.** The spec confirms declared specs "by
+benchmark jobs". Known-answer jobs and audits already are such jobs: their
+compute is known before they run, and the node cannot tell them from others.
+The job board times each from the lease to the commitment, which includes
+fetching the job's data, and scores the pace against one unit a second
+(`REFERENCE_UNITS_PER_SEC`). No time a node reports for itself is used.
+
+**Declared hardware bounds slots and opens inference.** The agent reads cores
+and memory from the system and sends them with each request for work. A node
+is offered no more slots than its hardware runs, one per core and 512 MB each,
+and only a node that declares a GPU is offered inference jobs. GPUs are
+declared once the agent can run inference on them.
+
+**Bandwidth is measured by other nodes.** "Timed transfers of dummy files": a
+node that holds data is asked about once an hour to fetch 1 MiB of test data
+from a node of another account that holds data. The data is made from a seed
+the job board chose, so it cannot be served from a cache, and the measuring
+node must report its hash, so it cannot report a transfer it did not make. The
+time is still its word; it is one measurement in a moving average, made by a
+node drawn at random. Bandwidth weighs only in the draw for data jobs, the
+spec's "data-heavy jobs".
+
 ## Hashes, not data
 
 Spec, "Two rules shape the control plane": "Canisters hold records, hashes, and

@@ -47,12 +47,9 @@ const RECOVERY_FILE: &str = "recovery";
 /// How often `submit` asks whether its job has finished.
 const JOB_POLL: Duration = Duration::from_secs(1);
 
-/// The largest private job, in compute units, that `submit` takes to fit this
-/// device and so runs here (spec section 7: the local route is taken when "the
-/// job fits the user's device"). What a device can do is its hardware-fit score,
-/// which nothing measures yet. Until it is, a device is taken to fit what the
-/// spec says any device can run: tier 0, a job of one unit.
-const LOCAL_ROUTE_MAX_UNITS: u64 = 1;
+/// The size of job any device can run, the spec's tier 0 job of one unit. A
+/// private job this small fits this device whatever its measured pace.
+const ANY_DEVICE_UNITS: u64 = 1;
 
 #[derive(Parser)]
 #[command(name = "decomp-node", about = "The DeComp node agent", version)]
@@ -1035,8 +1032,8 @@ fn show_account(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
         standing.max_tier
     );
     println!(
-        "         reliability {:.3}, availability {:.3}",
-        standing.reliability, standing.availability
+        "         reliability {:.3}, availability {:.3}, hardware fit {:.3}, bandwidth {:.3}",
+        standing.reliability, standing.availability, standing.fit, standing.bandwidth
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -1266,8 +1263,14 @@ fn submit(
             let message = "a private job cannot be handed state, split by byte count, or given credits for follow-up jobs";
             return Err(message.into());
         }
-        // A private job takes "the first route that fits" (spec section 7).
-        let fits_device = job.compute_cap <= LOCAL_ROUTE_MAX_UNITS;
+        // A private job takes "the first route that fits" (spec section 7). It
+        // fits this device if, at the pace the job board measured for it
+        // (its hardware fit), it finishes before its deadline.
+        let pace = client.standing().map_or(0.0, |standing| {
+            standing.fit * decomp_core::REFERENCE_UNITS_PER_SEC
+        });
+        let fits_device = job.compute_cap <= ANY_DEVICE_UNITS
+            || job.compute_cap as f64 <= pace * limits.deadline_secs as f64;
         return match privacy::route(&signature, job.compute_cap, fits_device)? {
             PrivateRoute::Local => run_here(&sandbox, dir, &job, &files),
             PrivateRoute::PrivateTotals => submit_shares(client, &job, files, &signature, limits),

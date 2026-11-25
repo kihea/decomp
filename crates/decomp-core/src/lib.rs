@@ -18,6 +18,7 @@ mod ledger;
 pub mod market;
 pub mod merkle;
 pub mod privacy;
+pub mod probe;
 pub mod records;
 pub mod registry;
 mod relay;
@@ -66,11 +67,13 @@ pub use ledger::{
     STARTER_GRANT, compute_fee,
 };
 pub use market::{
-    AccountStanding, Bid, BidError, BidOrder, JobClass, LeasePrice, Price, Rate, WorkPreferences,
+    AccountStanding, Bid, BidError, BidOrder, Gpu, Hardware, JobClass, LeasePrice, Price, Rate,
+    SLOT_MEMORY_MB, WorkPreferences,
 };
 pub use privacy::{
     ENCRYPTED_COMPUTE_MAX_UNITS, NoPrivateRoute, Privacy, PrivacyError, PrivateRoute,
 };
+pub use probe::{PROBE_BYTES, PROBE_INTERVAL_SECS, PROBE_PATH, PROBE_TIMEOUT_SECS, Probe};
 pub use records::{Record, RecordError, Records};
 pub use registry::{NAME_DEPOSIT, NameError, NameRecord, Registry, RegistryEntry};
 pub use relay::{
@@ -84,7 +87,7 @@ pub use request::{
     PublishedKey, Quote, Rates, RecordList, Refusal, Request, Resolved, ShardNow, Submitted,
     ValueKey,
 };
-pub use scores::{Conduct, Penalty, ScoreEvent, Scores, Standing};
+pub use scores::{Conduct, Penalty, REFERENCE_UNITS_PER_SEC, ScoreEvent, Scores, Standing};
 pub use seal::{SEAL_OVERHEAD_BYTES, SealingKeys};
 pub use settlement::{
     BATCH_PERIOD_SECS, Batch, Change, DrawPage, Inclusion, LogEntry, LogError, LogPage,

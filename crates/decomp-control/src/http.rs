@@ -21,7 +21,8 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::state::{
-    ControlPlane, InclusionError, OpenRelayError, RegistryError, StoreError, SubmitError,
+    ControlPlane, InclusionError, OpenRelayError, ProbeError, RegistryError, StoreError,
+    SubmitError,
 };
 
 /// An HTTP status.
@@ -250,11 +251,19 @@ fn answer(
             Json(control.status(account.clone())).into_response()
         }
         Call::GetStanding => Json(control.standing(&signer, &account.id)).into_response(),
-        Call::RequestLease { address } => {
+        Call::RequestLease { address, hardware } => {
             if let Some(address) = &address {
                 check_address(address)?;
             }
-            Json(control.request_lease(signer, account.id, address, now)).into_response()
+            Json(control.request_lease(signer, account.id, address, hardware, now)).into_response()
+        }
+        Call::ReportProbe {
+            seed,
+            millis,
+            digest,
+        } => {
+            control.report_probe(&signer, seed, millis, digest, now)?;
+            Json(json!({})).into_response()
         }
         Call::CommitResult { job_id, commitment } => {
             control.commit_result(signer, job_id, commitment, now)?;
@@ -724,6 +733,18 @@ impl From<OpenRelayError> for ApiError {
             OpenRelayError::Ledger(inner) => inner.into(),
             OpenRelayError::UnknownDevice => {
                 Self::new(StatusCode::NOT_FOUND, "unknown_device", message)
+            }
+        }
+    }
+}
+
+impl From<ProbeError> for ApiError {
+    fn from(error: ProbeError) -> Self {
+        let message = error.to_string();
+        match error {
+            ProbeError::NotAsked => Self::new(StatusCode::NOT_FOUND, "unknown_probe", message),
+            ProbeError::WrongData => {
+                Self::new(StatusCode::BAD_REQUEST, "wrong_probe_data", message)
             }
         }
     }

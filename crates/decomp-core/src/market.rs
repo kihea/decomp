@@ -161,6 +161,37 @@ pub struct WorkPreferences {
 /// The most slots a device may offer.
 pub const MAX_SLOTS: u32 = 256;
 
+/// The memory one slot needs, in megabytes (spec section 1, "Slots": "a
+/// sandbox with 1 CPU core, 512 MB of memory").
+pub const SLOT_MEMORY_MB: u64 = 512;
+
+/// What a device says its hardware is (spec section 1, "Node profile":
+/// hardware fit is measured by "declared specs, confirmed by benchmark jobs").
+/// The agent reads it from the system. It bounds the slots a device is offered,
+/// and only a device with a GPU is offered inference jobs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hardware {
+    pub cores: u32,
+    pub memory_mb: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<Gpu>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gpu {
+    pub name: String,
+    pub memory_mb: u64,
+}
+
+impl Hardware {
+    /// How many slots the hardware can run at once: one per core, as far as
+    /// memory goes.
+    pub fn slots(&self) -> u32 {
+        let by_memory = self.memory_mb / SLOT_MEMORY_MB;
+        self.cores.min(u32::try_from(by_memory).unwrap_or(u32::MAX))
+    }
+}
+
 impl Default for WorkPreferences {
     /// Everything the node is eligible for, at any rate, one slot, on mains
     /// power and unmetered networks only. This is what the automatic

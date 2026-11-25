@@ -1,6 +1,7 @@
 //! The web server other devices reach a node through: for the blobs it holds and
 //! the channels it relays. Only a node that other devices can connect to runs one.
 
+use decomp_core::{ContentHash, PROBE_BYTES, PROBE_PATH, probe};
 use std::io::{self, Read};
 use std::sync::Arc;
 use std::thread;
@@ -49,6 +50,26 @@ pub(crate) fn respond<R: Read>(request: Request, response: Response<R>) -> io::R
     request.respond(response)
 }
 
+/// Serves test data for a bandwidth measurement: `<seed>/<bytes>`, at most
+/// `PROBE_BYTES` of it.
+fn serve_probe(path: &str, request: Request) -> io::Result<()> {
+    let asked = path.split_once('/').and_then(|(seed, bytes)| {
+        let seed = seed.parse::<ContentHash>().ok()?;
+        let bytes = bytes
+            .parse::<u64>()
+            .ok()
+            .filter(|bytes| *bytes <= PROBE_BYTES)?;
+        Some((seed, bytes))
+    });
+    match asked {
+        Some((seed, bytes)) => respond(request, Response::from_data(probe::data(&seed, bytes))),
+        None => respond(
+            request,
+            Response::from_string("not a measurement").with_status_code(400),
+        ),
+    }
+}
+
 fn route(store: &Store, relay: &Relay, request: Request) -> io::Result<()> {
     // A browser asks first whether a page may make the request it is about to.
     if *request.method() == Method::Options {
@@ -59,6 +80,8 @@ fn route(store: &Store, relay: &Relay, request: Request) -> io::Result<()> {
         store::answer(store, path, request)
     } else if let Some(path) = url.strip_prefix(relay::CHANNEL_PATH) {
         relay::answer(relay, path, request)
+    } else if let Some(path) = url.strip_prefix(PROBE_PATH) {
+        serve_probe(path, request)
     } else {
         respond(
             request,

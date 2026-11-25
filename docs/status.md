@@ -27,7 +27,7 @@ Last updated 2026-11-21.
 | Commit and reveal; verification that follows supply | Available | `opportunistic`, `required`, and `none`; every receipt states its level |
 | Disputes, known-answer jobs, spot-check audits, holdback | Available | A dispute is settled by further nodes drawn at random, which run the job again; the first result two nodes report stands. Checkpoints are taken once per compute unit |
 | Splitting, tiers, follow-up jobs | Available | |
-| Node scores | In development | Reliability and availability are kept; bandwidth and hardware-fit scores are not yet measured |
+| Node scores | Available | Reliability, availability, hardware fit (known-answer jobs and audits timed by the job board, with declared cores, memory, and GPUs), and bandwidth (timed transfers of test data between nodes). GPUs are declared once the agent runs inference |
 | Always-on fallback | Available | The module runs in the control canister, on data the submitter left there |
 | Inference class with TOPLOC | Not started | Needs the approved model list and a runtime for it, and GPU nodes |
 | Attested nodes (Intel TDX, AMD SEV-SNP) | Not started | Needs nodes on that hardware |

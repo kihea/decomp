@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use decomp_core::{Blob, Challenge, JobId, LeasesGranted, WorkPreferences, merkle};
+use decomp_core::{Blob, Challenge, Hardware, JobId, LeasesGranted, WorkPreferences, merkle};
 use decomp_node::client::{Client, ClientError, unix_now};
 use decomp_node::relay::Relay;
 use decomp_node::schedule::{Conditions, Event, Worker, may_work};
@@ -109,6 +109,7 @@ pub fn start(
     };
 
     let worker = Worker::new(Arc::clone(&client), Arc::new(Sandbox::new()));
+    let hardware = decomp_node::hardware::read();
     let mut preferences: Option<(Instant, WorkPreferences)> = None;
     loop {
         let stale = preferences
@@ -128,7 +129,7 @@ pub fn start(
         let pause = if !allowed && !worker.has_unrevealed() && worker.running() == 0 {
             IDLE_POLL
         } else {
-            match turn(&client, &worker, &store, &relay, address) {
+            match turn(&client, &worker, &store, &relay, address, &hardware) {
                 Ok(()) => IDLE_POLL,
                 // Removed from its account: there is no more work for this key.
                 Err(error) if error.is("device_revoked") || error.is("not_linked") => {
@@ -154,10 +155,17 @@ fn turn(
     store: &Store,
     relay: &Relay,
     address: Option<&str>,
+    hardware: &Hardware,
 ) -> Result<(), ClientError> {
-    let granted: LeasesGranted = client.request_lease(address)?;
+    let granted: LeasesGranted = client.request_lease(address, hardware)?;
     let now = unix_now();
     worker.handle(&granted);
+    if let Some(probe) = &granted.probe {
+        match decomp_node::measure(probe) {
+            Ok((millis, digest)) => client.report_probe(probe.seed, millis, digest)?,
+            Err(reason) => eprintln!("could not measure {}: {reason}", probe.target),
+        }
+    }
 
     store.delete_expired(now);
     for root in &granted.drop {

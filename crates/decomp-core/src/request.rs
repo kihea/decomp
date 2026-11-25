@@ -12,7 +12,8 @@ use crate::envelope::Envelope;
 use crate::job::{JobResult, Lease, Manifest};
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, SealingKey};
 use crate::ledger::{Balance, CashOut, Credits};
-use crate::market::{Bid, BidOrder, Rate, WorkPreferences};
+use crate::market::{Bid, BidOrder, Hardware, Rate, WorkPreferences};
+use crate::probe::Probe;
 use crate::records::Record;
 use crate::registry::NameRecord;
 use crate::relay::{Incoming, RelayOrder};
@@ -103,6 +104,17 @@ pub enum Call {
     RequestLease {
         #[serde(default)]
         address: Option<String>,
+        /// The device's hardware, as the agent read it.
+        #[serde(default)]
+        hardware: Option<Hardware>,
+    },
+    /// A node reporting a measurement it was asked to make (see `probe`):
+    /// how long fetching the test data took, and the data's hash. Answer: an
+    /// empty object.
+    ReportProbe {
+        seed: ContentHash,
+        millis: u64,
+        digest: ContentHash,
     },
     /// A node committing the hash of its result for a job it holds a lease on
     /// (see `JobResult::commitment`). Answer: an empty object.
@@ -333,6 +345,9 @@ pub struct LeasesGranted {
     /// The open channels the node is asked to carry.
     #[serde(default)]
     pub relay: Vec<RelayOrder>,
+    /// A measurement of another node's bandwidth to make.
+    #[serde(default)]
+    pub probe: Option<Probe>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

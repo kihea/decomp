@@ -40,9 +40,12 @@ use decomp_core::{
     Standings, StateEntry, States, Storage, StorageEntry, StorageError, Storing, Through,
     WorkPreferences, channel_id, draw_hash, merkle, privacy, settlement,
 };
+use decomp_core::{
+    Hardware, Host, PROBE_BYTES, PROBE_INTERVAL_SECS, PROBE_TIMEOUT_SECS, Probe, probe,
+};
 use decomp_schema::records::{self, Records};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +65,15 @@ pub enum StoreError {
     NotLeased,
     #[error("nobody pays for this job's blobs")]
     NoPayer,
+}
+
+/// Why a measurement was not taken in.
+#[derive(Debug, thiserror::Error)]
+pub enum ProbeError {
+    #[error("this node was not asked to make that measurement, or was asked too long ago")]
+    NotAsked,
+    #[error("the hash is not that of the test data")]
+    WrongData,
 }
 
 /// Why a channel was not opened.
@@ -237,6 +249,10 @@ pub struct ControlPlane {
     activity: Vec<ActivityEntry>,
     /// The nodes other devices can connect to, which hold and relay data.
     hosts: Hosts,
+    /// The measurement each node has been asked to make and not reported,
+    /// with when it was asked, and when each node was last asked.
+    probes: HashMap<PublicKey, (Probe, u64)>,
+    probed_at: HashMap<PublicKey, u64>,
     storage: Storage,
     storage_log: Log,
     relays: Relays,
@@ -434,6 +450,8 @@ impl ControlPlane {
             fall_backs: Vec::new(),
             activity,
             hosts: Hosts::default(),
+            probes: HashMap::new(),
+            probed_at: HashMap::new(),
             storage,
             storage_log,
             relays,
@@ -700,9 +718,15 @@ impl ControlPlane {
         node: PublicKey,
         account: AccountId,
         address: Option<String>,
+        hardware: Option<Hardware>,
         now: u64,
     ) -> LeasesGranted {
+        let serves_data = address.is_some();
         self.hosts.seen(node, account, address, now);
+        if let Some(hardware) = hardware {
+            self.jobs.declare_hardware(node, hardware);
+        }
+        let probe = self.probe_for(node, account, serves_data, now);
         let interval = self.challenge_interval;
         let mut jobs = std::mem::take(&mut self.jobs);
         // The closures below borrow the rest of the control plane, so the
@@ -737,7 +761,87 @@ impl ControlPlane {
                 .storage
                 .challenge_for(node, now, interval, &mut self.rng),
             relay: self.relays.orders_for(&node, now),
+            probe,
         }
+    }
+
+    /// A measurement of another node's bandwidth for `node` to make, if it is
+    /// due one: once every `PROBE_INTERVAL_SECS`, of a node of another account
+    /// that serves data, drawn at random. Only nodes that serve data measure,
+    /// since only they are known to be reachable and so to be measuring well.
+    fn probe_for(
+        &mut self,
+        node: PublicKey,
+        account: AccountId,
+        serves_data: bool,
+        now: u64,
+    ) -> Option<Probe> {
+        self.probes
+            .retain(|_, (_, asked)| now.saturating_sub(*asked) <= PROBE_TIMEOUT_SECS);
+        if let Some((probe, _)) = self.probes.get(&node) {
+            return Some(probe.clone());
+        }
+        let due = self
+            .probed_at
+            .get(&node)
+            .is_none_or(|at| now.saturating_sub(*at) >= PROBE_INTERVAL_SECS);
+        if !serves_data || !due {
+            return None;
+        }
+        let targets: Vec<Host> = self
+            .hosts
+            .online(now)
+            .into_iter()
+            .filter(|host| host.account != account)
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        let target = &targets[self.rng.random_range(0..targets.len())];
+        let probe = Probe {
+            seed: ContentHash::from_bytes(self.rng.random()),
+            target: target.node,
+            address: target.address.clone(),
+            bytes: PROBE_BYTES,
+        };
+        self.probed_at.insert(node, now);
+        self.probes.insert(node, (probe.clone(), now));
+        Some(probe)
+    }
+
+    /// Takes in a measurement `node` was asked to make: if the data's hash
+    /// shows it fetched the test data, the time counts toward the measured
+    /// node's bandwidth.
+    pub fn report_probe(
+        &mut self,
+        node: &PublicKey,
+        seed: ContentHash,
+        millis: u64,
+        digest: ContentHash,
+        now: u64,
+    ) -> Result<(), ProbeError> {
+        let Some((probe, _)) = self
+            .probes
+            .get(node)
+            .filter(|(probe, _)| probe.seed == seed)
+        else {
+            return Err(ProbeError::NotAsked);
+        };
+        if ContentHash::of(&probe::data(&probe.seed, probe.bytes)) != digest {
+            return Err(ProbeError::WrongData);
+        }
+        let event = ScoreEvent {
+            node: probe.target,
+            at: now,
+            what: Conduct::Transferred {
+                bytes: probe.bytes,
+                millis,
+            },
+        };
+        self.probes.remove(node);
+        self.scores.apply(&event);
+        self.scores_log.append(&event);
+        Ok(())
     }
 
     /// What a job would cost if it were submitted now.

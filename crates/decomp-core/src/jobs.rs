@@ -42,7 +42,7 @@ use crate::job::{
 use crate::keys::{AccountId, ContentHash, JobId, PublicKey, ShareSet};
 use crate::ledger::{Credits, FeeSplit, HOLDBACK_PERCENT, HOLDBACK_SECS, Payout, compute_fee};
 use crate::market::{
-    AccountStanding, Bid, BidError, BidOrder, JobClass, LeasePrice, MARKET_FIRST_TIER,
+    AccountStanding, Bid, BidError, BidOrder, Hardware, JobClass, LeasePrice, MARKET_FIRST_TIER,
     MAX_BIDS_PER_ACCOUNT, PREMIUM_SCALE, Rate, Rates, SHARE_CAP_MIN_ACCOUNTS, Shares,
     WorkPreferences, fallback_rate, share_cap_ppm, taper,
 };
@@ -270,6 +270,10 @@ struct Held {
     proven: bool,
     /// The node was drawn to settle a dispute.
     referee: bool,
+    /// When the lease was granted and when the node committed, which time a
+    /// job whose compute is known as a measure of the node's hardware.
+    granted_at: u64,
+    committed_at: u64,
     commitment: Option<ContentHash>,
     revealed: Option<(JobResult, Envelope)>,
 }
@@ -290,6 +294,8 @@ pub struct Jobs {
     open: VecDeque<JobId>,
     nodes: HashMap<PublicKey, Node>,
     preferences: HashMap<PublicKey, WorkPreferences>,
+    /// What each node says its hardware is.
+    hardware: HashMap<PublicKey, Hardware>,
     bids: BTreeMap<ContentHash, Bid>,
     rates: Rates,
     shares: Shares,
@@ -374,6 +380,11 @@ impl Jobs {
         }
         self.preferences.insert(device, preferences);
         Ok(())
+    }
+
+    /// Notes what a node says its hardware is.
+    pub fn declare_hardware(&mut self, node: PublicKey, hardware: Hardware) {
+        self.hardware.insert(node, hardware);
     }
 
     /// A device's work preferences: what it stored, or the recommended default.
@@ -504,6 +515,7 @@ impl Jobs {
             return Err(JobError::AlreadyCommitted);
         }
         held.commitment = Some(commitment);
+        held.committed_at = now;
         self.events.push(ScoreEvent {
             node,
             at: now,
@@ -895,6 +907,21 @@ impl Jobs {
                     job_id,
                     ..expected.result.clone()
                 };
+            // The job's compute is known, so how long the node took to commit
+            // measures its hardware (spec section 1, "confirmed by benchmark
+            // jobs").
+            if passed {
+                let held = &job.leases[0];
+                let seconds = held.committed_at.saturating_sub(held.granted_at).max(1);
+                self.events.push(ScoreEvent {
+                    node,
+                    at: now,
+                    what: Conduct::Benchmarked {
+                        units: found.units,
+                        millis: seconds * 1000,
+                    },
+                });
+            }
             match (&job.kind, passed) {
                 (Kind::KnownAnswer { .. }, _) => {
                     let what = if passed {
@@ -1224,7 +1251,12 @@ impl Jobs {
             })
             .map(|job| job.manifest.slots)
             .sum();
-        self.preferences(node).slots.saturating_sub(used)
+        // A node offers no more slots than its hardware runs.
+        let offered = match self.hardware.get(node) {
+            Some(hardware) => self.preferences(node).slots.min(hardware.slots()),
+            None => self.preferences(node).slots,
+        };
+        offered.saturating_sub(used)
     }
 
     /// Grants a lease on each open job that needs one, to a node drawn from the
@@ -1335,6 +1367,15 @@ impl Jobs {
                 if !may_take(&standing, &job.manifest, job.rate) {
                     continue;
                 }
+                // Inference runs on a GPU (spec section 2), so only a node that
+                // has one is offered it.
+                let has_gpu = self
+                    .hardware
+                    .get(key)
+                    .is_some_and(|hardware| !hardware.gpus.is_empty());
+                if class == JobClass::Inference && !has_gpu {
+                    continue;
+                }
                 let account_standing = (standings.account)(account);
                 let cap = share_cap_ppm(&account_standing, now);
                 let share = shares.get(account).copied().unwrap_or(0);
@@ -1348,7 +1389,7 @@ impl Jobs {
                 };
                 let eligible = Eligible {
                     node: *key,
-                    weight: (standing.weight() * WEIGHT_SCALE).round() as u64,
+                    weight: (standing.weight(class) * WEIGHT_SCALE).round() as u64,
                     balanced: account_standing.balanced,
                 };
                 let preferences = self.preferences(key);
@@ -1449,6 +1490,8 @@ impl Jobs {
                 expires_at: (now + LEASE_SECS).min(job.manifest.deadline),
                 proven,
                 referee: job.refereeing.is_some(),
+                granted_at: now,
+                committed_at: 0,
                 commitment: None,
                 revealed: None,
             });
@@ -1519,6 +1562,8 @@ impl Jobs {
             expires_at: now + CHECK_DEADLINE_SECS,
             proven: true,
             referee: false,
+            granted_at: now,
+            committed_at: 0,
             commitment: None,
             revealed: None,
         });
