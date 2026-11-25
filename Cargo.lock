@@ -998,6 +998,8 @@ name = "decomp-replica"
 version = "0.1.0"
 dependencies = [
  "candid",
+ "decomp-core",
+ "decomp-node",
  "pocket-ic",
  "serde",
  "ureq",

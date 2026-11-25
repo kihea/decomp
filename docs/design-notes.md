@@ -680,6 +680,23 @@ out, as is pay held back for a spot check. So putting up stake, taking it back,
 and setting credits aside change no balance on the log. Paying for a job does,
 and so does a forfeit.
 
+## Control-plane throughput
+
+**The job board is split once measurement calls for it.** The spec runs the
+job board on "ICP canisters, split by job class and tier", and lists
+control-plane throughput as an open question: "split the job board across
+subnets; measure the ceiling in testing". Splitting makes every lease, escrow,
+and payout an asynchronous call between canisters, which costs seconds and
+cycles on every job, so it waits on a measurement. `decomp-load` takes it.
+
+On a local replica, 2026-11-25, with three nodes of one slot each running a
+one-unit job twice: the control canister took about 6 jobs a second, from 6
+clients and from 12 alike, and spent about 0.4 billion cycles a job,
+counting its timers and the nodes' requests. Settling ran at about 0.6 jobs a
+second, bound by the three nodes. Taking jobs is bound by update calls to one
+canister, so the split, or the spec's batching of leases and results, is what
+raises that ceiling when real load nears it.
+
 ## Node scores
 
 **Hardware fit is timed by the job board.** The spec confirms declared specs "by

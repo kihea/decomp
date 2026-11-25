@@ -6,6 +6,8 @@ description = "Runs the control-plane canisters on a local Internet Computer rep
 
 [dependencies]
 candid = "0.10.41"
+decomp-core = { version = "0.1.0", path = "../decomp-core" }
+decomp-node = { version = "0.1.0", path = "../decomp-node" }
 # The client must match the PocketIC server it drives; dfx 0.32 ships server 13.
 pocket-ic = "=13.0.0"
 serde = { version = "1.0.229", features = ["derive"] }

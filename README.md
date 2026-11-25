@@ -103,6 +103,16 @@ address; where `*.localhost` names do not resolve, use the gateway's form,
 `http://localhost:4943?canisterId=<canister id>`. Rebuilding the canister
 upgrades it in place, and its state is kept.
 
+### Measuring throughput
+
+`decomp-load` makes accounts, has them submit jobs at once to the control
+canister on a local replica, and reports how many jobs a second it took and
+settled, how long jobs took, and the cycles the canister spent on each:
+
+```bash
+DECOMP_CONTROL_URL="http://localhost:4943?canisterId=<canister id>"   cargo run --release -p decomp-replica --bin decomp-load -- module.wasm --jobs 200 --accounts 10
+```
+
 ### Devnet settings
 
 | Variable | Default | Meaning |
