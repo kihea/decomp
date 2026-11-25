@@ -11,7 +11,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::amount;
 use crate::keys::{AccountId, ContentHash, JobId};
+use crate::token::{IcrcAccount, Tokens, Withdrawal};
 
 /// An amount of credits, held as millionths of a credit so that fee shares are
 /// exact. On the wire it is that whole number.
@@ -19,7 +21,9 @@ use crate::keys::{AccountId, ContentHash, JobId};
 #[serde(transparent)]
 pub struct Credits(u64);
 
-const MICROS_PER_CREDIT: u64 = 1_000_000;
+/// The decimal places of a credit: amounts are held in millionths.
+const CREDIT_DECIMALS: u32 = 6;
+const MICROS_PER_CREDIT: u64 = 10u64.pow(CREDIT_DECIMALS);
 
 /// What a new account is given so its owner can use apps at once.
 pub const STARTER_GRANT: Credits = Credits::whole(25);
@@ -89,12 +93,8 @@ impl Sub for Credits {
 
 impl fmt::Display for Credits {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // At least two decimals, and as many more as it takes to show every
-        // microcredit: small fees are worth reading exactly.
-        let (whole, micros) = (self.0 / MICROS_PER_CREDIT, self.0 % MICROS_PER_CREDIT);
-        let fraction = format!("{micros:06}");
-        let fraction = fraction.trim_end_matches('0');
-        write!(f, "{whole}.{fraction:0<2}")
+        // Small fees are worth reading exactly.
+        f.write_str(&amount::format(self.0, CREDIT_DECIMALS))
     }
 }
 
@@ -103,18 +103,9 @@ impl FromStr for Credits {
     type Err = &'static str;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        const INVALID: &str = "an amount of credits looks like 12 or 12.5";
-        let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
-        if fraction.len() > 6 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(INVALID);
-        }
-        let whole: u64 = whole.parse().map_err(|_| INVALID)?;
-        let micros: u64 = format!("{fraction:0<6}").parse().map_err(|_| INVALID)?;
-        whole
-            .checked_mul(MICROS_PER_CREDIT)
-            .and_then(|whole| whole.checked_add(micros))
+        amount::parse(text, CREDIT_DECIMALS)
             .map(Self)
-            .ok_or(INVALID)
+            .ok_or("an amount of credits looks like 12 or 12.5")
     }
 }
 
@@ -184,8 +175,10 @@ pub struct Payout {
 /// An account's credits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Balance {
-    /// Starter credits. They can be spent but never staked, transferred, or cashed
-    /// out, which limits what farming new accounts can earn.
+    /// Credits that can be spent but never staked, transferred, or cashed out:
+    /// the starter grant, which limits what farming new accounts can earn, and
+    /// credits made by burning tokens, which are for compute and not a way to
+    /// turn tokens into money.
     pub granted: Credits,
     /// Credits the account earned or bought. The spec sets granted credits
     /// apart and no others, so the two are counted together.
@@ -302,6 +295,45 @@ pub enum LedgerEntry {
     CashOutPaid { id: ContentHash, payout: String },
     /// Closes a cash-out that was refused: its credits go back to the account.
     CashOutRefused { id: ContentHash },
+    /// Creates the token's whole supply in the treasury. Only one entry of a
+    /// ledger may create tokens.
+    MintTokens { amount: Tokens },
+    /// Moves tokens to `to`, from the account `from`, or from the treasury
+    /// when `from` is left out.
+    TransferTokens {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<AccountId>,
+        to: AccountId,
+        amount: Tokens,
+    },
+    /// Destroys an account's tokens and gives it `credits` for them, which it
+    /// can spend but not transfer or cash out.
+    BurnTokens {
+        account: AccountId,
+        amount: Tokens,
+        credits: Credits,
+    },
+    /// Sets an account's tokens aside to be minted as copies on the ICRC
+    /// ledger, to the ICRC account `to`. `id` names the withdrawal.
+    WithdrawTokens {
+        id: ContentHash,
+        account: AccountId,
+        amount: Tokens,
+        to: IcrcAccount,
+        at: u64,
+    },
+    /// The copies were minted, in block `block` of the ICRC ledger: the tokens
+    /// set aside move to the bridge pool, which backs every copy.
+    TokensWithdrawn { id: ContentHash, block: u64 },
+    /// The copies could not be minted: the tokens set aside go back.
+    WithdrawalFailed { id: ContentHash },
+    /// Copies burned on the ICRC ledger in block `block` come back to `account`
+    /// as tokens, out of the bridge pool. A block is credited once.
+    TokensDeposited {
+        account: AccountId,
+        amount: Tokens,
+        block: u64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -334,6 +366,22 @@ pub enum LedgerError {
     CashOutExists,
     #[error("no such cash-out is waiting")]
     UnknownCashOut,
+    #[error("the token's supply has already been created")]
+    SupplyCreated,
+    #[error("the account, or the treasury, has fewer tokens than that")]
+    InsufficientTokens,
+    #[error("an amount of tokens must be more than nothing")]
+    NoTokens,
+    #[error("the ICRC account is not a principal and an optional subaccount")]
+    BadIcrcAccount,
+    #[error("this withdrawal has already been asked for")]
+    WithdrawalExists,
+    #[error("no such withdrawal is waiting")]
+    UnknownWithdrawal,
+    #[error("this ICRC block has already been credited")]
+    DepositCredited,
+    #[error("the bridge pool holds fewer tokens than the deposit")]
+    BridgeShort,
 }
 
 struct Escrow {
@@ -356,6 +404,8 @@ pub enum Holder {
     /// Pays spot checkers and known-answer jobs (spec section 5, "Fee split").
     VerificationFund,
     Treasury,
+    /// Holds a token for every copy on the ICRC ledger. It holds no credits.
+    Bridge,
 }
 
 /// Every balance, plus the credits set aside for jobs that are still open.
@@ -375,6 +425,18 @@ pub struct Ledger {
     holdbacks: HashMap<JobId, Vec<(AccountId, Credits)>>,
     verification_fund: Credits,
     treasury: Credits,
+    /// Each account's tokens.
+    tokens: HashMap<AccountId, Tokens>,
+    /// The treasury's tokens: the supply not yet given out.
+    treasury_tokens: Tokens,
+    /// Tokens that back the copies on the ICRC ledger.
+    bridged: Tokens,
+    /// Whether the token's supply has been created.
+    supply_created: bool,
+    /// Withdrawals that wait for their copies to be minted, by their names.
+    withdrawals: BTreeMap<ContentHash, Withdrawal>,
+    /// The ICRC blocks whose burns have been credited, so none is twice.
+    deposits: HashSet<u64>,
 }
 
 impl Ledger {
@@ -410,6 +472,39 @@ impl Ledger {
         holdings.insert(Holder::VerificationFund, self.verification_fund);
         holdings.insert(Holder::Treasury, self.treasury);
         holdings
+    }
+
+    /// An account's tokens, not counting any it is withdrawing.
+    pub fn tokens(&self, account: &AccountId) -> Tokens {
+        self.tokens.get(account).copied().unwrap_or_default()
+    }
+
+    /// Whether the token's supply has been created.
+    pub fn supply_created(&self) -> bool {
+        self.supply_created
+    }
+
+    /// The tokens every holder has: an account's own and those it is
+    /// withdrawing, the treasury's, and the bridge pool's.
+    pub fn token_holdings(&self) -> BTreeMap<Holder, Tokens> {
+        let mut holdings: BTreeMap<Holder, Tokens> = self
+            .tokens
+            .iter()
+            .map(|(account, tokens)| (Holder::Account(*account), *tokens))
+            .collect();
+        for withdrawal in self.withdrawals.values() {
+            *holdings
+                .entry(Holder::Account(withdrawal.account))
+                .or_default() += withdrawal.amount;
+        }
+        holdings.insert(Holder::Treasury, self.treasury_tokens);
+        holdings.insert(Holder::Bridge, self.bridged);
+        holdings
+    }
+
+    /// The withdrawals that wait for their copies to be minted.
+    pub fn withdrawals(&self) -> Vec<Withdrawal> {
+        self.withdrawals.values().cloned().collect()
     }
 
     /// The cash-outs that wait to be paid or refused.
@@ -633,7 +728,106 @@ impl Ledger {
                 balance.cashing_out = balance.cashing_out - amount;
                 balance.earned += amount;
             }
+            LedgerEntry::MintTokens { amount } => {
+                if self.supply_created {
+                    return Err(LedgerError::SupplyCreated);
+                }
+                self.supply_created = true;
+                self.treasury_tokens = *amount;
+            }
+            LedgerEntry::TransferTokens { from, to, amount } => {
+                if *amount == Tokens::ZERO {
+                    return Err(LedgerError::NoTokens);
+                }
+                if !self.balances.contains_key(to) {
+                    return Err(LedgerError::UnknownAccount);
+                }
+                self.take_tokens(from.as_ref(), *amount)?;
+                *self.tokens.entry(*to).or_default() += *amount;
+            }
+            LedgerEntry::BurnTokens {
+                account,
+                amount,
+                credits,
+            } => {
+                if *amount == Tokens::ZERO {
+                    return Err(LedgerError::NoTokens);
+                }
+                self.account(account)?;
+                self.take_tokens(Some(account), *amount)?;
+                self.account(account)?.granted += *credits;
+            }
+            LedgerEntry::WithdrawTokens {
+                id,
+                account,
+                amount,
+                to,
+                at,
+            } => {
+                if *amount == Tokens::ZERO {
+                    return Err(LedgerError::NoTokens);
+                }
+                if !to.is_well_formed() {
+                    return Err(LedgerError::BadIcrcAccount);
+                }
+                if self.withdrawals.contains_key(id) {
+                    return Err(LedgerError::WithdrawalExists);
+                }
+                self.take_tokens(Some(account), *amount)?;
+                let withdrawal = Withdrawal {
+                    id: *id,
+                    account: *account,
+                    amount: *amount,
+                    to: to.clone(),
+                    at: *at,
+                };
+                self.withdrawals.insert(*id, withdrawal);
+            }
+            LedgerEntry::TokensWithdrawn { id, .. } => {
+                let withdrawal = self
+                    .withdrawals
+                    .remove(id)
+                    .ok_or(LedgerError::UnknownWithdrawal)?;
+                self.bridged += withdrawal.amount;
+            }
+            LedgerEntry::WithdrawalFailed { id } => {
+                let withdrawal = self
+                    .withdrawals
+                    .remove(id)
+                    .ok_or(LedgerError::UnknownWithdrawal)?;
+                *self.tokens.entry(withdrawal.account).or_default() += withdrawal.amount;
+            }
+            LedgerEntry::TokensDeposited {
+                account,
+                amount,
+                block,
+            } => {
+                if self.deposits.contains(block) {
+                    return Err(LedgerError::DepositCredited);
+                }
+                if self.bridged < *amount {
+                    return Err(LedgerError::BridgeShort);
+                }
+                self.account(account)?;
+                self.bridged = self.bridged - *amount;
+                *self.tokens.entry(*account).or_default() += *amount;
+                self.deposits.insert(*block);
+            }
         }
+        Ok(())
+    }
+
+    /// Takes tokens from an account, or from the treasury when `from` is
+    /// `None`, if it has that many.
+    fn take_tokens(&mut self, from: Option<&AccountId>, amount: Tokens) -> Result<(), LedgerError> {
+        let held = match from {
+            Some(account) => self.tokens.entry(*account).or_default(),
+            None => &mut self.treasury_tokens,
+        };
+        if *held < amount {
+            return Err(LedgerError::InsufficientTokens);
+        }
+        *held = *held - amount;
         Ok(())
     }
 

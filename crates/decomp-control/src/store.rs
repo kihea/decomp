@@ -107,7 +107,7 @@ impl Blobs {
     }
 }
 
-/// The key that signs the settlement log, which is also the treasury's.
+/// The key that signs the settlement log.
 pub enum ControlKey {
     /// A key the host holds, as the devnet does in its data directory.
     Held(SigningKey),

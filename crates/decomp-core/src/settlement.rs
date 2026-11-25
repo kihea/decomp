@@ -24,6 +24,7 @@ use crate::envelope::{Envelope, EnvelopeError};
 use crate::keys::{ContentHash, LedgerAddress, PublicKey};
 use crate::ledger::{Credits, Holder, Ledger};
 use crate::merkle;
+use crate::token::Tokens;
 
 /// How often the receipts canister posts a batch, in seconds (spec section 6: "Every
 /// 10 minutes (starting value)"). A shorter period proves work sooner; a longer
@@ -38,6 +39,8 @@ pub const MAX_LOG_PAGE: usize = 256;
 /// from (see `LedgerAddress::of_pool`).
 const VERIFICATION_FUND: &str = "verification-fund";
 const TREASURY: &str = "treasury";
+/// The pool that backs the token's copies on the ICRC ledger.
+const BRIDGE: &str = "token-bridge";
 
 /// The net change to one balance over a batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +48,8 @@ const TREASURY: &str = "treasury";
 pub struct Change {
     /// Whose balance, by ledger address and never by account ID.
     pub address: LedgerAddress,
-    /// The change in millionths of a credit: negative if the balance fell.
+    /// The change in the smallest unit: millionths of a credit, or
+    /// hundred-millionths of a token. Negative if the balance fell.
     pub change: i64,
 }
 
@@ -78,8 +82,13 @@ pub struct Batch {
     /// order they were published. Each goes in as the hash of its text (see
     /// `draw_hash`).
     pub draws: ContentHash,
-    /// One entry for every balance that changed, in order of address.
+    /// One entry for every balance of credits that changed, in order of
+    /// address.
     pub changes: Vec<Change>,
+    /// One entry for every balance of tokens that changed, in order of
+    /// address (see `token`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_changes: Vec<Change>,
     pub through: Through,
 }
 
@@ -175,7 +184,54 @@ pub struct SettlementLog {
     batches: Vec<Batch>,
     /// When each batch was posted.
     posted_at: Vec<u64>,
-    balances: BTreeMap<LedgerAddress, Credits>,
+    /// The credits at every address, in millionths.
+    balances: BTreeMap<LedgerAddress, u64>,
+    /// The tokens at every address, in hundred-millionths.
+    tokens: BTreeMap<LedgerAddress, u64>,
+}
+
+/// Takes `changes` into `balances`, if they are one for each address, in
+/// order, none of nothing, and take no balance below nothing.
+fn apply_changes(
+    balances: &BTreeMap<LedgerAddress, u64>,
+    changes: &[Change],
+) -> Result<BTreeMap<LedgerAddress, u64>, LogError> {
+    let in_order = changes
+        .windows(2)
+        .all(|pair| pair[0].address < pair[1].address);
+    if !in_order || changes.iter().any(|change| change.change == 0) {
+        return Err(LogError::BadChanges);
+    }
+    let mut balances = balances.clone();
+    for Change { address, change } in changes {
+        let balance = balances.entry(*address).or_default();
+        *balance = balance
+            .checked_add_signed(*change)
+            .ok_or(LogError::Overdrawn(*address))?;
+    }
+    Ok(balances)
+}
+
+/// The changes that take `before` to `now`, one for each address whose
+/// balance differs, in order of address.
+fn changes_between(
+    before: &BTreeMap<LedgerAddress, u64>,
+    now: &BTreeMap<LedgerAddress, u64>,
+) -> Vec<Change> {
+    let addresses: BTreeSet<&LedgerAddress> = now.keys().chain(before.keys()).collect();
+    addresses
+        .into_iter()
+        .map(|address| {
+            let at = |balances: &BTreeMap<LedgerAddress, u64>| {
+                balances.get(address).copied().unwrap_or_default() as i64
+            };
+            Change {
+                address: *address,
+                change: at(now) - at(before),
+            }
+        })
+        .filter(|change| change.change != 0)
+        .collect()
 }
 
 impl SettlementLog {
@@ -223,20 +279,10 @@ impl SettlementLog {
         {
             return Err(LogError::GoesBack);
         }
-        let in_order = batch
-            .changes
-            .windows(2)
-            .all(|pair| pair[0].address < pair[1].address);
-        if !in_order || batch.changes.iter().any(|change| change.change == 0) {
-            return Err(LogError::BadChanges);
-        }
-        let mut balances = self.balances.clone();
-        for Change { address, change } in &batch.changes {
-            let balance = balances.entry(*address).or_default();
-            let after = balance.micros().checked_add_signed(*change);
-            *balance = Credits::from_micros(after.ok_or(LogError::Overdrawn(*address))?);
-        }
+        let balances = apply_changes(&self.balances, &batch.changes)?;
+        let tokens = apply_changes(&self.tokens, &batch.token_changes)?;
         self.balances = balances;
+        self.tokens = tokens;
         self.batches.push(batch);
         Ok(())
     }
@@ -257,7 +303,12 @@ impl SettlementLog {
 
     /// The balance the log has at `address`.
     pub fn balance(&self, address: &LedgerAddress) -> Credits {
-        self.balances.get(address).copied().unwrap_or_default()
+        Credits::from_micros(self.balances.get(address).copied().unwrap_or_default())
+    }
+
+    /// The tokens the log has at `address`.
+    pub fn tokens(&self, address: &LedgerAddress) -> Tokens {
+        Tokens::from_e8s(self.tokens.get(address).copied().unwrap_or_default())
     }
 
     /// How far into the control plane's records the last batch reaches.
@@ -306,44 +357,22 @@ impl SettlementLog {
         &self,
         receipts: &[ContentHash],
         draws: &[ContentHash],
-        holdings: &BTreeMap<LedgerAddress, Credits>,
+        holdings: &Holdings,
         through: Through,
     ) -> Option<Batch> {
-        let batch = self.batch_from(receipts, draws, holdings, through);
-        let empty = receipts.is_empty() && draws.is_empty() && batch.changes.is_empty();
-        (!empty).then_some(batch)
-    }
-
-    /// The batch the records give at this point in the log, whether or not
-    /// there is anything in it.
-    fn batch_from(
-        &self,
-        receipts: &[ContentHash],
-        draws: &[ContentHash],
-        holdings: &BTreeMap<LedgerAddress, Credits>,
-        through: Through,
-    ) -> Batch {
-        let addresses = holdings.keys().chain(self.balances.keys());
-        let addresses: BTreeSet<&LedgerAddress> = addresses.collect();
-        let change = |address: &LedgerAddress| {
-            let now = holdings.get(address).copied().unwrap_or_default();
-            now.micros() as i64 - self.balance(address).micros() as i64
-        };
-        let changes: Vec<Change> = addresses
-            .into_iter()
-            .map(|address| Change {
-                address: *address,
-                change: change(address),
-            })
-            .filter(|change| change.change != 0)
-            .collect();
-        Batch {
+        let batch = Batch {
             number: self.batches.len() as u64,
             fingerprint: merkle::list_root(receipts),
             draws: merkle::list_root(draws),
-            changes,
+            changes: changes_between(&self.balances, &holdings.credits),
+            token_changes: changes_between(&self.tokens, &holdings.tokens),
             through,
-        }
+        };
+        let empty = receipts.is_empty()
+            && draws.is_empty()
+            && batch.changes.is_empty()
+            && batch.token_changes.is_empty();
+        (!empty).then_some(batch)
     }
 
     /// The entry that posts `posted` next in this log, for the control plane to
@@ -374,21 +403,35 @@ impl SettlementLog {
     }
 }
 
-/// What sits at every ledger address: each account's holdings under its own
-/// address, and the two pools under theirs. This is where account IDs are left
-/// behind: nothing that is posted names one.
-pub fn addressed(ledger: &Ledger, accounts: &Accounts) -> BTreeMap<LedgerAddress, Credits> {
+/// What sits at every ledger address, in each one's smallest unit.
+#[derive(Default)]
+pub struct Holdings {
+    pub credits: BTreeMap<LedgerAddress, u64>,
+    pub tokens: BTreeMap<LedgerAddress, u64>,
+}
+
+/// What sits at every ledger address: each account's credits and tokens under
+/// its own address, and the protocol's pools under theirs. This is where
+/// account IDs are left behind: nothing that is posted names one.
+pub fn addressed(ledger: &Ledger, accounts: &Accounts) -> Holdings {
     let address = |holder: &Holder| match holder {
         // Every balance belongs to an account that has a record.
         Holder::Account(id) => accounts.get(id).map(|account| account.ledger_address),
         Holder::VerificationFund => Some(LedgerAddress::of_pool(VERIFICATION_FUND)),
         Holder::Treasury => Some(LedgerAddress::of_pool(TREASURY)),
+        Holder::Bridge => Some(LedgerAddress::of_pool(BRIDGE)),
     };
-    let holdings = ledger.holdings();
-    let addressed = holdings
+    let credits = ledger
+        .holdings()
         .iter()
-        .filter_map(|(holder, credits)| Some((address(holder)?, *credits)));
-    addressed.collect()
+        .filter_map(|(holder, credits)| Some((address(holder)?, credits.micros())))
+        .collect();
+    let tokens = ledger
+        .token_holdings()
+        .iter()
+        .filter_map(|(holder, tokens)| Some((address(holder)?, tokens.e8s())))
+        .collect();
+    Holdings { credits, tokens }
 }
 
 /// The fingerprint of a batch whose receipts, as the exact texts that were

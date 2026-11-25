@@ -15,14 +15,15 @@ use decomp_core::{
     CashOutAsked, CashOuts, ContentHash, Envelope, EnvelopeError, JobError, LedgerEntry,
     LedgerError, MAX_CLOCK_SKEW_SECS, MAX_VALUE_KEY_LABEL_BYTES, NameError, OpError, Outcome,
     PrivacyError, PublicKey, PublishedKey, Rates, RecordError, RecordList, Refusal, RelayError,
-    Request, ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted, value_key_input,
+    Request, ShardNow, ShardRef, SponsorError, StorageError, Storing, Submitted, WithdrawalAsked,
+    value_key_input,
 };
 use serde::Serialize;
 use serde_json::json;
 
 use crate::state::{
     ControlPlane, InclusionError, OpenRelayError, ProbeError, RegistryError, StoreError,
-    SubmitError,
+    SubmitError, TokenError,
 };
 
 /// An HTTP status.
@@ -399,7 +400,7 @@ fn answer(
             amount,
             payment,
         } => {
-            treasury_only(control, &signer)?;
+            treasury_only(control, account)?;
             control.record(LedgerEntry::Buy {
                 account: buyer,
                 amount,
@@ -408,14 +409,7 @@ fn answer(
             Json(json!({})).into_response()
         }
         Call::CashOut { amount } => {
-            if signer != account.account_key {
-                let message = "a cash-out must be signed by the account key itself";
-                return Err(ApiError::new(
-                    StatusCode::FORBIDDEN,
-                    "not_account_key",
-                    message,
-                ));
-            }
+            account_key_only(account, &signer, "a cash-out")?;
             // The request's signature names the cash-out, so the same request
             // sent twice asks for one cash-out.
             let id = ContentHash::of(envelope.signature.as_bytes());
@@ -427,18 +421,56 @@ fn answer(
             Json(CashOutAsked { id }).into_response()
         }
         Call::GetCashOuts => {
-            treasury_only(control, &signer)?;
+            treasury_only(control, account)?;
             let waiting = control.cash_outs();
             Json(CashOuts { waiting }).into_response()
         }
         Call::PayCashOut { id, payout } => {
-            treasury_only(control, &signer)?;
+            treasury_only(control, account)?;
             control.record(LedgerEntry::CashOutPaid { id, payout })?;
             Json(json!({})).into_response()
         }
         Call::RefuseCashOut { id } => {
-            treasury_only(control, &signer)?;
+            treasury_only(control, account)?;
             control.record(LedgerEntry::CashOutRefused { id })?;
+            Json(json!({})).into_response()
+        }
+        Call::SendTokens { to, amount } => {
+            account_key_only(account, &signer, "sending tokens")?;
+            control.record(LedgerEntry::TransferTokens {
+                from: Some(account.id),
+                to,
+                amount,
+            })?;
+            Json(json!({})).into_response()
+        }
+        Call::BurnTokens { amount } => {
+            control.record(LedgerEntry::BurnTokens {
+                account: account.id,
+                amount,
+                credits: amount.credits(),
+            })?;
+            Json(json!({})).into_response()
+        }
+        Call::WithdrawTokens { amount, to } => {
+            account_key_only(account, &signer, "a withdrawal")?;
+            // As with a cash-out, the signature names the withdrawal.
+            let id = ContentHash::of(envelope.signature.as_bytes());
+            control.withdraw_tokens(id, account.id, amount, to, now)?;
+            Json(WithdrawalAsked { id }).into_response()
+        }
+        Call::GetDepositAddress => Json(control.deposit_address(&account.id)?).into_response(),
+        Call::DepositTokens => {
+            control.ask_deposit(account.id)?;
+            Json(json!({})).into_response()
+        }
+        Call::GrantTokens { to, amount } => {
+            treasury_only(control, account)?;
+            control.record(LedgerEntry::TransferTokens {
+                from: None,
+                to,
+                amount,
+            })?;
             Json(json!({})).into_response()
         }
     })
@@ -472,8 +504,23 @@ fn member<'a>(accounts: &'a Accounts, signer: &PublicKey) -> Result<&'a Account,
 
 /// Refuses a request that only the treasury may make: saying that credits were
 /// paid for, and paying or refusing a cash-out.
-fn treasury_only(control: &ControlPlane, signer: &PublicKey) -> Result<(), ApiError> {
-    if *signer == control.control_key() {
+/// Refuses a call that must be signed by the account key itself (spec
+/// section 1: the account key signs "cash-outs"), as everything that moves
+/// value out of an account must be.
+fn account_key_only(account: &Account, signer: &PublicKey, what: &str) -> Result<(), ApiError> {
+    if *signer == account.account_key {
+        return Ok(());
+    }
+    let message = format!("{what} must be signed by the account key itself");
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "not_account_key",
+        message,
+    ))
+}
+
+fn treasury_only(control: &ControlPlane, account: &Account) -> Result<(), ApiError> {
+    if control.is_treasurer(&account.id) {
         return Ok(());
     }
     let message = "only the treasury may do this";
@@ -628,13 +675,34 @@ impl From<LedgerError> for ApiError {
             LedgerError::BadPaymentName => (StatusCode::BAD_REQUEST, "bad_payment_name"),
             LedgerError::CashOutExists => (StatusCode::CONFLICT, "cash_out_exists"),
             LedgerError::UnknownCashOut => (StatusCode::NOT_FOUND, "unknown_cash_out"),
+            LedgerError::InsufficientTokens => {
+                (StatusCode::PAYMENT_REQUIRED, "insufficient_tokens")
+            }
+            LedgerError::NoTokens => (StatusCode::BAD_REQUEST, "no_amount"),
+            LedgerError::BadIcrcAccount => (StatusCode::BAD_REQUEST, "bad_icrc_account"),
+            LedgerError::WithdrawalExists => (StatusCode::CONFLICT, "withdrawal_exists"),
             LedgerError::NothingEscrowed
             | LedgerError::FeeExceedsEscrow
-            | LedgerError::PayoutsDoNotAddUp => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "ledger_failed")
-            }
+            | LedgerError::PayoutsDoNotAddUp
+            | LedgerError::SupplyCreated
+            | LedgerError::UnknownWithdrawal
+            | LedgerError::DepositCredited
+            | LedgerError::BridgeShort => (StatusCode::INTERNAL_SERVER_ERROR, "ledger_failed"),
         };
         Self::new(status, code, error.to_string())
+    }
+}
+
+impl From<TokenError> for ApiError {
+    fn from(error: TokenError) -> Self {
+        match error {
+            TokenError::Ledger(inner) => inner.into(),
+            TokenError::NoBridge => Self::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "no_token_bridge",
+                error.to_string(),
+            ),
+        }
     }
 }
 

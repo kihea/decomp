@@ -44,8 +44,14 @@ export type Device = { key: string; revoked: boolean };
 /** Credit amounts travel as whole millionths of a credit. */
 export const MICROS_PER_CREDIT = 1_000_000;
 
+/** Token amounts travel as whole hundred-millionths of a token. */
+export const E8S_PER_TOKEN = 100_000_000;
+
 export type Balance = {
-  /** Starter credits: they can be spent but never cashed out. */
+  /**
+   * Credits that can be spent but never cashed out: the starter grant, and
+   * credits made by burning tokens.
+   */
   granted: number;
   /** Credits the account earned or bought. */
   earned: number;
@@ -128,6 +134,8 @@ export type Account = {
   /** The app this account has published, if any. */
   app?: AppManifest;
   balance: Balance;
+  /** The account's tokens, in hundred-millionths, not counting any it is withdrawing. */
+  tokens: number;
   /** The combined reliability of the account's devices, from 0 to 1. */
   reputation: number;
   /** When the account first appeared, in seconds since 1970. */

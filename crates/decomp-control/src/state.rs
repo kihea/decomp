@@ -21,7 +21,7 @@
 //! | Blobs | Storage nodes; this process holds a copy of job inputs and outputs | `blobs/` | Yes |
 //! | Open jobs, leases, commitments, nodes asking, unanswered challenges | Job board | Memory | No, by design (spec, "Data management") |
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io;
 
 use decomp_core::Records as AccountRecords;
@@ -30,18 +30,20 @@ use decomp_core::{
     Account, AccountId, AccountStanding, AccountStatus, Accounts, Activity, Beacon, Bid, BidOrder,
     CashOut, Challenge, Closure, Conduct, ContentHash, Credits, Directory, DrawPage, Envelope,
     EnvelopeError, FallBackJob, Fallback, FollowUps, Hosts, Inclusion, IncomingChannels, JobError,
-    JobId, JobResult, JobStatus, Jobs, LeasesGranted, Ledger, LedgerAddress, LedgerEntry,
-    LedgerError, Located, LogError, LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE,
-    MAX_PIECES, MAX_READS, MAX_SHARD_NAME_BYTES, Manifest, NAME_DEPOSIT, NameError, NameRecord,
-    OpError, Opening, Outcome, PROBATION_FORFEIT_PERCENT, PRODUCED_RETENTION_DAYS, Payout, Penalty,
-    Placement, Posted, PrivacyError, PublicKey, Quote, Receipt, Record, RecordError, Registry,
-    RegistryEntry, RelayEntry, RelayError, Relays, Resolved, Route, ScoreEvent, Scores,
-    SealingKeys, SettlementLog, ShardRef, Signature, Splits, SponsorError, Sponsored, Standing,
-    Standings, StateEntry, States, Storage, StorageEntry, StorageError, Storing, Through,
-    WorkPreferences, channel_id, draw_hash, merkle, privacy, settlement,
+    JobId, JobResult, JobStatus, Jobs, LeasesGranted, Ledger, LedgerEntry, LedgerError, Located,
+    LogError, LogPage, MAX_APART_FROM, MAX_KEPT_FROM, MAX_LOG_PAGE, MAX_PIECES, MAX_READS,
+    MAX_SHARD_NAME_BYTES, Manifest, NAME_DEPOSIT, NameError, NameRecord, OpError, Opening, Outcome,
+    PROBATION_FORFEIT_PERCENT, PRODUCED_RETENTION_DAYS, Payout, Penalty, Placement, Posted,
+    PrivacyError, PublicKey, Quote, Receipt, Record, RecordError, Registry, RegistryEntry,
+    RelayEntry, RelayError, Relays, Resolved, Route, ScoreEvent, Scores, SealingKeys,
+    SettlementLog, ShardRef, Signature, Splits, SponsorError, Sponsored, Standing, Standings,
+    StateEntry, States, Storage, StorageEntry, StorageError, Storing, Through, WorkPreferences,
+    channel_id, draw_hash, merkle, privacy, settlement,
 };
 use decomp_core::{
-    Hardware, Host, PROBE_BYTES, PROBE_INTERVAL_SECS, PROBE_TIMEOUT_SECS, Probe, probe,
+    DepositAddress, Hardware, Holdings, Host, IcrcAccount, PROBE_BYTES, PROBE_INTERVAL_SECS,
+    PROBE_TIMEOUT_SECS, Probe, Subaccount, TOKEN_SUPPLY, Tokens, Withdrawal, deposit_subaccount,
+    probe,
 };
 use decomp_schema::records::{self, Records};
 use rand::rngs::StdRng;
@@ -146,6 +148,27 @@ pub enum SubmitError {
     Privacy(#[from] PrivacyError),
 }
 
+/// The ICRC ledger that holds copies of the token, and what the control
+/// plane needs to mint and burn them there.
+#[derive(Clone)]
+pub struct TokenBridge {
+    /// The ICRC ledger's principal, in text form.
+    pub ledger: String,
+    /// The control plane's own principal, the ICRC ledger's only minter.
+    pub minter: String,
+    /// Makes each account's deposit address, so that the public ICRC ledger
+    /// does not show whose a deposit is (see `deposit_subaccount`).
+    pub secret: [u8; 32],
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TokenError {
+    #[error("this control plane has no ICRC ledger for the token")]
+    NoBridge,
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
+}
+
 /// The settings a local network is started with.
 pub struct Settings {
     /// How long a stored blob goes between challenges, in seconds.
@@ -154,6 +177,9 @@ pub struct Settings {
     pub recovery_wait: u64,
     /// The accounts allowed to review apps and assign held names.
     pub reviewers: Vec<AccountId>,
+    /// The accounts allowed to act for the treasury: record credits bought,
+    /// pay or refuse cash-outs, and give out tokens.
+    pub treasurers: Vec<AccountId>,
     /// Brand names held until a reviewer assigns them.
     pub reserved_names: Vec<String>,
     /// Randomness to seed the control plane's own draws with: the choice of
@@ -221,7 +247,7 @@ pub struct ControlPlane {
     /// and each job's place in that order. Batches are made from these.
     receipt_hashes: Vec<ContentHash>,
     receipt_of: HashMap<JobId, u64>,
-    /// The key the settlement log is signed with, which is also the treasury's.
+    /// The key the settlement log is signed with.
     control: ControlKey,
     /// An entry of the settlement log waiting for a threshold key's signature.
     unsigned: Option<(String, Vec<u8>)>,
@@ -237,6 +263,11 @@ pub struct ControlPlane {
     records: AccountRecords,
     records_log: Log,
     reviewers: Vec<AccountId>,
+    treasurers: Vec<AccountId>,
+    /// The ICRC ledger that holds copies of the token, once the host has one.
+    bridge: Option<TokenBridge>,
+    /// Accounts that asked for their deposit address to be checked.
+    deposit_checks: Vec<AccountId>,
     market_log: Log,
     activity_log: Log,
     /// When each account appeared.
@@ -277,6 +308,7 @@ impl ControlPlane {
             challenge_interval,
             recovery_wait,
             reviewers,
+            treasurers,
             reserved_names,
             entropy,
         } = settings;
@@ -407,6 +439,15 @@ impl ControlPlane {
             return Err(io::Error::new(io::ErrorKind::InvalidData, message));
         }
 
+        // The token's whole supply is created once, in the treasury.
+        if !ledger.supply_created() {
+            let mint = LedgerEntry::MintTokens {
+                amount: TOKEN_SUPPLY,
+            };
+            ledger.apply(&mint).expect("no supply has been created");
+            ledger_log.append(&mint);
+        }
+
         // Open jobs do not survive a restart, so hand back what was set aside for
         // any job that was still open when the network last stopped.
         for job_id in ledger.escrowed_jobs() {
@@ -443,6 +484,9 @@ impl ControlPlane {
             records,
             records_log,
             reviewers,
+            treasurers,
+            bridge: None,
+            deposit_checks: Vec::new(),
             market_log,
             activity_log,
             created,
@@ -475,8 +519,7 @@ impl ControlPlane {
         self.rng = StdRng::from_seed(seed);
     }
 
-    /// The key that signs the settlement log and draws, which is also the
-    /// treasury's.
+    /// The key that signs the settlement log, whose batches prove the draws.
     pub fn control_key(&self) -> PublicKey {
         self.control.public_key()
     }
@@ -568,7 +611,7 @@ impl ControlPlane {
     }
 
     /// What sits at every ledger address now.
-    fn holdings(&self) -> BTreeMap<LedgerAddress, Credits> {
+    fn holdings(&self) -> Holdings {
         settlement::addressed(&self.ledger, &self.accounts)
     }
 
@@ -638,6 +681,7 @@ impl ControlPlane {
         let reputation = self.reputation(&account);
         let created = self.created.get(&account.id).copied().unwrap_or(0);
         AccountStatus {
+            tokens: self.ledger.tokens(&account.id),
             account,
             balance,
             reputation,
@@ -1477,6 +1521,81 @@ impl ControlPlane {
         self.ledger.apply(&entry)?;
         self.ledger_log.append(&entry);
         Ok(())
+    }
+
+    /// Whether `account` may act for the treasury.
+    pub fn is_treasurer(&self, account: &AccountId) -> bool {
+        self.treasurers.contains(account)
+    }
+
+    /// Connects the ICRC ledger that holds copies of the token, which opens
+    /// withdrawals and deposits.
+    pub fn connect_bridge(&mut self, bridge: TokenBridge) {
+        self.bridge = Some(bridge);
+    }
+
+    fn bridge(&self) -> Result<&TokenBridge, TokenError> {
+        self.bridge.as_ref().ok_or(TokenError::NoBridge)
+    }
+
+    /// Asks for an account's tokens to be withdrawn as copies on the ICRC
+    /// ledger. The host mints them (`withdrawals`) and records how that went.
+    pub fn withdraw_tokens(
+        &mut self,
+        id: ContentHash,
+        account: AccountId,
+        amount: Tokens,
+        to: IcrcAccount,
+        now: u64,
+    ) -> Result<(), TokenError> {
+        self.bridge()?;
+        let entry = LedgerEntry::WithdrawTokens {
+            id,
+            account,
+            amount,
+            to,
+            at: now,
+        };
+        Ok(self.record(entry)?)
+    }
+
+    /// The withdrawals that wait for their copies to be minted.
+    pub fn withdrawals(&self) -> Vec<Withdrawal> {
+        self.ledger.withdrawals()
+    }
+
+    /// Where `account` deposits copies of the token.
+    pub fn deposit_address(&self, account: &AccountId) -> Result<DepositAddress, TokenError> {
+        let bridge = self.bridge()?;
+        Ok(DepositAddress {
+            ledger: bridge.ledger.clone(),
+            account: IcrcAccount {
+                owner: bridge.minter.clone(),
+                subaccount: Some(deposit_subaccount(&bridge.secret, account)),
+            },
+        })
+    }
+
+    /// Asks the host to check an account's deposit address (`deposit_checks`).
+    pub fn ask_deposit(&mut self, account: AccountId) -> Result<(), TokenError> {
+        self.bridge()?;
+        if !self.deposit_checks.contains(&account) {
+            self.deposit_checks.push(account);
+        }
+        Ok(())
+    }
+
+    /// The deposit addresses to check, each with its account: the host burns
+    /// what it finds there and records `TokensDeposited`.
+    pub fn take_deposit_checks(&mut self) -> Vec<(AccountId, Subaccount)> {
+        let Some(bridge) = &self.bridge else {
+            return Vec::new();
+        };
+        let secret = bridge.secret;
+        self.deposit_checks
+            .drain(..)
+            .map(|account| (account, deposit_subaccount(&secret, &account)))
+            .collect()
     }
 
     /// Acts on what the job rules decided: updates node scores, pays for jobs

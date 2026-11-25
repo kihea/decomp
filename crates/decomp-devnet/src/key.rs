@@ -1,8 +1,6 @@
 //! The key the local network signs with, kept as a file in the data directory.
 //! It signs the settlement log, as the subnet's threshold key does for the
-//! control canister on the Internet Computer. It is also the treasury's key on
-//! a local network: the one key allowed to record credits bought and cash-outs
-//! paid.
+//! control canister on the Internet Computer.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};

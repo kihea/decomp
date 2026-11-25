@@ -23,6 +23,7 @@ use decomp_core::{
     Verification, Verify, WorkPreferences, controller, cut, draw_hash, encrypted, merkle, privacy,
     shares,
 };
+use decomp_core::{ICRC_TRANSFER_FEE, IcrcAccount, Subaccount, Tokens};
 
 use decomp_node::beacon::Rounds;
 use decomp_node::client::{Client, ClientError, unix_now};
@@ -102,6 +103,49 @@ enum Command {
         #[arg(long)]
         account_key: PathBuf,
     },
+    /// Send tokens to another account. Signed by the account key.
+    SendTokens {
+        /// The ID of the account to send them to.
+        to: AccountId,
+        /// Tokens to send, such as 20 or 12.5.
+        amount: Tokens,
+        /// The account key file, as `create-account` made it.
+        #[arg(long)]
+        account_key: PathBuf,
+    },
+    /// Burn tokens into credits, which can be spent but not cashed out.
+    BurnTokens {
+        /// Tokens to burn, such as 20 or 12.5.
+        amount: Tokens,
+    },
+    /// Withdraw tokens as copies on the ICRC ledger, which exchanges and
+    /// wallets trade. Signed by the account key.
+    WithdrawTokens {
+        /// Tokens to withdraw, such as 20 or 12.5.
+        amount: Tokens,
+        /// The principal of the ICRC account to mint the copies to.
+        #[arg(long)]
+        to: String,
+        /// The ICRC account's subaccount, as 64 hex digits.
+        #[arg(long)]
+        subaccount: Option<Subaccount>,
+        /// The account key file, as `create-account` made it.
+        #[arg(long)]
+        account_key: PathBuf,
+    },
+    /// Show where to send copies of the token on the ICRC ledger to deposit
+    /// them into this account.
+    DepositAddress,
+    /// Burn the copies sent to this account's deposit address and take them
+    /// back as tokens.
+    DepositTokens,
+    /// As a treasurer: give out tokens from the treasury's supply.
+    GrantTokens {
+        /// The ID of the account to give them to.
+        to: AccountId,
+        /// Tokens to give, such as 20 or 12.5.
+        amount: Tokens,
+    },
     /// Start a name's term again.
     RenewName { name: String },
     /// Return a name to the pool; its deposit comes back.
@@ -142,7 +186,7 @@ enum Command {
         /// The code of the device whose recovery to cancel.
         device: PublicKey,
     },
-    /// As the treasury: record that an account bought credits.
+    /// As a treasurer: record that an account bought credits.
     /// Nothing here takes or checks a payment.
     Bought {
         /// The ID of the account that bought them.
@@ -152,15 +196,10 @@ enum Command {
         /// A name for the payment. A payment is credited once.
         #[arg(long)]
         payment: String,
-        #[command(flatten)]
-        treasury: TreasuryArgs,
     },
-    /// As the treasury: show the cash-outs that wait.
-    CashOuts {
-        #[command(flatten)]
-        treasury: TreasuryArgs,
-    },
-    /// As the treasury: record that a cash-out was paid, which
+    /// As a treasurer: show the cash-outs that wait.
+    CashOuts,
+    /// As a treasurer: record that a cash-out was paid, which
     /// removes its credits for good. Nothing here pays anyone.
     PayCashOut {
         /// The cash-out's name, as `cash-outs` shows it.
@@ -168,16 +207,12 @@ enum Command {
         /// A name for the payment the account was paid by.
         #[arg(long)]
         payout: String,
-        #[command(flatten)]
-        treasury: TreasuryArgs,
     },
-    /// As the treasury: refuse a cash-out, which returns its
+    /// As a treasurer: refuse a cash-out, which returns its
     /// credits to the account.
     RefuseCashOut {
         /// The cash-out's name, as `cash-outs` shows it.
         id: ContentHash,
-        #[command(flatten)]
-        treasury: TreasuryArgs,
     },
     /// Put earned credits up as stake, which jobs of tier 3 and above require.
     Stake {
@@ -385,14 +420,6 @@ enum Command {
 }
 
 #[derive(Args)]
-struct TreasuryArgs {
-    /// The treasury's key file: on a local network, `control.key` in the
-    /// devnet's data directory.
-    #[arg(long)]
-    treasury_key: PathBuf,
-}
-
-#[derive(Args)]
 struct PreferenceArgs {
     /// Whether the device contributes at all.
     #[arg(long)]
@@ -456,17 +483,66 @@ fn main() -> ExitCode {
         Command::CashOut {
             amount,
             account_key,
-        } => {
-            let missing = || format!("{} is not there", account_key.display());
-            device::key_file(&account_key)
-                .map_err(Box::<dyn Error>::from)
-                .and_then(|key| key.ok_or_else(|| missing().into()))
-                .and_then(|key| {
-                    let id = Client::new(&cli.control, key).cash_out(amount)?;
-                    println!("cash-out {id} asked for; {amount} credits are set aside until it is paid or refused");
-                    Ok(ExitCode::SUCCESS)
-                })
-        }
+        } => as_account(&cli.control, &account_key).and_then(|client| {
+            let id = client.cash_out(amount)?;
+            println!(
+                "cash-out {id} asked for; {amount} credits are set aside until it is paid or refused"
+            );
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::SendTokens {
+            to,
+            amount,
+            account_key,
+        } => as_account(&cli.control, &account_key).and_then(|client| {
+            client.send_tokens(to, amount)?;
+            println!("sent {amount} tokens to account {to}");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::BurnTokens { amount } => connect().and_then(|client| {
+            client.burn_tokens(amount)?;
+            println!(
+                "burned {amount} tokens into {} credits, which can be spent but not cashed out",
+                amount.credits()
+            );
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::WithdrawTokens {
+            amount,
+            to,
+            subaccount,
+            account_key,
+        } => as_account(&cli.control, &account_key).and_then(|client| {
+            let to = IcrcAccount {
+                owner: to,
+                subaccount,
+            };
+            let id = client.withdraw_tokens(amount, to)?;
+            println!("withdrawal {id} asked for; {amount} tokens are set aside until they are minted on the ICRC ledger");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::DepositAddress => connect().and_then(|client| {
+            let decomp_core::DepositAddress { ledger, account } = client.deposit_address()?;
+            println!("ledger      {ledger}");
+            println!("owner       {}", account.owner);
+            if let Some(subaccount) = account.subaccount {
+                println!("subaccount  {subaccount}");
+            }
+            println!(
+                "Send copies of the token there, then run deposit-tokens. At least {ICRC_TRANSFER_FEE} tokens."
+            );
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::DepositTokens => connect().and_then(|client| {
+            client.deposit_tokens()?;
+            println!("asked; the copies at the deposit address are burned and arrive as tokens in a few seconds");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::GrantTokens { to, amount } => connect().and_then(|client| {
+            client.grant_tokens(to, amount)?;
+            println!("granted {amount} tokens from the treasury to account {to}");
+            Ok(ExitCode::SUCCESS)
+        }),
         Command::RenewName { name } => connect().and_then(|client| {
             let record = client.renew_name(name)?;
             println!("{} held until {}", record.name, record.expires_at);
@@ -544,13 +620,12 @@ fn main() -> ExitCode {
             account,
             amount,
             payment,
-            treasury,
-        } => as_treasury(&cli.control, &treasury).and_then(|client| {
+        } => connect().and_then(|client| {
             client.credit_purchase(account, amount, payment)?;
             println!("credited {amount} bought credits to account {account}");
             Ok(ExitCode::SUCCESS)
         }),
-        Command::CashOuts { treasury } => as_treasury(&cli.control, &treasury).and_then(|client| {
+        Command::CashOuts => connect().and_then(|client| {
             let waiting = client.cash_outs()?;
             for cash_out in &waiting {
                 let (id, account) = (cash_out.id, cash_out.account);
@@ -561,22 +636,16 @@ fn main() -> ExitCode {
             }
             Ok(ExitCode::SUCCESS)
         }),
-        Command::PayCashOut {
-            id,
-            payout,
-            treasury,
-        } => as_treasury(&cli.control, &treasury).and_then(|client| {
+        Command::PayCashOut { id, payout } => connect().and_then(|client| {
             client.pay_cash_out(id, payout)?;
             println!("recorded as paid; the credits of cash-out {id} are gone");
             Ok(ExitCode::SUCCESS)
         }),
-        Command::RefuseCashOut { id, treasury } => {
-            as_treasury(&cli.control, &treasury).and_then(|client| {
-                client.refuse_cash_out(id)?;
-                println!("refused; the credits of cash-out {id} are back with the account");
-                Ok(ExitCode::SUCCESS)
-            })
-        }
+        Command::RefuseCashOut { id } => connect().and_then(|client| {
+            client.refuse_cash_out(id)?;
+            println!("refused; the credits of cash-out {id} are back with the account");
+            Ok(ExitCode::SUCCESS)
+        }),
         Command::Stake { amount } => connect().and_then(|client| {
             show_credits(&client.stake(amount)?);
             Ok(ExitCode::SUCCESS)
@@ -729,11 +798,11 @@ fn main() -> ExitCode {
     })
 }
 
-/// A client that signs as the treasury.
-fn as_treasury(control: &str, treasury: &TreasuryArgs) -> Result<Client, Box<dyn Error>> {
-    let path = &treasury.treasury_key;
-    let missing = || format!("{} is not there", path.display());
-    let key = device::key_file(path)?.ok_or_else(missing)?;
+/// A client that signs with the account key in `file`, for what moves value
+/// out of an account.
+fn as_account(control: &str, file: &Path) -> Result<Client, Box<dyn Error>> {
+    let missing = || format!("{} is not there", file.display());
+    let key = device::key_file(file)?.ok_or_else(missing)?;
     Ok(Client::new(control, key))
 }
 
@@ -841,10 +910,11 @@ fn show_log(client: &Client) -> Result<ExitCode, Box<dyn Error>> {
     for batch in log.batches() {
         let (start, end) = log.receipts_of(batch.number).unwrap_or_default();
         println!(
-            "batch {}  {} receipts, {} balances changed, fingerprint {}",
+            "batch {}  {} receipts, {} balances and {} token balances changed, fingerprint {}",
             batch.number,
             end - start,
             batch.changes.len(),
+            batch.token_changes.len(),
             batch.fingerprint
         );
     }
@@ -1052,9 +1122,10 @@ fn show_credits(status: &AccountStatus) {
         );
     }
     println!(
-        "         {} are starter credits, which cannot be staked or cashed out",
+        "         {} are starter credits or burned tokens, which cannot be staked or cashed out",
         balance.granted
     );
+    println!("tokens   {}", status.tokens);
 }
 
 fn show_app(app: &AppManifest) {

@@ -12,6 +12,7 @@ use decomp_core::{
     Resolved, Route, SealingKey, SettlementLog, ShardNow, SigningKey, Standing, Submitted,
     WorkPreferences, seal,
 };
+use decomp_core::{DepositAddress, IcrcAccount, Tokens, WithdrawalAsked};
 use serde::de::{DeserializeOwned, IgnoredAny};
 
 /// How long one request may take, including sending or receiving a large blob.
@@ -160,14 +161,14 @@ impl Client {
         Ok(waiting)
     }
 
-    /// As the treasury: records that a cash-out was paid by the
+    /// As a treasurer: records that a cash-out was paid by the
     /// payment named `payout`.
     pub fn pay_cash_out(&self, id: ContentHash, payout: String) -> Result<(), ClientError> {
         self.call::<IgnoredAny>(Call::PayCashOut { id, payout })?;
         Ok(())
     }
 
-    /// As the coordinator's operator: refuses a cash-out.
+    /// As a treasurer: refuses a cash-out.
     pub fn refuse_cash_out(&self, id: ContentHash) -> Result<(), ClientError> {
         self.call::<IgnoredAny>(Call::RefuseCashOut { id })?;
         Ok(())
@@ -323,6 +324,47 @@ impl Client {
     pub fn cash_out(&self, amount: Credits) -> Result<ContentHash, ClientError> {
         let asked: CashOutAsked = self.call(Call::CashOut { amount })?;
         Ok(asked.id)
+    }
+
+    /// Sends tokens to another account. Signed by the account key.
+    pub fn send_tokens(&self, to: AccountId, amount: Tokens) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::SendTokens { to, amount })?;
+        Ok(())
+    }
+
+    /// Burns tokens into credits.
+    pub fn burn_tokens(&self, amount: Tokens) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::BurnTokens { amount })?;
+        Ok(())
+    }
+
+    /// Withdraws tokens as copies on the ICRC ledger. Signed by the account
+    /// key. Returns the withdrawal's name.
+    pub fn withdraw_tokens(
+        &self,
+        amount: Tokens,
+        to: IcrcAccount,
+    ) -> Result<ContentHash, ClientError> {
+        let asked: WithdrawalAsked = self.call(Call::WithdrawTokens { amount, to })?;
+        Ok(asked.id)
+    }
+
+    /// Where to send copies on the ICRC ledger to deposit them.
+    pub fn deposit_address(&self) -> Result<DepositAddress, ClientError> {
+        self.call(Call::GetDepositAddress)
+    }
+
+    /// Asks for the copies at the deposit address to be burned and given back
+    /// as tokens.
+    pub fn deposit_tokens(&self) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::DepositTokens)?;
+        Ok(())
+    }
+
+    /// As a treasurer: gives out tokens from the treasury's supply.
+    pub fn grant_tokens(&self, to: AccountId, amount: Tokens) -> Result<(), ClientError> {
+        self.call::<IgnoredAny>(Call::GrantTokens { to, amount })?;
+        Ok(())
     }
 
     pub fn renew_name(&self, name: String) -> Result<NameRecord, ClientError> {

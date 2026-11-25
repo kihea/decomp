@@ -4,7 +4,7 @@
 # built on top of the protocol.
 [workspace]
 resolver = "3"
-members = ["crates/*", "canisters/*"]
+members = ["crates/*", "canisters/control"]
 
 [workspace.package]
 edition = "2024"

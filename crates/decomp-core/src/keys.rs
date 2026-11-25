@@ -214,6 +214,13 @@ hex_newtype!(
     32
 );
 
+hex_newtype!(
+    /// A subaccount on an ICRC ledger: 32 bytes that, with an owner's
+    /// principal, make an ICRC account.
+    Subaccount,
+    32
+);
+
 impl LedgerAddress {
     /// The address of the account created by the request that carries
     /// `created`, the account key's signature.

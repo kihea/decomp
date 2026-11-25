@@ -16,6 +16,8 @@
 //!   before it takes effect (default 48 hours)
 //! - `DECOMP_REVIEWERS`: account IDs, comma-separated, allowed to review apps
 //!   and assign held names (default none)
+//! - `DECOMP_TREASURERS`: account IDs, comma-separated, allowed to act for the
+//!   treasury (default none)
 //! - `DECOMP_RESERVED_NAMES`: names, comma-separated, held for their brands'
 //!   owners (default none)
 
@@ -59,10 +61,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map(String::from)
             .collect()
     };
-    let reviewers = list("DECOMP_REVIEWERS")
-        .iter()
-        .map(|id| id.parse::<AccountId>())
-        .collect::<Result<Vec<_>, _>>()?;
+    let accounts = |name: &str| {
+        list(name)
+            .iter()
+            .map(|id| id.parse::<AccountId>())
+            .collect::<Result<Vec<_>, _>>()
+    };
 
     let settings = Settings {
         challenge_interval: seconds(
@@ -70,7 +74,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             DEFAULT_CHALLENGE_INTERVAL_SECS,
         )?,
         recovery_wait: seconds("DECOMP_RECOVERY_WAIT_SECS", RECOVERY_WAIT_SECS)?,
-        reviewers,
+        reviewers: accounts("DECOMP_REVIEWERS")?,
+        treasurers: accounts("DECOMP_TREASURERS")?,
         reserved_names: list("DECOMP_RESERVED_NAMES"),
         entropy: rand::random(),
     };
@@ -79,7 +84,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let control = ControlPlane::open(&mut DataDir::open(Path::new(&data_dir))?, settings)?;
     let listener = TcpListener::bind(&addr).await?;
     println!("decomp devnet listening on http://{addr}, data in {data_dir}/");
-    println!("control-plane key (treasury): {}", control.control_key());
+    println!("control-plane key: {}", control.control_key());
     axum::serve(listener, server::router(control, batch_period)).await?;
     Ok(())
 }

@@ -10,7 +10,7 @@ pub mod state;
 pub mod store;
 
 pub use http::{Response, StatusCode, ValueKeyRequest, handle, value_key_request};
-pub use state::{ControlPlane, Settings};
+pub use state::{ControlPlane, Settings, TokenBridge, TokenError};
 pub use store::{
     BlobBackend, Blobs, ControlKey, Log, LogBackend, MemorySnapshot, MemoryStorage, StateStore,
 };

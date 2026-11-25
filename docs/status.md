@@ -40,7 +40,7 @@ Last updated 2026-11-21.
 | Fee split, stake, penalties, starter grant | Available | Each node is paid 85% of its own run |
 | Share caps, taper, balanced accounts first | Available | Caps and the taper apply once a tier has 100 active accounts |
 | Open market: standing bids in tiers 3 and 4 | Available | Per unit or per job; bids can only go below the posted rate |
-| Buying and cashing out credits | In development | The treasury records purchases and cash-outs; no payment rail is connected until the legal review is complete |
+| Buying and cashing out credits | In development | Treasurer accounts record purchases and cash-outs; no payment rail is connected until the legal review is complete |
 | Storage, relay, and inference rates | In development | Storage and relays are priced by starting values the spec leaves open |
 
 ## Control plane and settlement
@@ -70,6 +70,6 @@ Last updated 2026-11-21.
 | --- | --- | --- |
 | Zero-knowledge proofs for small, high-value jobs | Not started | Needs a proving system for WebAssembly |
 | Compute for other chains | Not started | Needs a contract on each chain and the canisters' chain-key signing |
-| Governance by token-holder vote | Not started | Waits on the token decision |
-| Tradable token | Not started | Waits on legal advice |
+| Governance by token-holder vote | Not started | The token exists; votes on settings are not built |
+| Tradable token | Available | Held in the control plane's ledger (`decomp_core::token`), given out by treasurers, burned into credits one for one, and withdrawn to and deposited from DFINITY's standard ICRC ledger (`canisters/token`), of which the control canister is the only minter. Listing or selling it waits on legal advice |
 | Node agent for phones | Not started | Phones run only while charging on Wi-Fi |

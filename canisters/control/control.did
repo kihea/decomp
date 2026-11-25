@@ -1,7 +1,9 @@
 type Settings = record {
   reviewers : vec text;
+  treasurers : opt vec text;
   reserved_names : vec text;
   recovery_wait_secs : opt nat64;
+  token_ledger : opt principal;
 };
 type HttpRequest = record {
   method : text;

@@ -467,6 +467,8 @@ At these assumptions a CPU node earns a few dollars a month, so for most users t
 | Stable credits plus a floating token | App prices stay stable while the token floats; tokens are destroyed to create credits | More moving parts; the same legal questions |
 | Launch through [ICP's SNS](https://docs.internetcomputer.org/guides/governance/launching.md) | Raises ICP from participants in exchange for governance tokens | Irreversible; upgrades and treasury spending then need token-holder votes; requires a working, audited, open-source app |
 
+**Chosen: stable credits plus a floating token.** The token lives in DeComp's ledger beside credits, where it moves between accounts as one more ledger entry, and is burned to make credits that can be spent but not cashed out. For trading, a copy of it sits on an ICRC ledger (ICRC-1, ICRC-2, ICRC-3), the standard Internet Computer exchanges list, and the control plane is that ledger's only minter: withdrawing tokens mints copies, and depositing copies burns them and returns the tokens. Its whole supply is created in the treasury at the start, and the treasury gives it out to early nodes, contributors, and buyers.
+
 This section is not legal or financial advice. Any token sale needs a securities lawyer before it is designed.
 
 ## 6. Settlement and the ledger

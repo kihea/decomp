@@ -18,6 +18,7 @@ use crate::records::Record;
 use crate::registry::NameRecord;
 use crate::relay::{Incoming, RelayOrder};
 use crate::storage::{Challenge, StoreOrder, Waiting};
+use crate::token::{IcrcAccount, Tokens};
 
 /// The largest request or answer either side accepts. A blob travels inside one
 /// as base64, so this allows blobs of up to about 48 MB.
@@ -266,6 +267,41 @@ pub enum Call {
     /// was published as. The batch of the settlement log that covers a draw
     /// fingerprints it (see `settlement`). Answer: `DrawPage`.
     GetDraws { from: u64 },
+    /// Sends tokens to another account (see `token`). Signed by the account
+    /// key itself, as a cash-out is. Answer: an empty object.
+    SendTokens { to: AccountId, amount: Tokens },
+    /// Burns tokens into credits, which the account can spend but not
+    /// transfer or cash out. Answer: an empty object.
+    BurnTokens { amount: Tokens },
+    /// Withdraws tokens as copies on the ICRC ledger, minted to the ICRC
+    /// account `to`. Signed by the account key itself. Answer:
+    /// `WithdrawalAsked`; the copies arrive once the mint is done.
+    WithdrawTokens { amount: Tokens, to: IcrcAccount },
+    /// Where to send copies on the ICRC ledger to deposit them into this
+    /// account. Answer: `DepositAddress`.
+    GetDepositAddress,
+    /// Asks the control plane to burn the copies at the account's deposit
+    /// address and give it the tokens. Answer: an empty object; the tokens
+    /// arrive once the burn is done.
+    DepositTokens,
+    /// The treasury giving out tokens from the supply it holds: to early
+    /// nodes, contributors, and sales. Only a treasurer is answered. Answer:
+    /// an empty object.
+    GrantTokens { to: AccountId, amount: Tokens },
+}
+
+/// The name a withdrawal of tokens was given.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WithdrawalAsked {
+    pub id: ContentHash,
+}
+
+/// Where an account deposits copies of the token: an ICRC account of the
+/// control plane's, on the ICRC ledger `ledger` (a principal in text form).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DepositAddress {
+    pub ledger: String,
+    pub account: IcrcAccount,
 }
 
 /// An account record together with its credits. Changing an account answers
@@ -275,6 +311,10 @@ pub struct AccountStatus {
     #[serde(flatten)]
     pub account: Account,
     pub balance: Balance,
+    /// The account's tokens (see `token`), not counting any it is
+    /// withdrawing.
+    #[serde(default)]
+    pub tokens: Tokens,
     /// The combined reliability of the account's devices, from 0 to 1.
     #[serde(default)]
     pub reputation: f64,

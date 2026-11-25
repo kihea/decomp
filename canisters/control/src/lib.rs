@@ -26,6 +26,10 @@
 //!   provider can sign an entry the canister did not post. The canister
 //!   fetches the key's public key when it is installed, and answers no call
 //!   until it has it.
+//! - **The token.** Copies of the token that exchanges trade live on an ICRC
+//!   ledger installed beside this canister, which is its only minter
+//!   (`bridge`). Withdrawals are minted there and deposits burned there by
+//!   calls between the canisters.
 //! - **Persistence.** The control plane's logs live in the heap, are saved to
 //!   stable memory before an upgrade, and are replayed after it.
 //!
@@ -33,13 +37,17 @@
 //! answer and the gateway passes it on without the canister certifying query
 //! responses.
 
+mod bridge;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
 use candid::{CandidType, Deserialize, Principal};
 use decomp_control::fallback;
-use decomp_control::{ControlPlane, MemorySnapshot, MemoryStorage, Settings, ValueKeyRequest};
+use decomp_control::{
+    ControlPlane, MemorySnapshot, MemoryStorage, Settings, TokenBridge, ValueKeyRequest,
+};
 use decomp_core::{
     AccountId, BATCH_PERIOD_SECS, BEACON_PERIOD_SECS, Beacon, Blob, ContentHash, PublicKey,
     RandomnessSource, Refusal, Signature, VALUE_KEY_CONTEXT, ValueKey, round_at,
@@ -56,6 +64,12 @@ use ic_cdk_management_canister::{
 pub struct InstallSettings {
     /// Account IDs, as hex, allowed to review apps and assign held names.
     pub reviewers: Vec<String>,
+    /// Account IDs, as hex, allowed to act for the treasury.
+    pub treasurers: Option<Vec<String>>,
+    /// The ICRC ledger that holds copies of the token, with this canister as
+    /// its minting account (`canisters/token`). Left out, tokens stay in the
+    /// control plane's ledger.
+    pub token_ledger: Option<Principal>,
     /// Names held for their brands' owners.
     pub reserved_names: Vec<String>,
     /// How long a recovery waits before it takes effect, in seconds. Left
@@ -95,6 +109,9 @@ const MIN_CYCLES_FOR_NEW_JOBS: u128 = 2_000_000_000_000;
 
 struct Canister {
     install: InstallSettings,
+    /// Makes each account's deposit address on the ICRC ledger (see
+    /// `TokenBridge::secret`), drawn from the network's randomness once.
+    bridge_secret: Option<[u8; 32]>,
     storage: MemoryStorage,
     control: ControlPlane,
     sandbox: Sandbox,
@@ -107,6 +124,8 @@ thread_local! {
     static STARTING: RefCell<Option<InstallSettings>> = const { RefCell::new(None) };
     /// Whether a settlement entry is being signed now.
     static SIGNING: RefCell<bool> = const { RefCell::new(false) };
+    /// Whether the bridge is minting or burning on the ICRC ledger now.
+    static BRIDGING: RefCell<bool> = const { RefCell::new(false) };
     /// The threshold key's public key for the value-key context, fetched once.
     static VALUE_KEY_PUBLIC: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     /// Value keys asked for today, by account: the day and the count.
@@ -127,17 +146,22 @@ fn install_seed(purpose: &str) -> [u8; 32] {
     *ContentHash::of(&bytes).as_bytes()
 }
 
-fn open(install: InstallSettings, mut storage: MemoryStorage) -> Canister {
+fn account_ids(ids: &[String]) -> Vec<AccountId> {
+    ids.iter().filter_map(|id| id.parse().ok()).collect()
+}
+
+fn open(
+    install: InstallSettings,
+    mut storage: MemoryStorage,
+    bridge_secret: Option<[u8; 32]>,
+) -> Canister {
     let settings = Settings {
         challenge_interval: CHALLENGE_INTERVAL_SECS,
         recovery_wait: install
             .recovery_wait_secs
             .unwrap_or(decomp_core::RECOVERY_WAIT_SECS),
-        reviewers: install
-            .reviewers
-            .iter()
-            .filter_map(|id| id.parse().ok())
-            .collect(),
+        reviewers: account_ids(&install.reviewers),
+        treasurers: account_ids(install.treasurers.as_deref().unwrap_or_default()),
         reserved_names: install.reserved_names.clone(),
         entropy: install_seed("decomp/entropy"),
     };
@@ -145,10 +169,39 @@ fn open(install: InstallSettings, mut storage: MemoryStorage) -> Canister {
         ControlPlane::open(&mut storage, settings).expect("the control plane's logs replay");
     Canister {
         install,
+        bridge_secret,
         storage,
         control,
         sandbox: Sandbox::new(),
     }
+}
+
+/// Connects the token's ICRC ledger, if the canister was installed with one,
+/// drawing the secret for deposit addresses the first time.
+async fn connect_bridge() {
+    let (ledger, secret) =
+        with_canister(|canister| (canister.install.token_ledger, canister.bridge_secret));
+    let Some(ledger) = ledger else {
+        return;
+    };
+    let secret = match secret {
+        Some(secret) => secret,
+        None => match random_bytes().await {
+            Some(secret) => secret,
+            None => {
+                ic_cdk_timers::set_timer(KEY_RETRY, connect_bridge());
+                return;
+            }
+        },
+    };
+    with_canister(|canister| {
+        canister.bridge_secret = Some(secret);
+        canister.control.connect_bridge(TokenBridge {
+            ledger: ledger.to_text(),
+            minter: ic_cdk::api::canister_self().to_text(),
+            secret,
+        });
+    });
 }
 
 fn signing_key_id() -> SchnorrKeyId {
@@ -176,7 +229,11 @@ async fn start() {
     let Some(install) = STARTING.take() else {
         return;
     };
-    let canister = open(install, MemoryStorage::new(PublicKey::from_bytes(key)));
+    let canister = open(
+        install,
+        MemoryStorage::new(PublicKey::from_bytes(key)),
+        None,
+    );
     CANISTER.with_borrow_mut(|slot| *slot = Some(canister));
     start_timers();
 }
@@ -230,18 +287,19 @@ fn settle(canister: &mut Canister) {
     }
 }
 
+/// 32 bytes of the network's randomness.
+async fn random_bytes() -> Option<[u8; 32]> {
+    let reply = ic_cdk::call::Call::unbounded_wait(Principal::management_canister(), "raw_rand")
+        .await
+        .ok()?;
+    let bytes = reply.candid::<Vec<u8>>().ok()?;
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
+}
+
 /// Fetches a round of the network's randomness, which leases and audits are
 /// drawn from and which reseeds the control plane.
 async fn draw_randomness() {
-    let Ok(reply) =
-        ic_cdk::call::Call::unbounded_wait(Principal::management_canister(), "raw_rand").await
-    else {
-        return;
-    };
-    let Ok(bytes) = reply.candid::<Vec<u8>>() else {
-        return;
-    };
-    let Ok(randomness) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+    let Some(randomness) = random_bytes().await else {
         return;
     };
     with_canister(|canister| {
@@ -254,10 +312,40 @@ async fn draw_randomness() {
     });
 }
 
+/// Mints the copies of waiting withdrawals and burns the deposits asked for,
+/// on the token's ICRC ledger.
+async fn bridge() {
+    let Some(ledger) = with_canister(|canister| canister.install.token_ledger) else {
+        return;
+    };
+    if BRIDGING.replace(true) {
+        return;
+    }
+    let (withdrawals, deposits) = with_canister(|canister| {
+        let control = &mut canister.control;
+        (control.withdrawals(), control.take_deposit_checks())
+    });
+    for withdrawal in &withdrawals {
+        if let Some(entry) = bridge::mint(ledger, withdrawal).await {
+            with_canister(|canister| canister.control.record(entry))
+                .expect("a waiting withdrawal closes");
+        }
+    }
+    for (account, deposit) in deposits {
+        if let Some(entry) = bridge::burn_deposit(ledger, account, deposit).await {
+            with_canister(|canister| canister.control.record(entry))
+                .expect("each burn is a new block, backed by the bridge pool");
+        }
+    }
+    BRIDGING.set(false);
+}
+
 fn start_timers() {
     ic_cdk_timers::set_timer(Duration::ZERO, draw_randomness());
+    ic_cdk_timers::set_timer(Duration::ZERO, connect_bridge());
     ic_cdk_timers::set_timer_interval(Duration::from_secs(BEACON_PERIOD_SECS), draw_randomness);
     ic_cdk_timers::set_timer_interval(TICK, || async { with_canister(settle) });
+    ic_cdk_timers::set_timer_interval(TICK, bridge);
     ic_cdk_timers::set_timer_interval(Duration::from_secs(BATCH_PERIOD_SECS), post_batch);
 }
 
@@ -435,26 +523,31 @@ fn init(install: Option<InstallSettings>) {
     ic_cdk_timers::set_timer(Duration::ZERO, start());
 }
 
-/// What is saved across an upgrade: the install settings, and the control
-/// plane's state once it has opened.
-type Saved = (InstallSettings, Option<MemorySnapshot>);
+/// What is saved across an upgrade: the install settings, the control
+/// plane's state once it has opened, and the secret deposit addresses are
+/// made with.
+type Saved = (InstallSettings, Option<MemorySnapshot>, Option<[u8; 32]>);
 
 #[ic_cdk::pre_upgrade]
 fn pre_upgrade() {
     let saved: Saved = match CANISTER.take() {
-        Some(canister) => (canister.install, Some(canister.storage.snapshot())),
-        None => (STARTING.take().unwrap_or_default(), None),
+        Some(canister) => (
+            canister.install,
+            Some(canister.storage.snapshot()),
+            canister.bridge_secret,
+        ),
+        None => (STARTING.take().unwrap_or_default(), None, None),
     };
     ic_cdk::storage::stable_save((saved,)).expect("state saves");
 }
 
 #[ic_cdk::post_upgrade]
 fn post_upgrade() {
-    let ((install, snapshot),): (Saved,) =
+    let ((install, snapshot, secret),): (Saved,) =
         ic_cdk::storage::stable_restore().expect("state restores");
     match snapshot {
         Some(snapshot) => {
-            let canister = open(install, MemoryStorage::restore(snapshot));
+            let canister = open(install, MemoryStorage::restore(snapshot), secret);
             CANISTER.with_borrow_mut(|slot| *slot = Some(canister));
             start_timers();
         }

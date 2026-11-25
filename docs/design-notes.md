@@ -633,9 +633,10 @@ others, so a bought credit can be spent, staked, and cashed out, as an earned on
 can.
 
 **The treasury says that money moved.** Something outside DeComp must say that a
-payment arrived or a payout was made. The key the control plane signs the
-settlement log and draws with is also the treasury's, and only that key may
-record a credit purchase or pay or refuse a cash-out. The name of the payment
+payment arrived or a payout was made. Treasurers, accounts the control plane is
+installed with, record a credit purchase or pay or refuse a cash-out, signing
+as any account does. The control plane's own key cannot: on the Internet
+Computer it is a threshold key that no one holds, and it belongs to no account. The name of the payment
 goes into the credit record, one payment is credited once, and that is all that
 ties a credit to money.
 
@@ -834,6 +835,58 @@ are given.
 
 **Only the canister.** The devnet has no threshold key, and holding one key in
 its place would defeat the point, so it refuses the call.
+
+## The token
+
+**Stable credits plus a floating token.** Section 5 lists it among the funding
+options, and the owner chose it: tokens are destroyed to make credits, and
+credits are never turned back into tokens. Tokens live in the ledger beside
+credits, so a transfer between accounts is a ledger entry like any other, and
+batches carry token balance changes under ledger addresses (section 6, "No
+public balance under a user's identity").
+
+**The whole supply exists from the start.** 1,000,000,000 tokens are created
+in the treasury when the ledger starts, and nothing creates more. The spec says
+a token "pays early nodes and contributors, and can raise capital"; treasurers
+give tokens out by hand (`grant_tokens`). A schedule that pays nodes in tokens
+automatically is not built, since the spec sets none.
+
+**Burned tokens become credits that cannot be cashed out.** Burning one token
+makes one credit (`CREDIT_MICROS_PER_TOKEN`, a starting value), counted with
+granted credits. If burned credits could be cashed out, the burn rate would be a
+price in money the treasury promises to pay for every token; as credits for
+compute, it is a floor in compute, which is what "stable credits" means for app
+prices.
+
+**A fixed burn rate.** A rate pegged to the token's market price, as some
+networks do, needs a price feed, and no market price exists before the token is
+listed. The rate is a constant; changing it is an upgrade, which is recorded.
+
+**Exchanges trade a copy on DFINITY's ICRC ledger.** Exchanges and wallets on
+the Internet Computer list ICRC-1 and ICRC-2 tokens and index ICRC-3 block logs.
+Writing a ledger that implements them would be code exchanges do not yet
+trust, so the token's copy uses DFINITY's published ledger module, deployed
+unchanged (`canisters/token`). The control canister is its only minting
+account. A withdrawal mints copies; a deposit is a burn by transfer to the
+minting account. So the ICRC ledger's supply never exceeds the bridge pool,
+and is short of it only by the transfer fees that ledger burned.
+
+**Withdrawals mint once.** A mint carries the withdrawal's name as its memo and
+the time it was asked for, so the ICRC ledger answers a repeated mint with the
+first one's block. A mint whose answer was lost is tried again on the next
+tick and lands on that block. A withdrawal not minted within the ICRC ledger's
+24-hour window would be refunded; nothing short of the ledger being down for a
+day leaves one waiting that long.
+
+**Deposit addresses are private.** Each account deposits to a subaccount of the
+control canister made from a secret the canister draws from the network's
+randomness and keeps in its state. Anyone can see that copies were burned, but
+not which account received the tokens.
+
+**Moving tokens out of an account takes the account key.** Section 1 has the
+account key sign cash-outs; sending tokens and withdrawing them move value out
+of the account in the same way. Burning keeps the value in the account, so a
+device may do it.
 
 ## Open questions
 

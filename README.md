@@ -98,8 +98,9 @@ cargo build --release --target wasm32-unknown-unknown -p decomp-control-canister
 cargo run -p decomp-replica
 ```
 
-It prints the canister's address. Clients take it as the control plane's
-address; where `*.localhost` names do not resolve, use the gateway's form,
+It installs the token's ICRC ledger beside it (`canisters/token`), with the
+control canister as its only minter, and prints both canisters. Clients take
+the control canister's address as the control plane's address; where `*.localhost` names do not resolve, use the gateway's form,
 `http://localhost:4943?canisterId=<canister id>`. Rebuilding the canister
 upgrades it in place, and its state is kept.
 
@@ -123,11 +124,13 @@ DECOMP_CONTROL_URL="http://localhost:4943?canisterId=<canister id>"   cargo run 
 | `DECOMP_STORAGE_CHALLENGE_SECS` | `3600` | How long a stored blob goes between challenges |
 | `DECOMP_RECOVERY_WAIT_SECS` | `172800` | How long an account recovery waits before it takes effect |
 | `DECOMP_REVIEWERS` | none | Account IDs, comma-separated, that may review apps and assign held names |
+| `DECOMP_TREASURERS` | none | Account IDs, comma-separated, that may act for the treasury: record credits bought, pay cash-outs, give out tokens |
 | `DECOMP_RESERVED_NAMES` | none | Names, comma-separated, held for their brands' owners |
 
 The devnet's own key, printed at startup and kept in `control.key`, signs the
-settlement log and the published draws, and acts as the treasury on a local
-network.
+settlement log. `decomp-replica` takes `DECOMP_REVIEWERS`, `DECOMP_TREASURERS`,
+and `DECOMP_RESERVED_NAMES` too. An account that must be named before it
+exists, such as a treasurer, is made with `decomp-node new-account-key`.
 
 ## Contributing compute
 
