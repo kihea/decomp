@@ -21,7 +21,7 @@ use decomp_core::{
     AccountId, AccountStatus, AppManifest, Approval, BidOrder, Call, ContentHash, Controller,
     Credits, Encrypted, Fallback, Inclusion, JobClass, JobId, JobStatus, MAX_LOG_PAGE,
     MAX_STORAGE_DAYS, Manifest, OpeningKey, Outcome, Pickup, Price, Privacy, PrivateRoute,
-    PublicKey, Receipt, Request, SHARES, ShardRef, Share, ShareSet, Split, Sponsorship,
+    PublicKey, Receipt, Request, SHARES, ShardRef, Share, ShareSet, SigningKey, Split, Sponsorship,
     Verification, Verify, WorkPreferences, controller, cut, draw_hash, encrypted, merkle, privacy,
     shares,
 };
@@ -97,6 +97,14 @@ enum Command {
     /// Approve a new device into this device's account, by the code its
     /// `link` shows.
     ApproveDevice { device: PublicKey },
+    /// Make keys for a new device, such as a rented machine, and approve it
+    /// into this device's account. Shows the device's code and a secret to
+    /// give the machine in DECOMP_DEVICE_SECRET, which stands in for its key
+    /// files. Anyone who has the secret can work as the device: revoke it
+    /// when the machine is given back.
+    AddDevice,
+    /// Revoke a device of this device's account for good, by its code.
+    RevokeDevice { device: PublicKey },
     /// Ask for earned credits to be cashed out. Signed by the account key.
     CashOut {
         /// Credits to cash out, such as 20 or 12.5.
@@ -490,6 +498,22 @@ fn main() -> ExitCode {
         Command::ApproveDevice { device } => connect().and_then(|client| {
             client.approve_device(device)?;
             println!("approved device {device}");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::AddDevice => connect().and_then(|client| {
+            let key = SigningKey::generate();
+            let opening = OpeningKey::generate();
+            client.approve_device(key.public_key())?;
+            let device = Client::new(&cli.control, SigningKey::from_seed(key.seed()));
+            // So that other devices can send to the new one from the start.
+            device.publish_sealing_key(opening.sealing_key())?;
+            println!("approved device {}", key.public_key());
+            println!("{}={}", device::SECRET_VAR, device::secret(&key, &opening));
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::RevokeDevice { device } => connect().and_then(|client| {
+            client.revoke_device(device)?;
+            println!("revoked device {device}");
             Ok(ExitCode::SUCCESS)
         }),
         Command::CashOut {

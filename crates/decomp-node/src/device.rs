@@ -1,5 +1,7 @@
 //! This device's keys, kept as files in the agent's directory: the key it signs
-//! with, and the key it opens what is sealed to it with.
+//! with, and the key it opens what is sealed to it with. A rented machine is
+//! given both in `DECOMP_DEVICE_SECRET` instead, as `add-device` made them
+//! on a device of the account, so nothing has to be copied onto its disk.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -10,12 +12,47 @@ use decomp_core::{OpeningKey, SigningKey};
 const KEY_FILE: &str = "device.key";
 const OPENING_KEY_FILE: &str = "opening.key";
 
+/// The variable a rented machine's keys are given in: the signing key's
+/// secret bytes, then the opening key's, as 128 hex digits.
+pub const SECRET_VAR: &str = "DECOMP_DEVICE_SECRET";
+
+/// Both keys as one secret, for `SECRET_VAR`.
+pub fn secret(key: &SigningKey, opening: &OpeningKey) -> String {
+    let mut bytes = key.seed().to_vec();
+    bytes.extend_from_slice(&opening.seed());
+    hex::encode(bytes)
+}
+
+/// The keys given in `SECRET_VAR`, if it is set.
+fn from_secret() -> io::Result<Option<([u8; 32], [u8; 32])>> {
+    let Ok(secret) = std::env::var(SECRET_VAR) else {
+        return Ok(None);
+    };
+    let bad = || {
+        let message = format!("{SECRET_VAR} is not a device secret from add-device");
+        io::Error::new(io::ErrorKind::InvalidData, message)
+    };
+    let mut bytes = [0u8; 64];
+    hex::decode_to_slice(secret.trim(), &mut bytes).map_err(|_| bad())?;
+    let (key, opening) = bytes.split_at(32);
+    Ok(Some((
+        key.try_into().expect("32 bytes"),
+        opening.try_into().expect("32 bytes"),
+    )))
+}
+
 pub fn load(dir: &Path) -> io::Result<Option<SigningKey>> {
+    if let Some((key, _)) = from_secret()? {
+        return Ok(Some(SigningKey::from_seed(key)));
+    }
     Ok(read_seed(&dir.join(KEY_FILE))?.map(SigningKey::from_seed))
 }
 
 /// The key this device opens sealed data with, if it has made one.
 pub fn opening_key_if_made(dir: &Path) -> io::Result<Option<OpeningKey>> {
+    if let Some((_, opening)) = from_secret()? {
+        return Ok(Some(OpeningKey::from_seed(opening)));
+    }
     Ok(read_seed(&dir.join(OPENING_KEY_FILE))?.map(OpeningKey::from_seed))
 }
 

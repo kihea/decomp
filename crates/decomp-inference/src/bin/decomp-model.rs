@@ -2,12 +2,13 @@
 //! out.
 //!
 //! ```text
-//! decomp-model pack <hugging-face-folder> --name qwen3-0.6b --stages 2 --out <folder>
+//! decomp-model pack <hugging-face-folder> --name qwen3-0.6b --stages 2 --out <folder> [--precision bf16]
 //! decomp-model try <packed-folder> --prompt "The capital of France is" --tokens 16
 //! ```
 //!
 //! `pack` cuts a Hugging Face model (`config.json`, `model.safetensors`,
-//! `tokenizer.json`) into the files a stored model is published as, writes
+//! `tokenizer.json`) into the files a stored model is published as, to be
+//! computed in 32-bit floats (the default) or in bfloat16, writes
 //! them and the card to the output folder, and prints the card's root: the
 //! model's ID. Each file is then stored with `decomp-node store`, and the ID
 //! added to the approved list.
@@ -23,11 +24,11 @@ use std::time::Instant;
 
 use decomp_core::Sampling;
 use decomp_inference::card::{Card, pack};
-use decomp_inference::decoder::{self, Ends, Stage};
+use decomp_inference::decoder::{self, Ends, Precision, Stage};
 use decomp_inference::{LocalStage, Pipeline, StageLink, generate, validate};
 
 fn usage() -> Box<dyn Error> {
-    "usage: decomp-model pack <folder> --name NAME --stages N --out FOLDER\n       decomp-model try <packed-folder> [--prompt TEXT] [--tokens N]".into()
+    "usage: decomp-model pack <folder> --name NAME --stages N --out FOLDER [--precision f32|bf16]\n       decomp-model try <packed-folder> [--prompt TEXT] [--tokens N]".into()
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -49,10 +50,14 @@ fn pack_folder(args: &[String]) -> Result<(), Box<dyn Error>> {
     let name = flag(args, "--name").ok_or_else(usage)?;
     let stages: usize = flag(args, "--stages").ok_or_else(usage)?.parse()?;
     let out = PathBuf::from(flag(args, "--out").ok_or_else(usage)?);
+    let precision = match flag(args, "--precision") {
+        Some(name) => Precision::parse(&name).ok_or_else(usage)?,
+        None => Precision::F32,
+    };
     let config: serde_json::Value = serde_json::from_slice(&fs::read(folder.join("config.json"))?)?;
     let weights = fs::read(folder.join("model.safetensors"))?;
     let tokenizer = fs::read(folder.join("tokenizer.json"))?;
-    let (card, files) = pack(&name, &config, &weights, tokenizer, stages)?;
+    let (card, files) = pack(&name, &config, &weights, tokenizer, stages, precision)?;
     fs::create_dir_all(&out)?;
     for (index, bytes) in files.iter().enumerate() {
         fs::write(out.join(file_name(index)), bytes)?;

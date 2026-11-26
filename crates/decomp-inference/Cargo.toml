@@ -14,3 +14,9 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
+
+[features]
+# Run models on an NVIDIA GPU (needs the CUDA toolkit to build), or on an
+# Apple GPU. Without either, models run on the CPU.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]

@@ -15,7 +15,7 @@ use safetensors::SafeTensors;
 use safetensors::tensor::TensorView;
 use serde::{Deserialize, Serialize};
 
-use crate::decoder::DecoderConfig;
+use crate::decoder::{DecoderConfig, Precision};
 
 /// One file of a stored model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,15 +72,17 @@ pub enum PackError {
 /// ends, and `stages` stages of layers as even as the layer count allows.
 /// Tensors keep their names and types, so a file is a slice of the original.
 /// Returns the card and each file's bytes, in the card's order: tokenizer,
-/// ends, then the stages.
+/// ends, then the stages. Every node computes the model in `precision`.
 pub fn pack(
     name: &str,
     config: &serde_json::Value,
     weights: &[u8],
     tokenizer: Vec<u8>,
     stages: usize,
+    precision: Precision,
 ) -> Result<(Card, Vec<Vec<u8>>), PackError> {
-    let config = DecoderConfig::from_hugging_face(config).ok_or(PackError::UnknownFamily)?;
+    let mut config = DecoderConfig::from_hugging_face(config).ok_or(PackError::UnknownFamily)?;
+    config.precision = precision;
     if stages == 0 || stages > config.layers {
         return Err(PackError::BadStages {
             layers: config.layers,

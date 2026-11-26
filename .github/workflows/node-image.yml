@@ -1,0 +1,76 @@
+name: Node image
+
+# Builds the node agent's container images and publishes them to GitHub's
+# container registry: `cpu` for any machine and `cuda` for NVIDIA GPUs, each
+# also tagged with the commit. See deploy/node/README.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "deploy/node/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/node-image.yml"
+  pull_request:
+    paths:
+      - "deploy/node/**"
+      - ".github/workflows/node-image.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - tag: cpu
+            build_image: ubuntu:22.04
+            run_image: ubuntu:22.04
+            features: ""
+          - tag: cuda
+            build_image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            run_image: nvidia/cuda:12.4.1-runtime-ubuntu22.04
+            features: cuda
+    steps:
+      # The CUDA build image is large; the runner's preinstalled toolchains
+      # are not needed.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/node/Dockerfile
+          build-args: |
+            BUILD_IMAGE=${{ matrix.build_image }}
+            RUN_IMAGE=${{ matrix.run_image }}
+            FEATURES=${{ matrix.features }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=The DeComp node agent (${{ matrix.tag }})
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/decomp-node:${{ matrix.tag }}
+            ghcr.io/${{ github.repository_owner }}/decomp-node:${{ matrix.tag }}-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.tag }}
+
+  metal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p decomp-node --features metal

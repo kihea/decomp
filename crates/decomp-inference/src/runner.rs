@@ -4,8 +4,6 @@
 //! model runs as a pipeline of its ends and stages, each stage here or on
 //! another node.
 
-use candle_core::Tensor;
-
 use crate::decoder::{self, Ends, Stage, StageCache};
 use crate::model::{Session, Step};
 
@@ -70,12 +68,9 @@ pub fn run_stage(
     if tokens == 0 || activations.len() != tokens * hidden {
         return Err("the activations are not whole rows".into());
     }
-    let device = decoder::device();
-    let x = Tensor::from_vec(activations, (tokens, hidden), &device).map_err(failed)?;
+    let x = decoder::from_floats(activations, tokens, hidden, stage.dtype()).map_err(failed)?;
     let y = stage.forward(&x, cache).map_err(failed)?;
-    y.flatten_all()
-        .and_then(|y| y.to_vec1::<f32>())
-        .map_err(failed)
+    decoder::to_floats(&y).map_err(failed)
 }
 
 impl StageLink for LocalStage<'_> {
@@ -121,19 +116,15 @@ impl Runner for Pipeline<'_> {
 
     fn feed(&mut self, tokens: &[u32]) -> Result<Vec<Step>, String> {
         let embedded = self.ends.embed(tokens).map_err(failed)?;
-        let mut activations = embedded
-            .flatten_all()
-            .and_then(|x| x.to_vec1::<f32>())
-            .map_err(failed)?;
+        let mut activations = decoder::to_floats(&embedded).map_err(failed)?;
         for stage in &mut self.stages {
             activations = stage.forward(activations, tokens.len())?;
             if activations.len() != tokens.len() * self.hidden {
                 return Err("a stage answered with activations of the wrong shape".into());
             }
         }
-        let device = decoder::device();
-        let x =
-            Tensor::from_vec(activations, (tokens.len(), self.hidden), &device).map_err(failed)?;
+        let x = decoder::from_floats(activations, tokens.len(), self.hidden, self.ends.dtype())
+            .map_err(failed)?;
         let (hidden, logits) = self.ends.finish(&x).map_err(failed)?;
         let hidden = decoder::rows(&hidden).map_err(failed)?;
         let logits = decoder::rows(&logits).map_err(failed)?;

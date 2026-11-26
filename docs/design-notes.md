@@ -772,6 +772,30 @@ checkers, would close this; the spec does not say how.
 
 ## Models across devices
 
+**A model's precision is in its card.** On a GPU, large models are computed in
+bfloat16, half the memory of 32-bit floats; on a CPU, 32-bit floats are the
+fastest. TOPLOC tells a change of precision apart from the drift between
+devices, so a GPU node in bfloat16 and a CPU node in 32-bit floats could not
+check each other. The card therefore fixes the precision every node computes
+the model in, whatever its device, and the card's root is the model's ID.
+Activations travel between stages as 32-bit floats either way. A card in 32-bit
+floats leaves the field out, so the IDs of models packed before it are
+unchanged.
+
+**A node runs models on one GPU.** The agent takes the first GPU its build can
+use (CUDA, or Metal on Apple machines) and declares only that one, so a
+machine with several runs a node for each, each shown only its own GPU. That
+keeps one device key, one set of slots, and one hardware score for each GPU.
+
+**A rented machine is given its keys in a variable.** A device keeps its keys
+in files, and joins an account by showing a code and waiting for approval.
+Neither suits a machine rented by the hour and started from a template.
+`add-device` makes a device's keys on a device already in the account,
+approves it, publishes its sealing key, and prints both keys as one secret,
+which the machine is given in `DECOMP_DEVICE_SECRET` in place of the files.
+The company renting out the machine can read the secret, as it could read the
+files; it is one device's, and `revoke-device` ends it.
+
 **A stored model is cut into files on storage nodes.** The owner asked that
 models not need to fit on one device. `decomp-model pack` cuts a Hugging Face
 model into the tokenizer, the ends (embeddings, final normalization, output

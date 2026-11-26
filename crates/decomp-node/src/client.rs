@@ -330,6 +330,17 @@ impl Client {
         self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
     }
 
+    /// Revokes a device of this device's account for good, by its code.
+    pub fn revoke_device(&self, device_key: PublicKey) -> Result<AccountStatus, ClientError> {
+        let account = self.account()?.account;
+        let op = AccountOp::RevokeDevice {
+            account_id: account.id,
+            seq: account.seq,
+            device_key,
+        };
+        self.send(&self.ops_endpoint, &Envelope::seal(&self.key, &op))
+    }
+
     /// Asks for earned credits to be cashed out. The client must sign with the
     /// account key itself.
     pub fn cash_out(&self, amount: Credits) -> Result<ContentHash, ClientError> {

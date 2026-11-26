@@ -38,6 +38,7 @@ and what is built today in
 | `crates/decomp-inference` | Runs the approved models on a node: generation with TOPLOC proofs, and checking another node's generation by prefill. |
 | `crates/decomp-schema` | How a job's input and output types are described and checked. |
 | `client-ts` | `@decomp/client`, the TypeScript client for browsers and desktop web views. |
+| `deploy/node` | The node agent's container images, a Vast.ai template, and EC2 user data, for running nodes on rented machines. |
 | `docs` | The spec, status, and design notes. |
 
 ## Quick start

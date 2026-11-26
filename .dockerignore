@@ -1,0 +1,5 @@
+# Kept out of the node image's build context.
+.git
+target
+data
+**/node_modules

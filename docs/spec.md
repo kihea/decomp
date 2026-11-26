@@ -340,6 +340,8 @@ Every account holds a credit balance: it earns credits when its nodes run jobs a
 
 **Who pays.** A user action in an app creates jobs, and those jobs are charged to the user's balance by default. An application can instead sponsor jobs from its own credit pool, which is how a developer fronts the cost while the user base is small.
 
+**Contribution required for use.** An app can require its users to contribute compute. A job the app's manifest covers then runs for a user only if that user's account earned, over the last 30 days, at least a set share of what it spent. This suits apps that serve inference, where use that nobody supplies could otherwise run up empty demand. The app can exempt chosen models, so cheap models stay open to everyone while costly ones need contribution. An app should require it only where the economics call for it: the default AI chat space serves every model it can afford to without the requirement, and keeps it only for the models that need it.
+
 **Three user profiles.** The compute, split, and siphon groups from the original draft become outcomes of the balance, not roles a user picks.
 
 | Profile | Earlier name | Balance pattern | How it settles |
@@ -452,6 +454,7 @@ At these assumptions a CPU node earns a few dollars a month, so for most users t
 - **CPU nodes** earn pocket change. The offer to most users is that apps cost them nothing.
 - **GPU nodes** are where income is real. An RTX 4090 rents for a [median of USD 0.49 an hour](https://getdeploying.com/reference/cloud-gpu/nvidia-rtx-4090), many times what a CPU slot earns.
 - **Rented GPUs fill the gap at the start.** Until enough users offer GPUs, GPU nodes can run on rented machines. The node agent ships as a container image, with templates for GPU rental markets such as Vast.ai, and a rented machine runs as any other node of the account that rents it.
+- **Third Spaces runs its own fleet at the start.** It contributes compute as any account can, on machines rented from Vast.ai and on EC2 instances (storage optimized, accelerated computing, and general purpose). The EC2 instances that offer AMD SEV-SNP (M6a, C6a, and R6a) are its first attested nodes, which the enclave route of private mode needs.
 - **App prices can fall.** When most results are accepted unconfirmed, the same node pay supports a price near 0.8¢ per slot-hour, about half of cloud spot.
 
 **What Third Spaces earns.** While one team runs both layers, the 5% treasury share is the base income, and at these values it is small. Four levers raise it:

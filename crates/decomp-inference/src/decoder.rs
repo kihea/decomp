@@ -14,6 +14,7 @@
 //! from stage to stage.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use candle_core::{D, DType, Device, Tensor};
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,44 @@ pub struct DecoderConfig {
     pub qk_norm: bool,
     /// The query, key, and value projections have biases (Qwen2).
     pub qkv_bias: bool,
+    /// The precision every node computes the model in, whatever its device.
+    /// It is part of the card, and so of the model's ID, because TOPLOC
+    /// tells a change of precision apart from the drift between devices.
+    #[serde(default, skip_serializing_if = "Precision::is_f32")]
+    pub precision: Precision,
+}
+
+/// The number format a model is computed in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Precision {
+    /// 32-bit floats: the default, and the fastest on a CPU.
+    #[default]
+    F32,
+    /// bfloat16: half the memory, the format large models are trained and
+    /// served in on GPUs.
+    Bf16,
+}
+
+impl Precision {
+    fn is_f32(&self) -> bool {
+        *self == Precision::F32
+    }
+
+    pub fn dtype(self) -> DType {
+        match self {
+            Precision::F32 => DType::F32,
+            Precision::Bf16 => DType::BF16,
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "f32" => Some(Precision::F32),
+            "bf16" => Some(Precision::Bf16),
+            _ => None,
+        }
+    }
 }
 
 impl DecoderConfig {
@@ -75,22 +114,53 @@ impl DecoderConfig {
                     .get("attention_bias")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+            precision: Precision::F32,
         })
     }
 }
 
-/// The device models run on. The CPU for now; a node with a GPU runs them
-/// there once the agent declares GPUs.
+/// The device models run on: the first GPU, in a build with GPU support
+/// (the `cuda` or `metal` feature) on a machine that has one, and otherwise
+/// the CPU. A machine with several GPUs runs one node for each, each shown
+/// only its own (`CUDA_VISIBLE_DEVICES`).
 pub fn device() -> Device {
-    Device::Cpu
+    static DEVICE: OnceLock<Device> = OnceLock::new();
+    DEVICE
+        .get_or_init(|| {
+            #[cfg(feature = "cuda")]
+            if let Ok(device) = Device::new_cuda(0) {
+                return device;
+            }
+            #[cfg(feature = "metal")]
+            if let Ok(device) = Device::new_metal(0) {
+                return device;
+            }
+            Device::Cpu
+        })
+        .clone()
 }
 
-/// A weights file's tensors, in the 32-bit floats the runtime computes in.
-pub fn load_tensors(bytes: &[u8], device: &Device) -> Result<HashMap<String, Tensor>> {
+/// A weights file's tensors, in the format the model is computed in.
+pub fn load_tensors(
+    bytes: &[u8],
+    device: &Device,
+    dtype: DType,
+) -> Result<HashMap<String, Tensor>> {
     candle_core::safetensors::load_buffer(bytes, device)?
         .into_iter()
-        .map(|(name, tensor)| Ok((name, tensor.to_dtype(DType::F32)?)))
+        .map(|(name, tensor)| Ok((name, tensor.to_dtype(dtype)?)))
         .collect()
+}
+
+/// Activations as they travel between stages, plain 32-bit floats, as a
+/// `[tokens, hidden]` tensor in the format the model is computed in.
+pub fn from_floats(floats: Vec<f32>, tokens: usize, hidden: usize, dtype: DType) -> Result<Tensor> {
+    Tensor::from_vec(floats, (tokens, hidden), &device())?.to_dtype(dtype)
+}
+
+/// A tensor as plain 32-bit floats, row after row.
+pub fn to_floats(tensor: &Tensor) -> Result<Vec<f32>> {
+    tensor.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
 }
 
 fn take(tensors: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
@@ -115,7 +185,7 @@ pub struct Ends {
 
 impl Ends {
     pub fn load(config: &DecoderConfig, bytes: &[u8], device: &Device) -> Result<Self> {
-        let mut tensors = load_tensors(bytes, device)?;
+        let mut tensors = load_tensors(bytes, device, config.precision.dtype())?;
         let embeddings = take(&mut tensors, "model.embed_tokens.weight")?;
         let output = if config.tied_embeddings {
             embeddings.t()?.contiguous()?
@@ -128,6 +198,10 @@ impl Ends {
             embeddings,
             output,
         })
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.config.precision.dtype()
     }
 
     /// The tokens' embeddings, `[tokens, hidden]`.
@@ -190,7 +264,8 @@ impl Stage {
         bytes: &[u8],
         device: &Device,
     ) -> Result<Self> {
-        let mut tensors = load_tensors(bytes, device)?;
+        let dtype = config.precision.dtype();
+        let mut tensors = load_tensors(bytes, device, dtype)?;
         let mut layers = Vec::with_capacity(count);
         for index in first..first + count {
             let name = |part: &str| format!("model.layers.{index}.{part}");
@@ -240,9 +315,13 @@ impl Stage {
             config: config.clone(),
             first_layer: first,
             layers,
-            cos: angles.cos()?,
-            sin: angles.sin()?,
+            cos: angles.cos()?.to_dtype(dtype)?,
+            sin: angles.sin()?.to_dtype(dtype)?,
         })
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.config.precision.dtype()
     }
 
     pub fn layer_count(&self) -> usize {
@@ -267,7 +346,7 @@ impl Stage {
         }
         let cos = self.cos.narrow(0, start, tokens)?.contiguous()?;
         let sin = self.sin.narrow(0, start, tokens)?.contiguous()?;
-        let mask = causal_mask(tokens, start, activations.device())?;
+        let mask = causal_mask(tokens, start, activations.device(), activations.dtype())?;
         let mut x = activations.clone();
         for (layer, entry) in self.layers.iter().zip(cache.entries.iter_mut()) {
             x = self.layer(layer, &x, entry, &cos, &sin, mask.as_ref())?;
@@ -356,7 +435,12 @@ impl Stage {
 /// The mask that keeps each of `tokens` new tokens, after `start` earlier
 /// ones, from attending to tokens after it: `[tokens, start + tokens]`.
 /// `None` for one token, which may attend to all.
-fn causal_mask(tokens: usize, start: usize, device: &Device) -> Result<Option<Tensor>> {
+fn causal_mask(
+    tokens: usize,
+    start: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Option<Tensor>> {
     if tokens == 1 {
         return Ok(None);
     }
@@ -372,12 +456,14 @@ fn causal_mask(tokens: usize, start: usize, device: &Device) -> Result<Option<Te
             })
         })
         .collect();
-    Tensor::from_vec(values, (tokens, total), device).map(Some)
+    Tensor::from_vec(values, (tokens, total), device)?
+        .to_dtype(dtype)
+        .map(Some)
 }
 
-/// The rows of a `[rows, width]` tensor as plain vectors.
+/// The rows of a `[rows, width]` tensor as plain 32-bit floats.
 pub fn rows(tensor: &Tensor) -> Result<Vec<Vec<f32>>> {
-    tensor.to_vec2::<f32>()
+    tensor.to_dtype(DType::F32)?.to_vec2::<f32>()
 }
 
 /// The last dimension's index of the largest value, for each row.
