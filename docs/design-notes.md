@@ -129,6 +129,8 @@ record ... so jobs are billed to the right balance." Nothing had to be added to
 what a client sends, and every account has an address from the moment it
 exists.
 
+**A job will check that a device signs for an account.** The spec's default identity in an app is the account ID, but every action is signed by a device key, so a job that knows its users by account ID must be able to tell that a device belongs to one. DeComp offers that to every app: an app takes the account ID or a device identity, as the user chose, and the check is the same either way. It is not built yet.
+
 ## Jobs and verification
 
 **Results are compared whole.** Nodes must agree on the units used and the

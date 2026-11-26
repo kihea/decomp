@@ -184,6 +184,8 @@ An account is a keypair with six fields. DeComp stores no name, email, phone num
 | Account (default) | The account ID, the same in every app | Yes | Social apps, shared contacts, anything with a profile |
 | Device (chosen per app) | One device's key, with no link to the account | No | Send targets, shared or single-purpose machines, apps the user wants kept apart |
 
+**Account identity in jobs.** A job can check that a device signs for an account, so an app that knows a user by the account ID accepts actions signed on any of that user's devices, and one that knows a user by a device identity accepts only that device's.
+
 **Trade-off.** With the account scope, apps can recognize the same user across apps. For the device scope to hide the account, the list of an account's devices must not be publicly readable.
 
 **What the control plane sees.** The accounts canister holds each account's record, including which devices belong to it, so jobs are billed to the right balance. Canister state is visible to ICP's node providers. Compute nodes never see the record, and apps see only the identity the user chose.
@@ -449,6 +451,7 @@ At these assumptions a CPU node earns a few dollars a month, so for most users t
 
 - **CPU nodes** earn pocket change. The offer to most users is that apps cost them nothing.
 - **GPU nodes** are where income is real. An RTX 4090 rents for a [median of USD 0.49 an hour](https://getdeploying.com/reference/cloud-gpu/nvidia-rtx-4090), many times what a CPU slot earns.
+- **Rented GPUs fill the gap at the start.** Until enough users offer GPUs, GPU nodes can run on rented machines. The node agent ships as a container image, with templates for GPU rental markets such as Vast.ai, and a rented machine runs as any other node of the account that rents it.
 - **App prices can fall.** When most results are accepted unconfirmed, the same node pay supports a price near 0.8¢ per slot-hour, about half of cloud spot.
 
 **What Third Spaces earns.** While one team runs both layers, the 5% treasury share is the base income, and at these values it is small. Four levers raise it:
@@ -641,6 +644,7 @@ The developer decides what the app does and how private and durable each part mu
 | Billing | A cost estimate before each job, spending caps, sponsorship rules, one bill | Metering, escrow, fee split, conversion of credits to cycles |
 | Identity | The user's account ID, or a device identity if the user chose one; signed user actions | Key storage, device certificates, sign-in and recovery flows, one-time job IDs |
 | Verification | An optional `verify` override | Checkpoints, spot checks, disputes, known-answer jobs, penalties |
+| AI fingerprinting | Whether a piece of content came from an approved model run on the network, and how likely text or media is to be AI-made | Reading the content's receipt and model transcript; running the detection model as an inference job |
 | Display | The tile's background, artwork, typeface, size, tagline, and indicators; the whole screen once the space is open | Rendering tiles on the home page, enforcing the fixed tile rules, and the home button |
 
 **What every result reports.** Each result carries a receipt with five fields: the privacy route used, how the result was verified, what it cost, how long it took, and whether an enclave was involved.
