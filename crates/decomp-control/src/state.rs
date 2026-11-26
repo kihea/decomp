@@ -24,7 +24,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 
+use decomp_core::LogEntry;
 use decomp_core::Records as AccountRecords;
+use decomp_core::devices::{DEVICE_ROOT_REFRESH_SECS, DeviceProof, DeviceTree};
 use decomp_core::market::{BALANCED_LOOKBACK_SECS, fallback_rate};
 use decomp_core::{
     Account, AccountId, AccountStanding, AccountStatus, Accounts, Activity, Beacon, Bid, BidOrder,
@@ -253,6 +255,10 @@ pub struct ControlPlane {
     unsigned: Option<(String, Vec<u8>)>,
     settlement: SettlementLog,
     settlement_log: Log,
+    /// The settlement log's last entry posting a devices root, and the tree
+    /// it is the root of, once it has been built again since.
+    devices_entry: Option<Envelope>,
+    device_tree: Option<DeviceTree>,
     /// The draws of jobs that have closed, each as the text it was published
     /// as, and the hash of each text. Each batch fingerprints the draws since
     /// the batch before it.
@@ -421,8 +427,13 @@ impl ControlPlane {
         }
 
         let mut settlement = SettlementLog::default();
+        let mut devices_entry = None;
         let settlement_log = replay(store, "settlement", |entry: Envelope| {
-            settlement.apply(&entry).map_err(|e| e.to_string())
+            settlement.apply(&entry).map_err(|e| e.to_string())?;
+            if posts_devices(&entry) {
+                devices_entry = Some(entry);
+            }
+            Ok(())
         })?;
         let Through {
             ops: posted_ops,
@@ -477,6 +488,8 @@ impl ControlPlane {
             taking_jobs: true,
             settlement,
             settlement_log,
+            devices_entry,
+            device_tree: None,
             draw_hashes,
             draws_log,
             registry,
@@ -543,13 +556,58 @@ impl ControlPlane {
         let receipts = &self.receipt_hashes[last.receipts as usize..];
         let draws = &self.draw_hashes[last.draws as usize..];
         let holdings = self.holdings();
-        let Some(batch) = self
+        if let Some(batch) = self
             .settlement
             .next_batch(receipts, draws, &holdings, through)
-        else {
+        {
+            self.post(now, Posted::Batch(batch));
+        }
+        self.post_devices(now);
+    }
+
+    /// Posts the root of the tree of devices and their accounts, if the
+    /// devices changed since it was posted last or it is due again (see
+    /// `decomp_core::devices`). One entry waits for a threshold key's
+    /// signature at a time, so behind a batch it waits for the next period.
+    fn post_devices(&mut self, now: u64) {
+        if self.unsigned.is_some() {
             return;
+        }
+        let tree = DeviceTree::new(self.accounts.devices());
+        let due = match self.settlement.devices() {
+            Some((root, at)) => {
+                root != tree.root() || now.saturating_sub(at) >= DEVICE_ROOT_REFRESH_SECS
+            }
+            None => true,
         };
-        self.post(now, Posted::Batch(batch));
+        if due {
+            let root = tree.root();
+            self.device_tree = Some(tree);
+            self.post(now, Posted::Devices { root });
+        }
+    }
+
+    /// The proof that `device` belongs to its account, resting on the
+    /// devices root posted last. `None` if no root has been posted with the
+    /// device in it yet.
+    pub fn device_proof(&mut self, device: &PublicKey) -> Option<DeviceProof> {
+        let entry = self.devices_entry.clone()?;
+        let (root, _) = self.settlement.devices()?;
+        if self.device_tree.as_ref().map(DeviceTree::root) != Some(root) {
+            // Since a restart, or since devices changed: the tree is built
+            // again, and serves proofs only if the devices are as posted.
+            let tree = DeviceTree::new(self.accounts.devices());
+            if tree.root() != root {
+                return None;
+            }
+            self.device_tree = Some(tree);
+        }
+        let (account, siblings) = self.device_tree.as_ref()?.prove(device)?;
+        Some(DeviceProof {
+            account,
+            entry,
+            siblings,
+        })
     }
 
     /// Signs an entry and adds it to the settlement log, or, for a threshold
@@ -594,6 +652,9 @@ impl ControlPlane {
     fn append_entry(&mut self, entry: &Envelope) -> Result<(), LogError> {
         self.settlement.apply(entry)?;
         self.settlement_log.append(entry);
+        if posts_devices(entry) {
+            self.devices_entry = Some(entry.clone());
+        }
         Ok(())
     }
 
@@ -1807,6 +1868,7 @@ impl ControlPlane {
                         None => records::encode(&Records::new()),
                     }),
                     compute_cap: job.manifest.compute_cap,
+                    control_key: self.control.public_key(),
                 };
                 (job_id, run)
             })
@@ -1859,6 +1921,17 @@ struct Named {
 }
 
 /// Opens a log and applies every entry already in it.
+/// Whether a settlement log entry posts a devices root.
+fn posts_devices(entry: &Envelope) -> bool {
+    matches!(
+        entry.open::<LogEntry>(),
+        Ok(LogEntry {
+            posted: Posted::Devices { .. },
+            ..
+        })
+    )
+}
+
 fn replay<T: DeserializeOwned>(
     store: &mut dyn StateStore,
     name: &str,

@@ -109,6 +109,11 @@ pub struct LogEntry {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Posted {
     Batch(Batch),
+    /// The root of the tree of devices and their accounts, which device
+    /// proofs rest on (see `devices`).
+    Devices {
+        root: ContentHash,
+    },
 }
 
 /// What names a signed log entry in the entry after it: the hash of its text
@@ -188,6 +193,8 @@ pub struct SettlementLog {
     balances: BTreeMap<LedgerAddress, u64>,
     /// The tokens at every address, in hundred-millionths.
     tokens: BTreeMap<LedgerAddress, u64>,
+    /// The devices root posted last, and when.
+    devices: Option<(ContentHash, u64)>,
 }
 
 /// Takes `changes` into `balances`, if they are one for each address, in
@@ -258,6 +265,7 @@ impl SettlementLog {
                 self.take_batch(batch)?;
                 self.posted_at.push(at);
             }
+            Posted::Devices { root } => self.devices = Some((root, at)),
         }
         self.signer = Some(entry.signer);
         self.last = Some((entry_hash(entry), at));
@@ -290,6 +298,11 @@ impl SettlementLog {
     /// When batch `number` was posted, in seconds since 1970.
     pub fn posted_at(&self, number: u64) -> Option<u64> {
         self.posted_at.get(usize::try_from(number).ok()?).copied()
+    }
+
+    /// The devices root posted last, and when it was posted.
+    pub fn devices(&self) -> Option<(ContentHash, u64)> {
+        self.devices
     }
 
     /// The key that signs the log, once it has an entry.

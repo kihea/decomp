@@ -14,8 +14,8 @@ Last updated 2026-11-21.
 | Accounts as a key with no personal data; device keys; device linking | Available | `create_account`, `approve_device`, `revoke_device` |
 | The six account fields | Available | ID, devices, balance, reputation, controllers, and when the account appeared |
 | Controllers: recovery keys, a recovery service's key, guardian accounts, passkeys, wallets | Available | Recovery waits 48 hours and any device of the account can cancel it; an account can require two controllers |
-| Device-scope identity per app | Not started | Apps see the account ID today |
-| Account identity in jobs | Not started | A job will be able to check that a device signs for an account, so an app can know a user by the account ID, or by a device identity if the user chose one, while each device signs with its own key |
+| Device-scope identity per app | Available | An app is handed a device's key alone (the device identity) or with its device proof (the account). Which an app is handed is the application layer's choice |
+| Account identity in jobs | Available | The control plane posts the root of a Merkle tree of devices and accounts to the settlement log (`decomp_core::devices`); a device's proof, from `GetDeviceProof`, is checked in a job with `identity.account`, and is good for an hour either side of its entry |
 
 ## Nodes and jobs
 

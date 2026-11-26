@@ -38,6 +38,7 @@
 //! | `kv.scan` | `(prefix, len) -> len` | Gathers the records whose keys start with the `len` bytes at `prefix`, in the byte form `decomp_schema::records` defines, and returns its length as a 64-bit integer. `result.read` then copies it |
 //! | `model.generate` | `(model, prompt, len, max_tokens, temperature) -> len` | Has the approved model whose ID is the 32 bytes at `model`, one the job's manifest names, generate `max_tokens` tokens after the `len` bytes of prompt at `prompt`, sampling at `temperature` thousandths (0 takes the likeliest token), and returns the output's length in bytes as a 64-bit integer, or -1 if the manifest does not name the model. `result.read` then copies the output |
 //! | `model.embed` | `(model, text, len) -> len` | Has that model embed the `len` bytes at `text`, and returns the length of the embedding, little-endian 32-bit floats, as a 64-bit integer, or -1 if the manifest does not name the model. `result.read` then copies it |
+//! | `identity.account` | `(device, proof, len, at, dest) -> found` | Reads the `len` bytes at `proof` as a device proof (`decomp_core::devices::DeviceProof`, as JSON) and, if it shows the device whose 32-byte public key is at `device` to belong to an account at time `at` (a 64-bit integer, seconds since 1970), writes the account's ID to the 32 bytes at `dest` and returns 1; otherwise returns 0 |
 //! | `result.read` | `(dest)` | Copies what the last `open`, `blob.get`, `kv.get`, `kv.scan`, `model.generate`, or `model.embed` found into memory at `dest` |
 //!
 //! The three `kv` functions end a job that was handed no shard.
@@ -69,6 +70,7 @@ use crate::engine::{
 };
 use std::sync::Arc;
 
+use decomp_core::devices::DeviceProof;
 use decomp_core::inference::{Sampling, approved, call_seed};
 use decomp_core::{
     ContentHash, MAX_SPAWNED, OpeningKey, PublicKey, SEAL_OVERHEAD_BYTES, SealingKey, Signature,
@@ -157,6 +159,10 @@ pub struct Job<'a> {
     /// What answers the job's model calls. `None` where no model runs, which
     /// ends a job that calls one.
     pub model_host: Option<Arc<dyn Models>>,
+    /// The key the control plane signs its settlement log with, which device
+    /// proofs rest on. `None` where it is not known, and then
+    /// `identity.account` finds no account.
+    pub control_key: Option<PublicKey>,
 }
 
 /// One call a job made to a model.
@@ -397,6 +403,8 @@ struct State {
     random_blocks_drawn: u64,
     /// The key `open` opens with, if the job was given one.
     opening_key: Option<OpeningKey>,
+    /// The key device proofs rest on, if the job was given it.
+    control_key: Option<PublicKey>,
     /// The models the job may call, what answers them, and how many calls
     /// the job has made.
     models: Vec<ContentHash>,
@@ -460,6 +468,7 @@ impl Sandbox {
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "sig.verify", sig_verify))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "seal", seal_message))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "open", open_message))
+            .and_then(|linker| linker.func_wrap(HOST_MODULE, "identity.account", identity_account))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "rand.seeded", rand_seeded))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "blob.get", blob_get))
             .and_then(|linker| linker.func_wrap(HOST_MODULE, "blob.put", blob_put))
@@ -533,6 +542,7 @@ impl Sandbox {
             opening_key: None,
             models: &[],
             model_host: None,
+            control_key: None,
         };
         match self.execute(&job, SIGNATURE_EXPORT, None) {
             Ok(run) => Ok(run.result.ok().map(|produced| produced.output)),
@@ -598,6 +608,7 @@ impl Sandbox {
             seed: job.seed,
             random_blocks_drawn: 0,
             opening_key: job.opening_key.map(|key| OpeningKey::from_seed(key.seed())),
+            control_key: job.control_key,
             models: job.models.to_vec(),
             model_host: job.model_host.clone(),
             model_calls: 0,
@@ -948,6 +959,32 @@ fn open_message(mut caller: Caller<'_, State>, src: u32, len: u32) -> HostResult
     let found = opened.as_ref().map_or(-1, |message| message.len() as i64);
     state.found = opened.map(Found::Bytes);
     Ok(found)
+}
+
+/// Finds the account a device belongs to from a device proof. Charged as a
+/// signature check, which is what the proof costs to check, and by the byte.
+fn identity_account(
+    mut caller: Caller<'_, State>,
+    device: u32,
+    proof: u32,
+    len: u32,
+    at: u64,
+    dest: u32,
+) -> HostResult<u32> {
+    let (memory, state) = memory_and_state(&mut caller);
+    charge(state, SIGNATURE_CHECK_INSTRUCTIONS)?;
+    charge_for_bytes(state, len as usize)?;
+    let device = PublicKey::from_bytes(range(memory, device, 32)?.try_into().expect("32 bytes"));
+    let account = state.control_key.and_then(|control| {
+        let proof: DeviceProof =
+            serde_json::from_slice(range(memory, proof, len as usize).ok()?).ok()?;
+        proof.account_of(&device, &control, at)
+    });
+    let Some(account) = account else {
+        return Ok(0);
+    };
+    range_mut(memory, dest, 32)?.copy_from_slice(account.as_bytes());
+    Ok(1)
 }
 
 /// Fills the module's buffer from the job's random stream: block `n` of the

@@ -30,14 +30,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ENV PATH=/root/.cargo/bin:${PATH}
 WORKDIR /src
 COPY . .
+# The node agent, and decomp-model for packing and trying models on the
+# machine's own GPU.
 RUN cargo build --release --locked -p decomp-node --features "${FEATURES}" \
- && cp target/release/decomp-node /usr/local/bin/decomp-node
+ && cargo build --release --locked -p decomp-inference --bin decomp-model --features "${FEATURES}" \
+ && cp target/release/decomp-node target/release/decomp-model /usr/local/bin/
 
 FROM ${RUN_IMAGE}
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=build /usr/local/bin/decomp-node /usr/local/bin/decomp-node
+COPY --from=build /usr/local/bin/decomp-node /usr/local/bin/decomp-model /usr/local/bin/
 COPY --chmod=0755 deploy/node/entrypoint.sh /usr/local/bin/decomp-node-entrypoint
 # Where the node keeps what it holds for the network: stored files and models.
 ENV DECOMP_NODE_DIR=/var/lib/decomp

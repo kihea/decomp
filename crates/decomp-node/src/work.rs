@@ -116,6 +116,7 @@ pub fn work(client: &Client, sandbox: &Sandbox, lease: &Lease) -> Result<Committ
         opening_key: None,
         models: &manifest.models,
         model_host,
+        control_key: client.control_key(),
     });
     // A model call this node could not answer, for a reason of its own, is no
     // result: the lease lapses and the job is granted again.

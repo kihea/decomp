@@ -129,7 +129,39 @@ record ... so jobs are billed to the right balance." Nothing had to be added to
 what a client sends, and every account has an address from the moment it
 exists.
 
-**A job will check that a device signs for an account.** The spec's default identity in an app is the account ID, but every action is signed by a device key, so a job that knows its users by account ID must be able to tell that a device belongs to one. DeComp offers that to every app: an app takes the account ID or a device identity, as the user chose, and the check is the same either way. It is not built yet.
+**A job checks that a device signs for an account with a device proof.** The
+spec's default identity in an app is the account ID, but every action is signed
+by a device key, so a job that knows its users by account ID must be able to
+tell that a device belongs to one. DeComp offers that to every app. A
+certificate signed for each device by the control plane would cost a threshold
+signature each, about 26 billion cycles on the Internet Computer, for every
+device every time it is renewed. Instead the control plane keeps a Merkle tree
+of every device that is not revoked and its account, and posts the tree's root
+to the settlement log as an entry of its own (`Posted::Devices`), signed like
+every entry there: one signature for all devices. A device asks for its proof
+(`GetDeviceProof`): its account, that signed entry, and the hashes beside its
+path. A job checks it with `identity.account`, given the control plane's key
+by the node, so the check is one signature and a few hashes, with no call to
+the control plane. An app given a device's key alone knows the user by the
+device; given the key and the proof, by the account.
+
+**A device proof is good for an hour either side of its entry.** A proof cannot
+be taken back, so its age bounds how long a revoked device still passes as its
+account's. The root is posted whenever the devices change, at most once a batch
+period, and at least every half hour, so a device that is still its account's
+can always get a proof under half an hour old; a revoked device passes for at
+most an hour after its last root. The time a proof is checked against is the
+job's to give, and must be one it trusts, such as a game tick's.
+
+**The device tree is a trie with single-device subtrees cut short.** Each device
+sits at the hash of its key, and a subtree that holds one device is that
+device's leaf, so a proof is about as many hashes as the base-2 logarithm of
+the number of devices: five on a test network of a few dozen. Leaves and inner
+nodes are hashed with different prefixes, so neither can pass as the other.
+The control plane builds the tree again from the accounts each batch period,
+in time that grows with the number of devices; keeping it between periods
+waits until measured load calls for it, like the split of the job board. Only
+a device is given its own proof, so the tree reveals no account's devices.
 
 ## Jobs and verification
 

@@ -4,7 +4,7 @@
 //! and blobs to read with the control plane when it is submitted, and what the
 //! run produces is kept here too.
 
-use decomp_core::{JobId, JobResult};
+use decomp_core::{JobId, JobResult, PublicKey};
 use decomp_sandbox::{Blobs, Job, Sandbox};
 
 /// A job to run as a fallback, with everything it reads.
@@ -18,6 +18,8 @@ pub struct FallBackRun {
     /// The records of the shard the job was handed, if it was handed one.
     pub shard: Option<Vec<u8>>,
     pub compute_cap: u64,
+    /// The key the settlement log is signed with, which device proofs rest on.
+    pub control_key: PublicKey,
 }
 
 /// Runs a job whole and returns its result and every blob it produced.
@@ -33,6 +35,7 @@ pub fn run(sandbox: &Sandbox, run: &FallBackRun, job_id: JobId) -> (JobResult, V
         // Inference jobs cannot fall back, so no fallback calls a model.
         models: &[],
         model_host: None,
+        control_key: Some(run.control_key),
     });
     let produced = finding
         .produced_blobs()

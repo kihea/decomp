@@ -7,6 +7,7 @@ mod account;
 mod amount;
 mod app;
 pub mod controller;
+pub mod devices;
 mod draw;
 #[cfg(feature = "encrypted")]
 pub mod encrypted;

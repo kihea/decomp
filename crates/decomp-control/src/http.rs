@@ -383,6 +383,17 @@ fn answer(
                 message,
             ));
         }
+        Call::GetDeviceProof => match control.device_proof(&signer) {
+            Some(proof) => Json(proof).into_response(),
+            None => {
+                let message = "no devices root with this device in it has been posted yet; ask again after the next batch";
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "device_proof_pending",
+                    message,
+                ));
+            }
+        },
         Call::GetSealingKey { device } => Json(PublishedKey {
             proof: control.sealing_key_proof(&device),
         })

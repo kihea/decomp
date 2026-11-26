@@ -105,6 +105,9 @@ enum Command {
     AddDevice,
     /// Revoke a device of this device's account for good, by its code.
     RevokeDevice { device: PublicKey },
+    /// Show the proof that this device belongs to its account, which apps'
+    /// jobs check, as JSON, after checking it against the control plane's key.
+    DeviceProof,
     /// Ask for earned credits to be cashed out. Signed by the account key.
     CashOut {
         /// Credits to cash out, such as 20 or 12.5.
@@ -511,6 +514,16 @@ fn main() -> ExitCode {
             println!("{}={}", device::SECRET_VAR, device::secret(&key, &opening));
             Ok(ExitCode::SUCCESS)
         }),
+        Command::DeviceProof => connect().and_then(|client| {
+            let proof = client.device_proof()?;
+            let control = client.control_key().ok_or("the settlement log has no entry yet")?;
+            let account = proof
+                .account_of(&client.device_key(), &control, unix_now())
+                .ok_or("the proof does not hold")?;
+            eprintln!("this device belongs to account {account}");
+            println!("{}", serde_json::to_string(&proof)?);
+            Ok(ExitCode::SUCCESS)
+        }),
         Command::RevokeDevice { device } => connect().and_then(|client| {
             client.revoke_device(device)?;
             println!("revoked device {device}");
@@ -829,7 +842,12 @@ fn main() -> ExitCode {
             Ok(ExitCode::SUCCESS)
         }),
         Command::Run { job } => {
-            read_job(&job).and_then(|files| run_here(&Sandbox::new(), &cli.dir, &job, &files))
+            // Device proofs a job checks rest on the control plane's key,
+            // known here only if the control plane can be reached.
+            let control_key = connect().ok().and_then(|client| client.control_key());
+            read_job(&job).and_then(|files| {
+                run_here(&Sandbox::new(), &cli.dir, &job, &files, control_key)
+            })
         }
     };
     outcome.unwrap_or_else(|error| {
@@ -1386,7 +1404,7 @@ fn submit(
         let fits_device = job.compute_cap <= ANY_DEVICE_UNITS
             || job.compute_cap as f64 <= pace * limits.deadline_secs as f64;
         return match privacy::route(&signature, job.compute_cap, fits_device)? {
-            PrivateRoute::Local => run_here(&sandbox, dir, &job, &files),
+            PrivateRoute::Local => run_here(&sandbox, dir, &job, &files, client.control_key()),
             PrivateRoute::PrivateTotals => submit_shares(client, &job, files, &signature, limits),
             PrivateRoute::EncryptedCompute => {
                 submit_encrypted(client, &job, files, &signature, limits)
@@ -1800,6 +1818,7 @@ fn run_here(
     dir: &Path,
     job: &JobArgs,
     files: &JobFiles,
+    control_key: Option<PublicKey>,
 ) -> Result<ExitCode, Box<dyn Error>> {
     let JobFiles {
         module,
@@ -1837,6 +1856,7 @@ fn run_here(
         // Nor is there any state to hand it.
         state: None,
         opening_key: opening_key.as_ref(),
+        control_key,
         models: &job.models,
         // Off the network there is no one to check the models' answers, so
         // they are generated here.

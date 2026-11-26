@@ -229,6 +229,9 @@ pub enum Call {
     /// `value_keys`). Only the control canister can answer it. Answer:
     /// `ValueKey`.
     GetValueKey { label: String, transport_key: Blob },
+    /// The proof that the signing device belongs to its account, resting on
+    /// the devices root posted last (see `devices`). Answer: `DeviceProof`.
+    GetDeviceProof,
     /// Opens a channel to the device `to` through a relay node, for up to `bytes`
     /// bytes, and sets the fee for that much aside (see `relay`). Answer: `Route`.
     OpenRelay { to: PublicKey, bytes: u64 },

@@ -369,6 +369,17 @@ impl Accounts {
         self.by_id.get(id)
     }
 
+    /// Every device that has not been revoked, and its account.
+    pub fn devices(&self) -> impl Iterator<Item = (PublicKey, AccountId)> + '_ {
+        self.by_id.values().flat_map(|account| {
+            account
+                .devices
+                .iter()
+                .filter(|device| !device.revoked)
+                .map(|device| (device.key, account.id))
+        })
+    }
+
     /// The account `key` belongs to, as its account key or as one of its devices
     /// (revoked devices included).
     pub fn account_of(&self, key: &PublicKey) -> Option<&Account> {

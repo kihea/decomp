@@ -1,8 +1,10 @@
 //! Client for the control plane's request endpoint, signing as this device.
 
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decomp_core::LogError;
+use decomp_core::devices::DeviceProof;
 use decomp_core::{
     AccountId, AccountOp, AccountStatus, Activity, AppManifest, Approval, Bid, BidOrder, Bids,
     Blob, BlobData, BlobRef, Call, CashOut, CashOutAsked, CashOuts, Challenge, ContentHash,
@@ -44,6 +46,8 @@ pub struct Client {
     ops_endpoint: String,
     key: SigningKey,
     http: ureq::Agent,
+    /// The key the control plane signs its settlement log with, once known.
+    control_key: OnceLock<PublicKey>,
 }
 
 impl Client {
@@ -66,7 +70,25 @@ impl Client {
             ops_endpoint: format!("{base}/v1/ops{query}"),
             key,
             http,
+            control_key: OnceLock::new(),
         }
+    }
+
+    /// The key the control plane signs its settlement log with, which device
+    /// proofs rest on: the signer of the log's first entry. `None` until the
+    /// log has one, or if the control plane cannot be reached.
+    pub fn control_key(&self) -> Option<PublicKey> {
+        if let Some(key) = self.control_key.get() {
+            return Some(*key);
+        }
+        let key = self.log_page(0).ok()?.entries.first()?.signer;
+        Some(*self.control_key.get_or_init(|| key))
+    }
+
+    /// The proof that this device belongs to its account (see
+    /// `decomp_core::devices`).
+    pub fn device_proof(&self) -> Result<DeviceProof, ClientError> {
+        self.call(Call::GetDeviceProof)
     }
 
     pub fn device_key(&self) -> PublicKey {
