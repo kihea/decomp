@@ -112,6 +112,13 @@ export type AppManifest = {
   client?: string;
   /** The hash of a blob of metadata the application layer defines. */
   metadata?: string;
+  /**
+   * Left out, the app requires no contribution. Otherwise a job the app pays for,
+   * or that is handed its state, runs only for an account that earned `percent`
+   * percent of what it spent over the last 30 days, unless every model the job
+   * calls is in `exempt_models`.
+   */
+  contribution?: { percent: number; exempt_models?: string[] };
 };
 
 export type Account = {

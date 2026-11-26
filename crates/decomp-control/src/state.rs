@@ -26,6 +26,7 @@ use std::io;
 
 use decomp_core::LogEntry;
 use decomp_core::Records as AccountRecords;
+use decomp_core::app::CONTRIBUTION_WINDOW_SECS;
 use decomp_core::devices::{DEVICE_ROOT_REFRESH_SECS, DeviceProof, DeviceTree};
 use decomp_core::market::{BALANCED_LOOKBACK_SECS, fallback_rate};
 use decomp_core::{
@@ -148,6 +149,14 @@ pub enum SubmitError {
     SplitWithState,
     #[error(transparent)]
     Privacy(#[from] PrivacyError),
+    #[error(
+        "the app requires its users to contribute compute: this account has earned {earned} credits and spent {spent} over the last 30 days, and the app asks it to have earned {percent}% of what it spends, this job included"
+    )]
+    ContributionRequired {
+        earned: Credits,
+        spent: Credits,
+        percent: u32,
+    },
 }
 
 /// The ICRC ledger that holds copies of the token, and what the control
@@ -1330,6 +1339,7 @@ impl ControlPlane {
             self.sponsored
                 .check((app, published), account, module, to_set_aside, now)?;
         }
+        self.check_contribution(account, &manifest, to_set_aside, now)?;
         if self.ledger.balance(&payer).spendable() < to_set_aside {
             return Err(LedgerError::InsufficientCredits.into());
         }
@@ -1353,6 +1363,42 @@ impl ControlPlane {
             self.splits.add(job_id, account, manifest, pieces);
         }
         Ok(job_id)
+    }
+
+    /// Refuses a job if an app whose credits or state it uses requires its
+    /// users to contribute compute, and `account` has not contributed enough
+    /// to set `amount` aside for it (see `decomp_core::app`). The app's own
+    /// account is never held to its rule.
+    fn check_contribution(
+        &self,
+        account: AccountId,
+        manifest: &Manifest,
+        amount: Credits,
+        now: u64,
+    ) -> Result<(), SubmitError> {
+        let apps = manifest
+            .sponsor
+            .iter()
+            .chain(manifest.state.as_ref().map(|shard| &shard.app));
+        for app in apps.filter(|app| **app != account) {
+            let rule = self
+                .accounts
+                .get(app)
+                .and_then(|owner| owner.app.as_ref())
+                .and_then(|published| published.contribution.as_ref());
+            let Some(rule) = rule.filter(|rule| rule.covers(&manifest.models)) else {
+                continue;
+            };
+            let window = self.activity(&account, now.saturating_sub(CONTRIBUTION_WINDOW_SECS));
+            if !rule.allows(window.earned, window.spent, amount) {
+                return Err(SubmitError::ContributionRequired {
+                    earned: window.earned,
+                    spent: window.spent,
+                    percent: rule.percent,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The accounts a job is kept from: those that the keys its manifest names

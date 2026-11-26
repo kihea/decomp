@@ -41,6 +41,7 @@ Last updated 2026-11-21.
 | Credits in microcredits; posted rates with tier premiums between a floor and the fallback ceiling | Available | 250 microcredits per unit at the base rate; premiums retune every minute |
 | Fee split, stake, penalties, starter grant | Available | Each node is paid 85% of its own run |
 | Share caps, taper, balanced accounts first | Available | Caps and the taper apply once a tier has 100 active accounts |
+| Contribution required for use | Available | An app can require that a job it pays for, or that is handed its state, runs only for an account that earned a set share of what it spent over 30 days, and exempt chosen models (`decomp_core::app::Contribution`) |
 | Open market: standing bids in tiers 3 and 4 | Available | Per unit or per job; bids can only go below the posted rate |
 | Buying and cashing out credits | In development | Treasurer accounts record purchases and cash-outs; no payment rail is connected until the legal review is complete |
 | Storage, relay, and inference rates | In development | Storage and relays are priced by starting values the spec leaves open |

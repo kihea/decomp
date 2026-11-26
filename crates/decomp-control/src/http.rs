@@ -739,6 +739,9 @@ impl From<SubmitError> for ApiError {
             SubmitError::NotTakingJobs => {
                 Self::new(StatusCode::SERVICE_UNAVAILABLE, "not_taking_jobs", message)
             }
+            SubmitError::ContributionRequired { .. } => {
+                Self::new(StatusCode::FORBIDDEN, "contribution_required", message)
+            }
             SubmitError::TooManyPieces => {
                 Self::new(StatusCode::BAD_REQUEST, "too_many_pieces", message)
             }

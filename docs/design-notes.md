@@ -324,6 +324,21 @@ fewer, larger records or in shards.
 
 ## Market and pricing
 
+**A contribution rule covers the jobs that use the app's credits or state.**
+The owner asked that an app be able to require its users to contribute
+compute, so that use nobody supplies cannot run up empty demand, with chosen
+models exempt. A job names the app it uses only when the app pays for it
+(`sponsor`) or it is handed the app's state, so those are the jobs the rule
+covers. A job a user pays for that touches nothing of the app's is the user's
+own use of the network, and refusing it would protect nothing of the app's;
+covering every job that runs one of the app's modules would also hold the
+users of every other app that lists the same module to this app's rule. The
+share is of credits earned over credits spent in the last 30 days, the spec's
+window, counting the job being submitted, so a new account that has earned
+nothing is refused its first covered job. A job is exempt only if it calls
+models and every one is exempt; a job that calls none is covered. The app's
+own account is never held to its rule.
+
 **Credits are whole millionths.** Amounts are integers of microcredits, so fee
 shares are exact and the parts of a split always add up to the fee; the treasury
 takes what rounding leaves. Premiums are whole thousandths for the same reason:

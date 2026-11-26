@@ -5,7 +5,7 @@
 
 mod account;
 mod amount;
-mod app;
+pub mod app;
 pub mod controller;
 pub mod devices;
 mod draw;
@@ -39,7 +39,8 @@ mod value_keys;
 
 pub use account::{Account, AccountOp, Accounts, Device, OpError, Recovery};
 pub use app::{
-    AppManifest, MAX_APP_MODULES, MAX_APP_NAME_BYTES, SponsorError, Sponsored, Sponsorship,
+    AppManifest, Contribution, MAX_APP_MODULES, MAX_APP_NAME_BYTES, SponsorError, Sponsored,
+    Sponsorship,
 };
 pub use controller::{
     Approval, Controller, MAX_APPROVALS, MAX_CONTROLLERS, MAX_GUARDIANS, MAX_WAITING_RECOVERIES,

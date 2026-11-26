@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use decomp_core::{APPROVED_MODELS, ICRC_TRANSFER_FEE, IcrcAccount, Subaccount, Tokens};
 use decomp_core::{
-    AccountId, AccountStatus, AppManifest, Approval, BidOrder, Call, ContentHash, Controller,
-    Credits, Encrypted, Fallback, Inclusion, JobClass, JobId, JobStatus, MAX_LOG_PAGE,
+    AccountId, AccountStatus, AppManifest, Approval, BidOrder, Call, ContentHash, Contribution,
+    Controller, Credits, Encrypted, Fallback, Inclusion, JobClass, JobId, JobStatus, MAX_LOG_PAGE,
     MAX_STORAGE_DAYS, Manifest, OpeningKey, Outcome, Pickup, Price, Privacy, PrivateRoute,
     PublicKey, Receipt, Request, SHARES, ShardRef, Share, ShareSet, SigningKey, Split, Sponsorship,
     Verification, Verify, WorkPreferences, controller, cut, draw_hash, encrypted, merkle, privacy,
@@ -288,6 +288,15 @@ enum Command {
         /// credits a day for each account. Without it the app pays for none.
         #[arg(long)]
         sponsor_daily: Option<Credits>,
+        /// Require users to contribute compute: a job the app pays for, or
+        /// that is handed its state, runs only for an account that earned at
+        /// least this percentage of what it spent over the last 30 days.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        contribution_percent: Option<u32>,
+        /// An approved model, by name or ID, that jobs may call without the
+        /// contribution rule applying. Repeat for each.
+        #[arg(long = "exempt-model", value_parser = parse_model, requires = "contribution_percent")]
+        exempt_models: Vec<ContentHash>,
         /// The app's client files, bundled into one file, for a gateway to
         /// serve at the app's name.
         #[arg(long)]
@@ -630,6 +639,8 @@ fn main() -> ExitCode {
             name,
             modules,
             sponsor_daily,
+            contribution_percent,
+            exempt_models,
             client: client_files,
             metadata,
         } => connect().and_then(|client| {
@@ -637,7 +648,11 @@ fn main() -> ExitCode {
                 client: client_files,
                 metadata,
             };
-            publish(&client, name, &modules, sponsor_daily, files)
+            let contribution = contribution_percent.map(|percent| Contribution {
+                percent,
+                exempt_models,
+            });
+            publish(&client, name, &modules, sponsor_daily, contribution, files)
         }),
         Command::Send {
             file,
@@ -1202,6 +1217,13 @@ fn show_app(app: &AppManifest) {
         ),
         None => println!("         does not pay for jobs"),
     }
+    if let Some(rule) = &app.contribution {
+        println!(
+            "         requires users to have earned {}% of what they spend, {} models exempt",
+            rule.percent,
+            rule.exempt_models.len()
+        );
+    }
 }
 
 /// Stores the app's modules and publishes its manifest.
@@ -1216,6 +1238,7 @@ fn publish(
     name: String,
     modules: &[PathBuf],
     sponsor_daily: Option<Credits>,
+    contribution: Option<Contribution>,
     files: AppFiles,
 ) -> Result<ExitCode, Box<dyn Error>> {
     let mut hashes = Vec::new();
@@ -1236,6 +1259,7 @@ fn publish(
         sponsorship: sponsor_daily.map(|per_account_daily| Sponsorship { per_account_daily }),
         client: upload(&files.client)?,
         metadata: upload(&files.metadata)?,
+        contribution,
     })?;
     println!("app ID   {}", status.account.id);
     if let Some(app) = &status.account.app {
